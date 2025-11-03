@@ -12,12 +12,13 @@ import (
 	"github.com/looplab/eventhorizon/uuid"
 )
 
-// JSONCodec is a codec for marshaling and unmarshaling events
+// JSON is a codec for marshaling and unmarshaling events.
 // to and from bytes in JSON format.
-type JSONCodec struct{}
+// Based on origianl eh version but jsoniter insted of platform josn.
+type JSON struct{}
 
 // MarshalEvent marshals an event into bytes in JSON format.
-func (c *JSONCodec) MarshalEvent(ctx context.Context, event eh.Event) ([]byte, error) {
+func (c *JSON) MarshalEvent(ctx context.Context, event eh.Event) ([]byte, error) {
 	e := evt{
 		EventType:     event.EventType(),
 		Timestamp:     event.Timestamp(),
@@ -46,7 +47,7 @@ func (c *JSONCodec) MarshalEvent(ctx context.Context, event eh.Event) ([]byte, e
 }
 
 // UnmarshalEvent unmarshals an event from bytes in JSON format.
-func (c *JSONCodec) UnmarshalEvent(ctx context.Context, b []byte) (eh.Event, context.Context, error) {
+func (c *JSON) UnmarshalEvent(ctx context.Context, b []byte) (eh.Event, context.Context, error) {
 	// Decode the raw JSON event data.
 	var e evt
 	if err := json.Unmarshal(b, &e); err != nil {

@@ -66,7 +66,7 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 		errCh:          make(chan error, 100),
 		cctx:           ctx,
 		cancel:         cancel,
-		codec:          &codec.JsonEventCodec{},
+		codec:          &codec.JSON{},
 	}
 
 	for _, option := range options {
