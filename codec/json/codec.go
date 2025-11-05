@@ -8,8 +8,8 @@ import (
 
 	json "github.com/json-iterator/go"
 
-	eh "github.com/looplab/eventhorizon"
-	"github.com/looplab/eventhorizon/uuid"
+	eh "github.com/vercly/eventhorizon"
+	"github.com/vercly/eventhorizon/uuid"
 )
 
 // JSON is a codec for marshaling and unmarshaling events.

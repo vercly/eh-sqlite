@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	eh "github.com/looplab/eventhorizon"
-	"github.com/looplab/eventhorizon/mocks"
-	"github.com/looplab/eventhorizon/outbox"
 	_ "github.com/mattn/go-sqlite3"
+	eh "github.com/vercly/eventhorizon"
+	"github.com/vercly/eventhorizon/mocks"
+	"github.com/vercly/eventhorizon/outbox"
 )
 
 func init() {

@@ -10,8 +10,8 @@ import (
 	"github.com/vercly/eh-sqlite/context/sqlite"
 
 	json "github.com/json-iterator/go"
-	eh "github.com/looplab/eventhorizon"
-	"github.com/looplab/eventhorizon/uuid"
+	eh "github.com/vercly/eventhorizon"
+	"github.com/vercly/eventhorizon/uuid"
 )
 
 // EventStore is an eventhorizon.EventStore for SQLite.

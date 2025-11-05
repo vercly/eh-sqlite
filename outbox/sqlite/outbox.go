@@ -14,9 +14,9 @@ import (
 	codec "github.com/vercly/eh-sqlite/codec/json"
 
 	jsoniter "github.com/json-iterator/go"
-	eh "github.com/looplab/eventhorizon"
-	"github.com/looplab/eventhorizon/uuid"
 	_ "github.com/mattn/go-sqlite3"
+	eh "github.com/vercly/eventhorizon"
+	"github.com/vercly/eventhorizon/uuid"
 )
 
 var (
