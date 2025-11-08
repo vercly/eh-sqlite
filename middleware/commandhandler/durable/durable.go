@@ -18,10 +18,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
+	"sync/atomic"
 	"time"
 
-	json "github.com/json-iterator/go"
 	eh "github.com/vercly/eventhorizon"
+	"github.com/vercly/eventhorizon/codec/json"
 	"github.com/vercly/eventhorizon/uuid"
 )
 
@@ -44,6 +46,7 @@ func GetCompletionFunc(ctx context.Context) (TaskCompletionFunc, bool) {
 // in the context to update the task's status upon completion.
 type Middleware struct {
 	db         *sql.DB
+	codec      eh.CommandCodec
 	insertStmt *sql.Stmt
 	updateStmt *sql.Stmt
 }
@@ -90,6 +93,7 @@ func NewMiddleware(db *sql.DB) (eh.CommandHandlerMiddleware, error) {
 
 	m := &Middleware{
 		db:         db,
+		codec:      json.CommandCodec{},
 		insertStmt: insertStmt,
 		updateStmt: updateStmt,
 	}
@@ -106,11 +110,11 @@ func (m *Middleware) handler(ctx context.Context, cmd eh.Command, h eh.CommandHa
 	taskUUID := uuid.New()
 	now := time.Now()
 
-	cmdBlob, err := json.Marshal(cmd)
+	cmdBlob, err := m.codec.MarshalCommand(ctx, cmd)
 	if err != nil {
 		return fmt.Errorf("durable: could not marshal command: %w", err)
 	}
-	res, err := m.insertStmt.ExecContext(ctx, taskUUID.String(), cmd.CommandType().String(), string(cmdBlob), now, now)
+	res, err := m.insertStmt.ExecContext(ctx, taskUUID.String(), cmd.CommandType().String(), cmdBlob, now, now)
 	if err != nil {
 		return fmt.Errorf("durable: could not save command to queue: %w", err)
 	}
@@ -119,15 +123,21 @@ func (m *Middleware) handler(ctx context.Context, cmd eh.Command, h eh.CommandHa
 		return fmt.Errorf("durable: could not get last insert ID: %w", err)
 	}
 
-	// 2. Define the completion callback.
+	// 2. Define the robust completion callback.
+	var completed atomic.Bool
 	completionFunc := func(status string, execErr error) {
+		if completed.Swap(true) {
+			return // Already called.
+		}
+
 		var errMsg sql.NullString
 		if execErr != nil {
 			errMsg.String = execErr.Error()
 			errMsg.Valid = true
 		}
-		// Each Exec call on a DB object runs in its own implicit transaction (autocommit).
-		m.updateStmt.Exec(status, errMsg, time.Now(), taskID)
+		if _, err := m.updateStmt.Exec(status, errMsg, time.Now(), taskID); err != nil {
+			log.Printf("durable middleware: CRITICAL: failed to update task status for taskID %d: %v", taskID, err)
+		}
 	}
 
 	// 3. Enrich the context with the callback.
@@ -135,4 +145,75 @@ func (m *Middleware) handler(ctx context.Context, cmd eh.Command, h eh.CommandHa
 
 	// 4. Call the next handler in the chain.
 	return h.HandleCommand(taskCtx, cmd)
+}
+
+// Resume dispatches all unfinished commands from the database to the command bus.
+// This function should be called on application startup to recover from a crash.
+func Resume(ctx context.Context, db *sql.DB, bus eh.CommandHandler) error {
+	codec := json.CommandCodec{}
+	rows, err := db.QueryContext(ctx, `SELECT id, command_blob FROM async_tasks WHERE status = 'new' OR status = 'processing'`)
+	if err != nil {
+		return fmt.Errorf("durable: could not query for unfinished tasks: %w", err)
+	}
+	defer rows.Close()
+
+	type unfinishedTask struct {
+		id          int64
+		commandBlob []byte
+	}
+
+	var tasks []unfinishedTask
+
+	// 1. Read all tasks into memory first to avoid holding the connection.
+	for rows.Next() {
+		var task unfinishedTask
+		if err := rows.Scan(&task.id, &task.commandBlob); err != nil {
+			log.Printf("durable: could not scan unfinished task: %v", err)
+			continue // Try next row
+		}
+		tasks = append(tasks, task)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("durable: error during row iteration: %w", err)
+	}
+	// Close rows immediately to release the read connection.
+	rows.Close()
+
+	if len(tasks) == 0 {
+		return nil // Nothing to do.
+	}
+
+	// 2. Now, process the tasks from the in-memory slice.
+	updateStatusStmt, err := db.PrepareContext(ctx, `UPDATE async_tasks SET status = 'processing', updated_at = ? WHERE id = ?`)
+	if err != nil {
+		return fmt.Errorf("durable: could not prepare status update statement: %w", err)
+	}
+	defer updateStatusStmt.Close()
+
+	for _, task := range tasks {
+		// The command codec can return a new context with data from the command (e.g. tracing).
+		cmd, cmdCtx, err := codec.UnmarshalCommand(ctx, task.commandBlob)
+		if err != nil {
+			log.Printf("durable: could not unmarshal command for task %d: %v", task.id, err)
+			continue
+		}
+		if cmdCtx == nil {
+			cmdCtx = ctx
+		}
+
+		// Mark as processing before dispatching to avoid race conditions on quick restarts.
+		if _, err := updateStatusStmt.ExecContext(ctx, time.Now(), task.id); err != nil {
+			log.Printf("durable: could not update task %d to processing: %v", task.id, err)
+			continue
+		}
+
+		// Use the unmarshaled context when re-dispatching the command.
+		if err := bus.HandleCommand(cmdCtx, cmd); err != nil {
+			log.Printf("durable: could not re-dispatch command for task %d: %v", task.id, err)
+			// The task remains in 'processing' state for a sweeper to find later.
+			continue
+		}
+	}
+
+	return nil
 }

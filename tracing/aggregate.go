@@ -84,5 +84,5 @@ func (a *AggregateBase) AppendEventWithContext(
 
 	allOptions := append(options, tracingOptions...)
 
-	a.AggregateBase.AppendEvent(eventType, eventData, timestamp, allOptions...)
+	a.AppendEvent(eventType, eventData, timestamp, allOptions...)
 }

@@ -11,11 +11,10 @@ import (
 
 	"github.com/vercly/eh-sqlite/context/sqlite"
 
-	codec "github.com/vercly/eh-sqlite/codec/json"
-
 	jsoniter "github.com/json-iterator/go"
 	_ "github.com/mattn/go-sqlite3"
 	eh "github.com/vercly/eventhorizon"
+	ehcodec "github.com/vercly/eventhorizon/codec/json"
 	"github.com/vercly/eventhorizon/uuid"
 )
 
@@ -66,7 +65,7 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 		errCh:          make(chan error, 100),
 		cctx:           ctx,
 		cancel:         cancel,
-		codec:          &codec.JSON{},
+		codec:          &ehcodec.EventCodec{},
 	}
 
 	for _, option := range options {
