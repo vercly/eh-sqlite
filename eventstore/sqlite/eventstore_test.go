@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	eh "github.com/vercly/eventhorizon"
 	"github.com/vercly/eventhorizon/eventstore"
 	"github.com/vercly/eventhorizon/mocks"
@@ -126,7 +126,7 @@ func newTestDB(t testing.TB) *sql.DB {
 	}
 	f.Close()
 
-	db, err := sql.Open("sqlite3", f.Name())
+	db, err := sql.Open("sqlite", addTimestampParams(f.Name()))
 	if err != nil {
 		t.Fatal(err)
 	}

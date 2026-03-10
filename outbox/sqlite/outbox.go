@@ -12,7 +12,7 @@ import (
 	"github.com/vercly/eh-sqlite/context/sqlite"
 
 	jsoniter "github.com/json-iterator/go"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	eh "github.com/vercly/eventhorizon"
 	ehcodec "github.com/vercly/eventhorizon/codec/json"
 	"github.com/vercly/eventhorizon/uuid"
