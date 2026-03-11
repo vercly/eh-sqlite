@@ -7,9 +7,11 @@ import (
 	"log"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vercly/eh-sqlite/context/sqlite"
+	"golang.org/x/sync/errgroup"
 
 	jsoniter "github.com/json-iterator/go"
 	_ "modernc.org/sqlite"
@@ -40,12 +42,16 @@ type Outbox struct {
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
 	codec          eh.EventCodec
+	maxRetries     int
+	maxGoroutines  int
 
-	insertEventStmt    *sql.Stmt
-	selectEventsStmt   *sql.Stmt
-	updateTakenAtStmt  *sql.Stmt
-	deleteEventStmt    *sql.Stmt
-	updateHandlersStmt *sql.Stmt
+	insertEventStmt     *sql.Stmt
+	selectEventsStmt    *sql.Stmt
+	updateTakenAtStmt   *sql.Stmt
+	deleteEventStmt     *sql.Stmt
+	updateHandlersStmt  *sql.Stmt
+	updateRetryStmt     *sql.Stmt
+	addRetryCountColumn *sql.Stmt
 }
 
 type matcherHandler struct {
@@ -66,6 +72,8 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 		cctx:           ctx,
 		cancel:         cancel,
 		codec:          &ehcodec.EventCodec{},
+		maxRetries:     10, // Default to 10
+		maxGoroutines:  10, // Default to 10 concurrent HTTP handlers
 	}
 
 	for _, option := range options {
@@ -90,7 +98,8 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 				-- --- Blob Column for the rest of the event data ---
 				-- This will store a JSON object containing the full event,
 				-- including data, metadata, version, etc.
-				event_blob TEXT NOT NULL
+				event_blob TEXT NOT NULL,
+				retry_count INTEGER DEFAULT 0
 		);
 
 		-- Index the columns you will query.
@@ -99,6 +108,10 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 	`, o.outboxTable)); err != nil {
 		return nil, fmt.Errorf("could not create outbox table: %w", err)
 	}
+
+	// Try to add the retry_count column to existing tables.
+	// We ignore the error because SQLite does not support ADD COLUMN IF NOT EXISTS.
+	o.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN retry_count INTEGER DEFAULT 0;`, o.outboxTable))
 
 	if err := o.prepareStatements(); err != nil {
 		return nil, fmt.Errorf("could not prepare statements: %w", err)
@@ -116,6 +129,22 @@ func WithTableName(outbox string) Option {
 	}
 }
 
+// WithMaxRetries sets the maximum number of error retries before an event is dropped.
+func WithMaxRetries(retries int) Option {
+	return func(o *Outbox) error {
+		o.maxRetries = retries
+		return nil
+	}
+}
+
+// WithMaxGoroutines limits the number of concurrent handlers spawned during a single outbox sweep.
+func WithMaxGoroutines(max int) Option {
+	return func(o *Outbox) error {
+		o.maxGoroutines = max
+		return nil
+	}
+}
+
 func (o *Outbox) prepareStatements() (err error) {
 	if o.insertEventStmt, err = o.db.Prepare(fmt.Sprintf(`
 		INSERT INTO %s (id, event_type, aggregate_id, created_at, taken_at, handlers, event_blob)
@@ -125,7 +154,7 @@ func (o *Outbox) prepareStatements() (err error) {
 	}
 
 	if o.selectEventsStmt, err = o.db.Prepare(fmt.Sprintf(`
-		SELECT id, event_type, aggregate_id, created_at, taken_at, handlers, event_blob
+		SELECT id, event_type, aggregate_id, created_at, taken_at, handlers, event_blob, retry_count
 		FROM %s
 		WHERE taken_at IS NULL OR taken_at < ?
 		ORDER BY created_at ASC LIMIT 50
@@ -144,6 +173,10 @@ func (o *Outbox) prepareStatements() (err error) {
 
 	if o.updateHandlersStmt, err = o.db.Prepare(fmt.Sprintf(`UPDATE %s SET handlers = ? WHERE id = ?`, o.outboxTable)); err != nil {
 		return fmt.Errorf("could not prepare update handlers statement: %w", err)
+	}
+
+	if o.updateRetryStmt, err = o.db.Prepare(fmt.Sprintf(`UPDATE %s SET retry_count = retry_count + 1 WHERE id = ?`, o.outboxTable)); err != nil {
+		return fmt.Errorf("could not prepare update retry statement: %w", err)
 	}
 	return nil
 }
@@ -181,10 +214,11 @@ type outboxDoc struct {
 	ID    uuid.UUID
 	Event eh.Event
 	// Ctx is the context of the event, which is not persisted to the database.
-	Ctx       context.Context
-	Handlers  []string
-	CreatedAt time.Time
-	TakenAt   sql.NullTime
+	Ctx        context.Context
+	Handlers   []string
+	CreatedAt  time.Time
+	TakenAt    sql.NullTime
+	RetryCount int
 }
 
 // HandleEvent implements the HandleEvent method of the eventhorizon.EventHandler interface.
@@ -274,6 +308,7 @@ func (o *Outbox) Close() error {
 	o.updateTakenAtStmt.Close()
 	o.deleteEventStmt.Close()
 	o.updateHandlersStmt.Close()
+	o.updateRetryStmt.Close()
 	return o.db.Close()
 }
 
@@ -364,8 +399,11 @@ func (o *Outbox) Errors() <-chan error {
 func (o *Outbox) scanOutboxDoc(rows *sql.Rows) (*outboxDoc, error) {
 	var id, eventType, aggregateID, handlersBlob, eventBlob string
 	var createdAt, takenAt sql.NullTime
+	var retryCount int
 
-	if err := rows.Scan(&id, &eventType, &aggregateID, &createdAt, &takenAt, &handlersBlob, &eventBlob); err != nil {
+	// Fallback to not failing if the schema is old and retryCount hasn't been added yet in a result set
+	// Note: We're selecting specific columns, so we must add retry_count to the select statement.
+	if err := rows.Scan(&id, &eventType, &aggregateID, &createdAt, &takenAt, &handlersBlob, &eventBlob, &retryCount); err != nil {
 		return nil, fmt.Errorf("could not scan row: %w", err)
 	}
 
@@ -380,26 +418,89 @@ func (o *Outbox) scanOutboxDoc(rows *sql.Rows) (*outboxDoc, error) {
 	}
 
 	return &outboxDoc{
-		ID:        uuid.MustParse(id),
-		Event:     event,
-		Ctx:       ctx,
-		Handlers:  handlers,
-		CreatedAt: createdAt.Time,
-		TakenAt:   takenAt,
+		ID:         uuid.MustParse(id),
+		Event:      event,
+		Ctx:        ctx,
+		Handlers:   handlers,
+		CreatedAt:  createdAt.Time,
+		TakenAt:    takenAt,
+		RetryCount: retryCount,
 	}, nil
+}
+
+type processedResult struct {
+	r                      *outboxDoc
+	successfulHandlers     []string
+	failedRetryable        int
+	failedFatal            int
+	failedDropDueToRetries bool
 }
 
 // processBatch - main procesing batch
 func (o *Outbox) processBatch(ctx context.Context) (int, error) {
-	tx, err := o.db.Begin()
+	eventsToProcess, err := o.fetchAndLockEvents(ctx)
 	if err != nil {
 		return 0, err
+	}
+	if len(eventsToProcess) == 0 {
+		return 0, nil
+	}
+
+	g, _ := errgroup.WithContext(ctx)
+	g.SetLimit(o.maxGoroutines)
+
+	// Since we are interacting with the database, we want to serialize the queries to avoid 'database is locked' errors under WAL.
+	// But we DO want to run dispatchEvent asynchronously.
+	// So we create channels to funnel the results of dispatchEvents back into a single routine that updates DB records.
+	resultsCh := make(chan processedResult, len(eventsToProcess))
+
+	for _, req := range eventsToProcess {
+		req := req // capture loop var
+		g.Go(func() error {
+			// dispatchEvent runs multiple handlers for ONE event and returns how many succeeded/failed
+			successfulHandlers, failedHandlers, fatalError := o.dispatchEvent(req)
+
+			res := processedResult{
+				r:                  req,
+				successfulHandlers: successfulHandlers,
+			}
+
+			if fatalError {
+				res.failedFatal = failedHandlers
+			} else if failedHandlers > 0 {
+				res.failedRetryable = failedHandlers
+				if req.RetryCount >= o.maxRetries { // Check poison pill logic limit
+					res.failedDropDueToRetries = true
+				}
+			}
+
+			// We don't abort errgroup on handler errors; we want to process all messages in batch.
+			resultsCh <- res
+			return nil
+		})
+	}
+
+	// Wait in a separate goroutine so we can close results channel
+	go func() {
+		g.Wait()
+		close(resultsCh)
+	}()
+
+	o.updateEventsDB(ctx, resultsCh)
+
+	return len(eventsToProcess), nil
+}
+
+func (o *Outbox) fetchAndLockEvents(ctx context.Context) ([]*outboxDoc, error) {
+	tx, err := o.db.Begin()
+	if err != nil {
+		return nil, err
 	}
 	defer tx.Rollback()
 
 	rows, err := tx.StmtContext(ctx, o.selectEventsStmt).Query(time.Now().Add(-PeriodicSweepAge))
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	var eventsToProcess []*outboxDoc
@@ -407,7 +508,7 @@ func (o *Outbox) processBatch(ctx context.Context) (int, error) {
 		r, err := o.scanOutboxDoc(rows)
 		if err != nil {
 			rows.Close()
-			return 0, err
+			return nil, err
 		}
 		eventsToProcess = append(eventsToProcess, r)
 	}
@@ -415,33 +516,52 @@ func (o *Outbox) processBatch(ctx context.Context) (int, error) {
 
 	if len(eventsToProcess) == 0 {
 		tx.Commit()
-		return 0, nil
+		return nil, nil
 	}
 
 	now := time.Now()
 	for _, r := range eventsToProcess {
 		if _, err := tx.Stmt(o.updateTakenAtStmt).ExecContext(ctx, now, r.ID.String()); err != nil {
-			return 0, err
+			return nil, err
 		}
 	}
 
 	// End the transaction that locks the rows.
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("could not commit transaction locking events: %w", err)
+		return nil, fmt.Errorf("could not commit transaction locking events: %w", err)
 	}
 
-	for _, r := range eventsToProcess {
-		processedHandlers := o.dispatchEvent(r)
-		//
-		// If nothing worked, move on to the next one. We'll try again later.
-		if len(processedHandlers) == 0 {
+	return eventsToProcess, nil
+}
+
+func (o *Outbox) updateEventsDB(ctx context.Context, resultsCh <-chan processedResult) {
+	// Read results back and perform serial SQLite updates
+	for res := range resultsCh {
+		r := res.r
+
+		// If nothing worked and it's a poison pill due to max retries or a fatal error
+		if res.failedDropDueToRetries || res.failedFatal > 0 {
+			o.sendError(fmt.Errorf("event dropped outbox: max retries reached or fatal error encountered"), r.Event, ctx)
+			if _, err := o.deleteEventStmt.ExecContext(ctx, r.ID.String()); err != nil {
+				o.sendError(fmt.Errorf("could not delete fully processed/dropped event: %w", err), r.Event, ctx)
+			}
+			continue
+		}
+
+		if len(res.successfulHandlers) == 0 {
+			// Increment retry counter if no handler succeeded and it's not fatal.
+			if res.failedRetryable > 0 {
+				if _, err := o.updateRetryStmt.ExecContext(ctx, r.ID.String()); err != nil {
+					o.sendError(fmt.Errorf("could not increment event retry: %w", err), r.Event, ctx)
+				}
+			}
 			continue
 		}
 
 		// Update the list of remaining handlers
 		remainingHandlers := make([]string, 0, len(r.Handlers))
 		for _, required := range r.Handlers {
-			if !slices.Contains(processedHandlers, required) {
+			if !slices.Contains(res.successfulHandlers, required) {
 				remainingHandlers = append(remainingHandlers, required)
 			}
 		}
@@ -463,13 +583,14 @@ func (o *Outbox) processBatch(ctx context.Context) (int, error) {
 			}
 		}
 	}
-
-	return len(eventsToProcess), nil
 }
 
 // dispatchEvent - Returns a list of handlers that completed successfully.
-func (o *Outbox) dispatchEvent(r *outboxDoc) []string {
+// Also returns count of failed handlers and a boolean indicating if ANY failure was Fatal.
+func (o *Outbox) dispatchEvent(r *outboxDoc) ([]string, int, bool) {
 	var successfulHandlers []string
+	var failedHandlers int
+	var fatalError uint32 // use uint32 for atomic ops across goroutines, though here it's 1 event 1 goroutine
 
 	handlerSet := make(map[string]struct{})
 	for _, h := range r.Handlers {
@@ -479,7 +600,11 @@ func (o *Outbox) dispatchEvent(r *outboxDoc) []string {
 	o.handlersMu.RLock()
 	defer o.handlersMu.RUnlock()
 
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
 	for _, mh := range o.handlers {
+		mh := mh // local variable for closure
 		// Check if this handler is even on the list of handlers to be processed for this event.
 		if _, ok := handlerSet[mh.HandlerType().String()]; !ok {
 			continue
@@ -489,13 +614,29 @@ func (o *Outbox) dispatchEvent(r *outboxDoc) []string {
 			continue
 		}
 
-		if err := mh.HandleEvent(r.Ctx, r.Event); err != nil {
-			err = fmt.Errorf("could not handle event (%s): %w", mh.HandlerType(), err)
-			o.sendError(err, r.Event, r.Ctx)
-		} else {
-			successfulHandlers = append(successfulHandlers, mh.HandlerType().String())
-		}
+		wg.Add(1)
+		go func(hnd *matcherHandler) {
+			defer wg.Done()
+			if err := hnd.HandleEvent(r.Ctx, r.Event); err != nil {
+				severity := GetSeverity(err)
+
+				if severity == SeverityFatal {
+					atomic.StoreUint32(&fatalError, 1)
+				}
+				err = fmt.Errorf("could not handle event (%s): %w", hnd.HandlerType(), err)
+				o.sendError(err, r.Event, r.Ctx)
+
+				mu.Lock()
+				failedHandlers++
+				mu.Unlock()
+			} else {
+				mu.Lock()
+				successfulHandlers = append(successfulHandlers, hnd.HandlerType().String())
+				mu.Unlock()
+			}
+		}(mh)
 	}
 
-	return successfulHandlers
+	wg.Wait()
+	return successfulHandlers, failedHandlers, atomic.LoadUint32(&fatalError) == 1
 }

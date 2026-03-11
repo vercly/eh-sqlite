@@ -5,6 +5,7 @@ go 1.25.3
 require (
 	github.com/json-iterator/go v1.1.12
 	github.com/vercly/eventhorizon v0.16.3
+	golang.org/x/sync v0.20.0
 	modernc.org/sqlite v1.46.1
 )
 
