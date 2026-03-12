@@ -36,3 +36,10 @@ func NewBaseCommand() BaseCommand {
 		CmdID: ehuuid.New(),
 	}
 }
+
+// NewBaseCommandWithID returns a new BaseCommand with a specific ID.
+func NewBaseCommandWithID(id ehuuid.UUID) BaseCommand {
+	return BaseCommand{
+		CmdID: id,
+	}
+}
