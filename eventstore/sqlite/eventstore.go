@@ -33,6 +33,12 @@ type EventStore struct {
 	stmtSelectSnapshot *sql.Stmt
 }
 
+// Compile-time assertions that EventStore implements the eventhorizon interfaces.
+var (
+	_ eh.EventStore    = (*EventStore)(nil)
+	_ eh.SnapshotStore = (*EventStore)(nil)
+)
+
 // NewEventStore creates a new EventStore.
 func NewEventStore(db *sql.DB, options ...Option) (*EventStore, error) {
 	s := &EventStore{

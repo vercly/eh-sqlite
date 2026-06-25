@@ -14,11 +14,13 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	jsoniter "github.com/json-iterator/go"
-	_ "modernc.org/sqlite"
 	eh "github.com/vercly/eventhorizon"
 	ehcodec "github.com/vercly/eventhorizon/codec/json"
 	"github.com/vercly/eventhorizon/uuid"
 )
+
+// Compile-time assertion that Outbox implements the eventhorizon Outbox interface.
+var _ eh.Outbox = (*Outbox)(nil)
 
 var (
 	// PeriodicSweepInterval Interval in which to do a sweep of various unprocessed events.

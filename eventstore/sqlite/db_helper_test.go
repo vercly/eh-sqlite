@@ -3,8 +3,9 @@ package sqlite
 import "strings"
 
 // addTimestampParams appends modernc.org/sqlite DSN options that make the driver
-// convert integer TIMESTAMP/DATETIME columns to time.Time automatically,
-// matching the behaviour of the legacy mattn/go-sqlite3 driver.
+// convert integer TIMESTAMP/DATETIME columns to time.Time automatically. It is a
+// test-only helper: choosing a driver and its DSN is the responsibility of the
+// library's consumer, not of the event store itself.
 func addTimestampParams(dsn string) string {
 	// Strip legacy mattn/go-sqlite3 parameters to avoid overlapping config
 	dsn = strings.ReplaceAll(dsn, "_journal=wal", "")

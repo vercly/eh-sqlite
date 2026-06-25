@@ -1,62 +1,31 @@
-// Package eventing provides shared logic for event-driven components
-// within the amlcheck domain, focusing on command and event tracing.
+// Package eventing provides small, domain-agnostic helpers for building
+// eventhorizon-based applications: a reusable base command type and correlation-ID
+// propagation between context, commands and event metadata.
 //
-// # Usage
+// # Base command
 //
-// This package simplifies tracing by providing a base command and context helpers.
-//
-// ## Base Command
-//
-// To ensure all commands have a unique ID (for causation tracking), embed
-// `eventing.BaseCommand` in your command structs. The `AggregateID` is also
-// provided by `BaseCommand` and is automatically set to the command's unique ID.
-//
-// Example:
-//
-//	import (
-//		"internal/amlcheck/eventing"
-//		eh "github.com/vercly/eventhorizon"
-//	)
-//
-//	const MyCommand = eh.CommandType("my:command")
+// Embed BaseCommand to give a command a stable identity (AggregateID / CommandID)
+// without boilerplate:
 //
 //	type MyCmd struct {
 //		eventing.BaseCommand
-//		// other fields...
+//		// fields...
 //	}
 //
 //	func (c *MyCmd) AggregateType() eh.AggregateType { return "my_aggregate" }
-//	func (c *MyCmd) CommandType() eh.CommandType      { return MyCommand }
+//	func (c *MyCmd) CommandType() eh.CommandType     { return "my:command" }
 //
+// # Correlation ID
 //
-// ## Tracing Context
+// Carry a correlation ID on the context and stamp it onto emitted events so a whole
+// flow can be traced and projected:
 //
-// To trace a flow of operations, use the correlation ID helpers.
-// The correlation ID will be automatically added to the metadata of all
-// events created within a context that carries it.
+//	ctx = eventing.NewContextWithID(ctx, correlationID)
 //
-// ### Starting a Trace
+//	// when creating an event inside a handler:
+//	event := eh.NewEventForAggregate(t, data, time.Now(), at, id, v,
+//		eventing.WithCorrelationIDMetadata(ctx))
 //
-// Use `WithCorrelationID` to add a new correlation ID to the context,
-// typically at the start of an operation (e.g., in an HTTP handler).
-//
-//	ctx := eventing.WithCorrelationID(context.Background(), "my-unique-correlation-id")
-//
-// ### In a Command Handler
-//
-// When creating an event, ensure you pass the context to the aggregate's
-// command handler. To propagate tracing info, create event options for
-// `causation_id` (from the command) and `correlation_id` (from the context).
-//
-//	func (a *MyAggregate) HandleCommand(ctx context.Context, command eh.Command) error {
-//		// ...
-//		options := []eh.EventOption{eh.FromCommand(cmd)}
-//		if correlationID, ok := eventing.CorrelationIDFromContext(ctx); ok {
-//			options = append(options, eh.WithMetadata(map[string]any{
-//				"correlation_id": correlationID,
-//			}))
-//		}
-//		a.AppendEvent(MyEventType, MyEventData{}, time.Now(), options...)
-//		// ...
-//	}
+//	// later, in a projector or saga:
+//	id, ok := eventing.CorrelationIDFromEvent(event)
 package eventing
