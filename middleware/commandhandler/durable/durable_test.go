@@ -3,6 +3,8 @@ package durable
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -38,7 +40,7 @@ func newDurableTestDB(t testing.TB) *sql.DB {
 	}
 	f.Close()
 
-	db, err := sql.Open("sqlite", f.Name()+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	db, err := sql.Open("sqlite", f.Name()+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)&_loc=auto&_inttotime=1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,5 +169,223 @@ func TestResumeReusesRow(t *testing.T) {
 	}
 	if status != "completed" {
 		t.Fatalf("expected original row status 'completed', got %q", status)
+	}
+}
+
+// --- Phase 4 (Path A): durable retry semantics ---
+
+type permanentErr struct{ msg string }
+
+func (e permanentErr) Error() string                 { return e.msg }
+func (e permanentErr) DurableSeverity() ErrorSeverity { return SeverityPermanent }
+
+// classifyingHandler mirrors tracing.NewDurableHandler: it classifies the inner
+// handler's error and reports the matching durable status via the completion func.
+func classifyingHandler(inner eh.CommandHandler) eh.CommandHandler {
+	return eh.CommandHandlerFunc(func(ctx context.Context, cmd eh.Command) error {
+		err := inner.HandleCommand(ctx, cmd)
+		if f, ok := GetCompletionFunc(ctx); ok {
+			switch {
+			case err == nil:
+				f(StatusCompleted, nil)
+			case ClassifyError(err) == SeverityPermanent:
+				f(StatusFailedPermanent, err)
+			default:
+				f(StatusFailedRetriable, err)
+			}
+		}
+		return err
+	})
+}
+
+func failHandler(err error) eh.CommandHandler {
+	return eh.CommandHandlerFunc(func(ctx context.Context, cmd eh.Command) error { return err })
+}
+
+func getTask(t *testing.T, db *sql.DB, id int64) (status string, retryCount int, nextRetryValid bool) {
+	t.Helper()
+	var nra sql.NullTime
+	if err := db.QueryRow(`SELECT status, retry_count, next_retry_at FROM async_tasks WHERE id = ?`, id).
+		Scan(&status, &retryCount, &nra); err != nil {
+		t.Fatalf("could not read task %d: %v", id, err)
+	}
+	return status, retryCount, nra.Valid
+}
+
+func onlyTaskID(t *testing.T, db *sql.DB) int64 {
+	t.Helper()
+	var id int64
+	if err := db.QueryRow(`SELECT id FROM async_tasks LIMIT 1`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func insertRetriableTask(t *testing.T, db *sql.DB, retryCount int, nextRetryAt time.Time) int64 {
+	t.Helper()
+	cmd := &resumeTestCommand{ID: uuid.New(), Content: "retry-me"}
+	blob, err := (ehjson.CommandCodec{}).MarshalCommand(context.Background(), cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	res, err := db.Exec(
+		`INSERT INTO async_tasks (task_uuid, command_type, command_blob, status, retry_count, max_retries, created_at, updated_at, next_retry_at)
+		 VALUES (?, ?, ?, 'failed_retriable', ?, 5, ?, ?, ?)`,
+		uuid.New().String(), string(resumeTestCmdType), string(blob), retryCount, now, now, nextRetryAt,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	return id
+}
+
+func TestClassifyError(t *testing.T) {
+	if got := ClassifyError(errors.New("plain")); got != SeverityRetriable {
+		t.Errorf("plain error should default to retriable, got %v", got)
+	}
+	if got := ClassifyError(permanentErr{"no"}); got != SeverityPermanent {
+		t.Errorf("CategorizedError should be permanent, got %v", got)
+	}
+	if got := ClassifyError(fmt.Errorf("wrap: %w", permanentErr{"no"})); got != SeverityPermanent {
+		t.Errorf("wrapped CategorizedError should be permanent, got %v", got)
+	}
+}
+
+// TestRetriableFailureSchedulesRetry: a default (unclassified) failure moves the
+// task to failed_retriable, bumps retry_count, and sets next_retry_at.
+func TestRetriableFailureSchedulesRetry(t *testing.T) {
+	db := newDurableTestDB(t)
+	mw, err := NewMiddleware(db, WithRetryBackoff(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := eh.UseCommandHandlerMiddleware(classifyingHandler(failHandler(errors.New("transient"))), mw)
+
+	_ = bus.HandleCommand(context.Background(), &resumeTestCommand{ID: uuid.New(), Content: "x"})
+
+	if n := countTasks(t, db); n != 1 {
+		t.Fatalf("expected 1 row, got %d", n)
+	}
+	status, rc, nraValid := getTask(t, db, onlyTaskID(t, db))
+	if status != StatusFailedRetriable {
+		t.Fatalf("expected status %q, got %q", StatusFailedRetriable, status)
+	}
+	if rc != 1 {
+		t.Fatalf("expected retry_count 1, got %d", rc)
+	}
+	if !nraValid {
+		t.Fatal("expected next_retry_at to be set")
+	}
+}
+
+// TestPermanentFailureNotRetried: a SeverityPermanent error fails permanently with
+// no retry scheduling.
+func TestPermanentFailureNotRetried(t *testing.T) {
+	db := newDurableTestDB(t)
+	mw, err := NewMiddleware(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := eh.UseCommandHandlerMiddleware(classifyingHandler(failHandler(permanentErr{"fatal"})), mw)
+
+	_ = bus.HandleCommand(context.Background(), &resumeTestCommand{ID: uuid.New(), Content: "x"})
+
+	status, rc, nraValid := getTask(t, db, onlyTaskID(t, db))
+	if status != StatusFailedPermanent {
+		t.Fatalf("expected status %q, got %q", StatusFailedPermanent, status)
+	}
+	if rc != 0 {
+		t.Fatalf("expected retry_count 0, got %d", rc)
+	}
+	if nraValid {
+		t.Fatal("expected next_retry_at to remain unset")
+	}
+}
+
+// TestResumePicksDueRetriableAndCompletes: a due failed_retriable task is resumed,
+// reuses its row, and completes on success.
+func TestResumePicksDueRetriableAndCompletes(t *testing.T) {
+	db := newDurableTestDB(t)
+	mw, err := NewMiddleware(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := eh.UseCommandHandlerMiddleware(classifyingHandler(failHandler(nil)), mw) // nil error => success
+
+	id := insertRetriableTask(t, db, 1, time.Now().Add(-time.Minute)) // due
+
+	if err := Resume(context.Background(), db, bus); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := countTasks(t, db); n != 1 {
+		t.Fatalf("resume must not duplicate rows, got %d", n)
+	}
+	status, rc, _ := getTask(t, db, id)
+	if status != StatusCompleted {
+		t.Fatalf("expected status %q, got %q", StatusCompleted, status)
+	}
+	if rc != 1 {
+		t.Fatalf("expected retry_count to stay 1, got %d", rc)
+	}
+}
+
+// TestRetryExhaustionBecomesPermanent: failing again at retry_count == max-1 flips
+// the task to failed_permanent and clears next_retry_at.
+func TestRetryExhaustionBecomesPermanent(t *testing.T) {
+	db := newDurableTestDB(t)
+	mw, err := NewMiddleware(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := eh.UseCommandHandlerMiddleware(classifyingHandler(failHandler(errors.New("still failing"))), mw)
+
+	id := insertRetriableTask(t, db, 4, time.Now().Add(-time.Minute)) // max_retries=5, due
+
+	if err := Resume(context.Background(), db, bus); err != nil {
+		t.Fatal(err)
+	}
+
+	status, rc, nraValid := getTask(t, db, id)
+	if status != StatusFailedPermanent {
+		t.Fatalf("expected status %q, got %q", StatusFailedPermanent, status)
+	}
+	if rc != 5 {
+		t.Fatalf("expected retry_count 5, got %d", rc)
+	}
+	if nraValid {
+		t.Fatal("expected next_retry_at cleared on exhaustion")
+	}
+}
+
+// TestResumeSkipsNotDueRetriable: a retriable task whose next_retry_at is in the
+// future is not resumed.
+func TestResumeSkipsNotDueRetriable(t *testing.T) {
+	db := newDurableTestDB(t)
+	mw, err := NewMiddleware(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := 0
+	counting := eh.CommandHandlerFunc(func(ctx context.Context, cmd eh.Command) error {
+		called++
+		return nil
+	})
+	bus := eh.UseCommandHandlerMiddleware(classifyingHandler(counting), mw)
+
+	id := insertRetriableTask(t, db, 1, time.Now().Add(time.Hour)) // not due
+
+	if err := Resume(context.Background(), db, bus); err != nil {
+		t.Fatal(err)
+	}
+
+	if called != 0 {
+		t.Fatalf("a not-due retriable task must not be resumed, handler called %d times", called)
+	}
+	status, _, _ := getTask(t, db, id)
+	if status != StatusFailedRetriable {
+		t.Fatalf("expected status to stay %q, got %q", StatusFailedRetriable, status)
 	}
 }

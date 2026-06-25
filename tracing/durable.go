@@ -37,20 +37,24 @@ func NewDurableHandler(handler eh.CommandHandler) eh.CommandHandler {
 		// Ensure the completion function is always called.
 		defer func() {
 			if r := recover(); r != nil {
-				// Handle panics in the inner handler.
+				// A panic is a bug, not a transient fault: fail permanently.
 				err = fmt.Errorf("panic recovered in durable handler: %v", r)
-				completionFunc("failed_permanent", err)
+				completionFunc(durable.StatusFailedPermanent, err)
 			}
 		}()
 
 		// Execute the actual command handler.
 		err = handler.HandleCommand(ctx, cmd)
 
-		// Report the result.
-		if err != nil {
-			completionFunc("failed_permanent", err)
-		} else {
-			completionFunc("completed", nil)
+		// Report the result. Errors are retried by default; a handler can opt out by
+		// returning a durable.CategorizedError reporting SeverityPermanent.
+		switch {
+		case err == nil:
+			completionFunc(durable.StatusCompleted, nil)
+		case durable.ClassifyError(err) == durable.SeverityPermanent:
+			completionFunc(durable.StatusFailedPermanent, err)
+		default:
+			completionFunc(durable.StatusFailedRetriable, err)
 		}
 
 		return err

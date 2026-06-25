@@ -26,8 +26,15 @@ correctness core has now been implemented and tested:
 - ✅ Finding 2 / Phase 2 — atomic outbox claiming (implemented + tested)
 - ✅ Finding 3 / Phase 3 — event-store writer serialization (implemented + tested)
 - ✅ Finding 6 / Phase 5 — DB ownership cleanup (implemented + tested)
-- ⏳ Finding 4 / Phase 4 — durable retry semantics (pending; not started)
+- ✅ Finding 4 / Phase 4 — durable retry semantics, Path A (implemented + tested)
 - ⏳ Finding 5 / Phase 6 — outbox throughput tuning + metrics (pending; not started)
+
+Note on Phase 4 scope: the retry **state machine** lives in the `eh-sqlite` library
+(error classification, `failed_retriable` + `retry_count`/`next_retry_at`,
+exhaustion → `failed_permanent`, extended `Resume`). The **periodic trigger** that
+re-invokes `Resume` to pick up due-retriable tasks during normal operation is the
+consumer's responsibility (e.g. a cron job) and is intentionally not part of this
+library change.
 
 Verification after implementation: `GOWORK=off go test ./...` (incl. `-race`) in
 `eh-sqlite` passes; `go build ./...` and `make` from the repository root pass.
@@ -133,7 +140,7 @@ Impact:
 
 ### 4. Durable retry fields are not implemented as behavior
 
-Severity: medium — Status: ⏳ pending
+Severity: medium — Status: ✅ FIXED (Phase 4, Path A)
 
 The `async_tasks` table has `failed_retriable`, `retry_count`, `max_retries`,
 and `next_retry_at`, but the runtime does not use them as a complete retry
@@ -273,7 +280,7 @@ Required tests:
 - Concurrent saves for the same aggregate still return an event conflict.
 - Multi-event saves reserve contiguous positions.
 
-### Phase 4: decide and implement durable retry semantics — ⏳ pending
+### Phase 4: decide and implement durable retry semantics — ✅ DONE (Path A)
 
 Choose one of two paths.
 
@@ -339,7 +346,7 @@ Required tests/benchmarks:
 2. ✅ Atomic outbox claiming.
 3. ✅ Event-store writer serialization (atomic `$all` increment + `_txlock=immediate`).
 4. ✅ DB ownership cleanup.
-5. ⏳ Durable retry semantics.
+5. ✅ Durable retry semantics (Path A — library state machine).
 6. ⏳ Outbox throughput tuning and metrics.
 
 This order removes the highest correctness risks first while keeping each

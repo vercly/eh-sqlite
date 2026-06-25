@@ -17,6 +17,7 @@ package durable
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"sync/atomic"
@@ -26,6 +27,47 @@ import (
 	"github.com/vercly/eventhorizon/codec/json"
 	"github.com/vercly/eventhorizon/uuid"
 )
+
+// Task status values stored in the async_tasks.status column.
+const (
+	StatusNew             = "new"
+	StatusProcessing      = "processing"
+	StatusCompleted       = "completed"
+	StatusFailedRetriable = "failed_retriable"
+	StatusFailedPermanent = "failed_permanent"
+)
+
+// defaultRetryBackoff is how long a failed-retriable task waits before it becomes
+// due for another attempt. Override with WithRetryBackoff.
+const defaultRetryBackoff = 1 * time.Minute
+
+// ErrorSeverity classifies how a failed durable command should be treated.
+type ErrorSeverity int
+
+const (
+	// SeverityRetriable is the default: the command is retried until max_retries.
+	SeverityRetriable ErrorSeverity = iota
+	// SeverityPermanent marks an error that must not be retried.
+	SeverityPermanent
+)
+
+// CategorizedError lets a command handler override the default retry classification
+// by returning (or wrapping) an error that reports its own severity. Mirrors the
+// outbox CategorizedError convention.
+type CategorizedError interface {
+	error
+	DurableSeverity() ErrorSeverity
+}
+
+// ClassifyError returns the severity for err, defaulting to SeverityRetriable when
+// the error does not implement CategorizedError.
+func ClassifyError(err error) ErrorSeverity {
+	var ce CategorizedError
+	if errors.As(err, &ce) {
+		return ce.DurableSeverity()
+	}
+	return SeverityRetriable
+}
 
 // --- Unexported context keys and types ---
 type taskCompletionFuncKey struct{}
@@ -62,15 +104,26 @@ func resumeTaskID(ctx context.Context) (int64, bool) {
 // to a database before passing them to the next handler. It provides a callback
 // in the context to update the task's status upon completion.
 type Middleware struct {
-	db         *sql.DB
-	codec      eh.CommandCodec
-	insertStmt *sql.Stmt
-	updateStmt *sql.Stmt
+	db           *sql.DB
+	codec        eh.CommandCodec
+	insertStmt   *sql.Stmt
+	updateStmt   *sql.Stmt
+	retryStmt    *sql.Stmt
+	retryBackoff time.Duration
+}
+
+// Option configures the durable Middleware.
+type Option func(*Middleware)
+
+// WithRetryBackoff sets the delay before a failed-retriable task becomes due for
+// another attempt. Defaults to defaultRetryBackoff.
+func WithRetryBackoff(d time.Duration) Option {
+	return func(m *Middleware) { m.retryBackoff = d }
 }
 
 // NewMiddleware creates a new Durable Middleware.
 // It also ensures the required `async_tasks` table exists in the database.
-func NewMiddleware(db *sql.DB) (eh.CommandHandlerMiddleware, error) {
+func NewMiddleware(db *sql.DB, opts ...Option) (eh.CommandHandlerMiddleware, error) {
 	// Ensure the async_tasks table exists.
 	if _, err := db.Exec(`
 			CREATE TABLE IF NOT EXISTS async_tasks (
@@ -108,11 +161,33 @@ func NewMiddleware(db *sql.DB) (eh.CommandHandlerMiddleware, error) {
 		return nil, fmt.Errorf("durable: could not prepare update statement: %w", err)
 	}
 
+	// retryStmt records a retriable failure: it bumps the attempt counter, stores the
+	// error and the next attempt time, and atomically flips the task to
+	// failed_permanent (clearing next_retry_at) once the attempts reach max_retries.
+	// The RHS expressions see the pre-update retry_count, so retry_count + 1 is the
+	// new effective attempt count.
+	retryStmt, err := db.Prepare(`
+		UPDATE async_tasks
+		SET retry_count = retry_count + 1,
+			last_error = ?,
+			updated_at = ?,
+			status = CASE WHEN retry_count + 1 >= max_retries THEN 'failed_permanent' ELSE 'failed_retriable' END,
+			next_retry_at = CASE WHEN retry_count + 1 >= max_retries THEN NULL ELSE ? END
+		WHERE id = ?`)
+	if err != nil {
+		return nil, fmt.Errorf("durable: could not prepare retry statement: %w", err)
+	}
+
 	m := &Middleware{
-		db:         db,
-		codec:      json.CommandCodec{},
-		insertStmt: insertStmt,
-		updateStmt: updateStmt,
+		db:           db,
+		codec:        json.CommandCodec{},
+		insertStmt:   insertStmt,
+		updateStmt:   updateStmt,
+		retryStmt:    retryStmt,
+		retryBackoff: defaultRetryBackoff,
+	}
+	for _, opt := range opts {
+		opt(m)
 	}
 
 	return func(h eh.CommandHandler) eh.CommandHandler {
@@ -159,7 +234,19 @@ func (m *Middleware) handler(ctx context.Context, cmd eh.Command, h eh.CommandHa
 			errMsg.String = execErr.Error()
 			errMsg.Valid = true
 		}
-		if _, err := m.updateStmt.Exec(status, errMsg, time.Now(), taskID); err != nil {
+
+		now := time.Now()
+		if status == StatusFailedRetriable {
+			// Schedule another attempt; retryStmt flips to failed_permanent in SQL
+			// once max_retries is reached.
+			nextRetryAt := now.Add(m.retryBackoff)
+			if _, err := m.retryStmt.Exec(errMsg, now, nextRetryAt, taskID); err != nil {
+				log.Printf("durable middleware: CRITICAL: failed to record retriable failure for taskID %d: %v", taskID, err)
+			}
+			return
+		}
+
+		if _, err := m.updateStmt.Exec(status, errMsg, now, taskID); err != nil {
 			log.Printf("durable middleware: CRITICAL: failed to update task status for taskID %d: %v", taskID, err)
 		}
 	}
@@ -180,7 +267,14 @@ func (m *Middleware) handler(ctx context.Context, cmd eh.Command, h eh.CommandHa
 // original async_tasks row instead of inserting a duplicate.
 func Resume(ctx context.Context, db *sql.DB, bus eh.CommandHandler) error {
 	codec := json.CommandCodec{}
-	rows, err := db.QueryContext(ctx, `SELECT id, command_blob FROM async_tasks WHERE status = 'new' OR status = 'processing'`)
+	// Select crash-interrupted tasks (new/processing) plus retriable tasks whose
+	// backoff has elapsed and that still have attempts left.
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, command_blob FROM async_tasks
+		WHERE status = 'new'
+		   OR status = 'processing'
+		   OR (status = 'failed_retriable' AND next_retry_at <= ? AND retry_count < max_retries)`,
+		time.Now())
 	if err != nil {
 		return fmt.Errorf("durable: could not query for unfinished tasks: %w", err)
 	}
