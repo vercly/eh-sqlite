@@ -30,6 +30,10 @@ import (
 // --- Unexported context keys and types ---
 type taskCompletionFuncKey struct{}
 
+// resumeTaskIDKey carries the id of an existing async_tasks row so the middleware
+// reuses it during Resume instead of inserting a duplicate row.
+type resumeTaskIDKey struct{}
+
 // TaskCompletionFunc is a function that signals the completion status of a task.
 type TaskCompletionFunc func(status string, execErr error)
 
@@ -39,6 +43,19 @@ type TaskCompletionFunc func(status string, execErr error)
 func GetCompletionFunc(ctx context.Context) (TaskCompletionFunc, bool) {
 	f, ok := ctx.Value(taskCompletionFuncKey{}).(TaskCompletionFunc)
 	return f, ok
+}
+
+// withResumeTaskID returns a context that instructs the durable middleware to reuse
+// an existing task row identified by id rather than persisting a new one. It is used
+// when re-dispatching commands during Resume so completion updates the original row.
+func withResumeTaskID(ctx context.Context, id int64) context.Context {
+	return context.WithValue(ctx, resumeTaskIDKey{}, id)
+}
+
+// resumeTaskID returns the existing task id carried by ctx, if any.
+func resumeTaskID(ctx context.Context) (int64, bool) {
+	id, ok := ctx.Value(resumeTaskIDKey{}).(int64)
+	return id, ok
 }
 
 // Middleware implements a durable command handling middleware that persists commands
@@ -106,21 +123,28 @@ func NewMiddleware(db *sql.DB) (eh.CommandHandlerMiddleware, error) {
 }
 
 func (m *Middleware) handler(ctx context.Context, cmd eh.Command, h eh.CommandHandler) error {
-	// 1. Save the command to the database.
-	taskUUID := uuid.New()
-	now := time.Now()
+	// 1. Persist the command, or reuse an existing row when resuming.
+	var taskID int64
+	if existingID, ok := resumeTaskID(ctx); ok {
+		// Resuming a previously persisted task: reuse its row so completion updates
+		// the original record instead of inserting a duplicate.
+		taskID = existingID
+	} else {
+		taskUUID := uuid.New()
+		now := time.Now()
 
-	cmdBlob, err := m.codec.MarshalCommand(ctx, cmd)
-	if err != nil {
-		return fmt.Errorf("durable: could not marshal command: %w", err)
-	}
-	res, err := m.insertStmt.ExecContext(ctx, taskUUID.String(), cmd.CommandType().String(), cmdBlob, now, now)
-	if err != nil {
-		return fmt.Errorf("durable: could not save command to queue: %w", err)
-	}
-	taskID, err := res.LastInsertId()
-	if err != nil {
-		return fmt.Errorf("durable: could not get last insert ID: %w", err)
+		cmdBlob, err := m.codec.MarshalCommand(ctx, cmd)
+		if err != nil {
+			return fmt.Errorf("durable: could not marshal command: %w", err)
+		}
+		res, err := m.insertStmt.ExecContext(ctx, taskUUID.String(), cmd.CommandType().String(), cmdBlob, now, now)
+		if err != nil {
+			return fmt.Errorf("durable: could not save command to queue: %w", err)
+		}
+		taskID, err = res.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("durable: could not get last insert ID: %w", err)
+		}
 	}
 
 	// 2. Define the robust completion callback.
@@ -148,7 +172,12 @@ func (m *Middleware) handler(ctx context.Context, cmd eh.Command, h eh.CommandHa
 }
 
 // Resume dispatches all unfinished commands from the database to the command bus.
-// This function should be called on application startup to recover from a crash.
+// This function should be called on application startup to recover from a crash,
+// but only after all command handlers have been registered on the bus.
+//
+// The provided bus must include this durable middleware: resumed commands are
+// re-dispatched carrying their existing task id, so the middleware reuses the
+// original async_tasks row instead of inserting a duplicate.
 func Resume(ctx context.Context, db *sql.DB, bus eh.CommandHandler) error {
 	codec := json.CommandCodec{}
 	rows, err := db.QueryContext(ctx, `SELECT id, command_blob FROM async_tasks WHERE status = 'new' OR status = 'processing'`)
@@ -207,8 +236,10 @@ func Resume(ctx context.Context, db *sql.DB, bus eh.CommandHandler) error {
 			continue
 		}
 
-		// Use the unmarshaled context when re-dispatching the command.
-		if err := bus.HandleCommand(cmdCtx, cmd); err != nil {
+		// Re-dispatch the command carrying its existing task id so the durable
+		// middleware reuses the original row instead of inserting a duplicate.
+		// Use the unmarshaled context to preserve tracing/correlation data.
+		if err := bus.HandleCommand(withResumeTaskID(cmdCtx, task.id), cmd); err != nil {
 			log.Printf("durable: could not re-dispatch command for task %d: %v", task.id, err)
 			// The task remains in 'processing' state for a sweeper to find later.
 			continue

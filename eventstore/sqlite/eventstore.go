@@ -24,14 +24,13 @@ type EventStore struct {
 	eventHandlerInTX      eh.EventHandler
 
 	// Prepared statements
-	stmtInsertEvent     *sql.Stmt
-	stmtSelectEvents    *sql.Stmt
-	stmtSelectStream    *sql.Stmt
-	stmtInsertStream    *sql.Stmt
-	stmtUpdateStream    *sql.Stmt
-	stmtUpdateAllStream *sql.Stmt
-	stmtInsertSnapshot  *sql.Stmt
-	stmtSelectSnapshot  *sql.Stmt
+	stmtInsertEvent    *sql.Stmt
+	stmtSelectEvents   *sql.Stmt
+	stmtIncrAllStream  *sql.Stmt
+	stmtInsertStream   *sql.Stmt
+	stmtUpdateStream   *sql.Stmt
+	stmtInsertSnapshot *sql.Stmt
+	stmtSelectSnapshot *sql.Stmt
 }
 
 // NewEventStore creates a new EventStore.
@@ -108,17 +107,18 @@ func NewEventStore(db *sql.DB, options ...Option) (*EventStore, error) {
 	if s.stmtSelectEvents, err = s.db.Prepare(fmt.Sprintf(`SELECT event_type, data, timestamp, aggregate_type, aggregate_id, version, metadata FROM %s WHERE aggregate_id = ? AND version >= ? ORDER BY version ASC`, s.eventsTable)); err != nil {
 		return nil, fmt.Errorf("could not prepare select events statement: %w", err)
 	}
-	if s.stmtSelectStream, err = s.db.Prepare(fmt.Sprintf(`SELECT position FROM %s WHERE aggregate_id = ?`, s.streamsTable)); err != nil {
-		return nil, fmt.Errorf("could not prepare select stream statement: %w", err)
+	// stmtIncrAllStream atomically reserves a contiguous range of global positions
+	// by incrementing the $all high-water mark and returning the new value. Being a
+	// write, it acquires the writer lock immediately, eliminating the read-then-write
+	// race that allowed concurrent saves to compute colliding positions.
+	if s.stmtIncrAllStream, err = s.db.Prepare(fmt.Sprintf(`UPDATE %s SET position = position + ? WHERE aggregate_id = ? RETURNING position`, s.streamsTable)); err != nil {
+		return nil, fmt.Errorf("could not prepare increment all stream statement: %w", err)
 	}
 	if s.stmtInsertStream, err = s.db.Prepare(fmt.Sprintf(`INSERT INTO %s (aggregate_id, position, aggregate_type, version, updated_at) VALUES (?, ?, ?, ?, ?)`, s.streamsTable)); err != nil {
 		return nil, fmt.Errorf("could not prepare insert stream statement: %w", err)
 	}
 	if s.stmtUpdateStream, err = s.db.Prepare(fmt.Sprintf(`UPDATE %s SET position = ?, version = version + ?, updated_at = ? WHERE aggregate_id = ? AND version = ?`, s.streamsTable)); err != nil {
 		return nil, fmt.Errorf("could not prepare update stream statement: %w", err)
-	}
-	if s.stmtUpdateAllStream, err = s.db.Prepare(fmt.Sprintf(`UPDATE %s SET position = ? WHERE aggregate_id = ?`, s.streamsTable)); err != nil {
-		return nil, fmt.Errorf("could not prepare update all stream statement: %w", err)
 	}
 	if s.stmtInsertSnapshot, err = s.db.Prepare(fmt.Sprintf(`INSERT INTO %s (aggregate_id, version, data, timestamp, aggregate_type) VALUES (?, ?, ?, ?, ?)`, s.snapshotsTable)); err != nil {
 		return nil, fmt.Errorf("could not prepare insert snapshot statement: %w", err)
@@ -193,18 +193,9 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 	}
 	defer tx.Rollback() // Rollback on any error.
 
-	// Fetch and increment global version in the all-stream.
-	row := tx.Stmt(s.stmtSelectStream).QueryRow("$all")
-	var allStreamPosition int
-	if err := row.Scan(&allStreamPosition); err != nil {
-		return &eh.EventStoreError{
-			Err: fmt.Errorf("could not get global position: %w", err),
-			Op:  eh.EventStoreOpSave,
-		}
-	}
-
-	// Build all event records, with incrementing versions starting from the
-	// original aggregate version.
+	// Validate and build all event records before touching the database, so invalid
+	// input never acquires the writer lock. Versions increment from the original
+	// aggregate version.
 	dbEvents := make([]*evt, len(events))
 	for i, event := range events {
 		if event.AggregateID() != id {
@@ -224,8 +215,23 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 				Op:  eh.EventStoreOpSave,
 			}
 		}
-		e.Position = allStreamPosition + i + 1
 		dbEvents[i] = e
+	}
+
+	// Atomically reserve a contiguous range of global positions. This UPDATE is the
+	// first DB write of the transaction, so it takes the writer lock before any read,
+	// preventing concurrent saves from reserving the same positions. It returns the
+	// new high-water mark; the reserved range is [newAllPosition-len+1, newAllPosition].
+	var newAllPosition int
+	if err := tx.Stmt(s.stmtIncrAllStream).QueryRow(len(events), "$all").Scan(&newAllPosition); err != nil {
+		return &eh.EventStoreError{
+			Err: fmt.Errorf("could not reserve global position: %w", err),
+			Op:  eh.EventStoreOpSave,
+		}
+	}
+	firstPosition := newAllPosition - len(events) + 1
+	for i := range dbEvents {
+		dbEvents[i].Position = firstPosition + i
 	}
 
 	// Insert events.
@@ -242,13 +248,7 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 		}
 	}
 
-	// Update the $all stream.
-	if _, err := tx.Stmt(s.stmtUpdateAllStream).Exec(lastPosition, "$all"); err != nil {
-		return &eh.EventStoreError{
-			Err: fmt.Errorf("could not update global position: %w", err),
-			Op:  eh.EventStoreOpSave,
-		}
-	}
+	// The $all stream was already advanced atomically by stmtIncrAllStream above.
 
 	// Update the aggregate stream.
 	if originalVersion == 0 {
@@ -428,7 +428,9 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, id uuid.UUID, snapshot eh
 	return nil
 }
 
-// Close implements the Close method of the eventhorizon.EventStore interface.
+// Close releases the prepared statements. It deliberately does NOT close the
+// underlying *sql.DB: the database is supplied by the caller (see NewEventStore)
+// and may be shared with other components, so its owner is responsible for closing it.
 func (s *EventStore) Close() error {
 	if s.stmtInsertEvent != nil {
 		s.stmtInsertEvent.Close()
@@ -436,8 +438,8 @@ func (s *EventStore) Close() error {
 	if s.stmtSelectEvents != nil {
 		s.stmtSelectEvents.Close()
 	}
-	if s.stmtSelectStream != nil {
-		s.stmtSelectStream.Close()
+	if s.stmtIncrAllStream != nil {
+		s.stmtIncrAllStream.Close()
 	}
 	if s.stmtInsertStream != nil {
 		s.stmtInsertStream.Close()
@@ -445,16 +447,13 @@ func (s *EventStore) Close() error {
 	if s.stmtUpdateStream != nil {
 		s.stmtUpdateStream.Close()
 	}
-	if s.stmtUpdateAllStream != nil {
-		s.stmtUpdateAllStream.Close()
-	}
 	if s.stmtInsertSnapshot != nil {
 		s.stmtInsertSnapshot.Close()
 	}
 	if s.stmtSelectSnapshot != nil {
 		s.stmtSelectSnapshot.Close()
 	}
-	return s.db.Close()
+	return nil
 }
 
 func isSnapshotEmpty(s eh.Snapshot) bool {

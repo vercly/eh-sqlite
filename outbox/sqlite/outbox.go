@@ -46,8 +46,7 @@ type Outbox struct {
 	maxGoroutines  int
 
 	insertEventStmt     *sql.Stmt
-	selectEventsStmt    *sql.Stmt
-	updateTakenAtStmt   *sql.Stmt
+	claimEventsStmt     *sql.Stmt
 	deleteEventStmt     *sql.Stmt
 	updateHandlersStmt  *sql.Stmt
 	updateRetryStmt     *sql.Stmt
@@ -105,6 +104,8 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 		-- Index the columns you will query.
 		CREATE INDEX IF NOT EXISTS idx_%[1]s_created_at ON %[1]s (created_at);
 		CREATE INDEX IF NOT EXISTS idx_%[1]s_taken_at ON %[1]s (taken_at);
+		-- Composite index supporting the atomic claim query (availability + ordering).
+		CREATE INDEX IF NOT EXISTS idx_%[1]s_claim ON %[1]s (taken_at, created_at);
 	`, o.outboxTable)); err != nil {
 		return nil, fmt.Errorf("could not create outbox table: %w", err)
 	}
@@ -153,18 +154,22 @@ func (o *Outbox) prepareStatements() (err error) {
 		return fmt.Errorf("could not prepare insert event statement: %w", err)
 	}
 
-	if o.selectEventsStmt, err = o.db.Prepare(fmt.Sprintf(`
-		SELECT id, event_type, aggregate_id, created_at, taken_at, handlers, event_blob, retry_count
-		FROM %s
-		WHERE taken_at IS NULL OR taken_at < ?
-		ORDER BY created_at ASC LIMIT 50
+	// claimEventsStmt atomically claims a batch of available rows and returns them
+	// in a single statement. Setting taken_at and selecting the claimed rows happen
+	// as one atomic operation, so two processes can never claim the same row.
+	if o.claimEventsStmt, err = o.db.Prepare(fmt.Sprintf(`
+		UPDATE %[1]s
+		SET taken_at = ?
+		WHERE id IN (
+			SELECT id
+			FROM %[1]s
+			WHERE taken_at IS NULL OR taken_at < ?
+			ORDER BY created_at ASC
+			LIMIT 50
+		)
+		RETURNING id, event_type, aggregate_id, created_at, taken_at, handlers, event_blob, retry_count
 	`, o.outboxTable)); err != nil {
-		return fmt.Errorf("could not prepare select events statement: %w", err)
-	}
-
-	if o.updateTakenAtStmt, err = o.db.Prepare(fmt.Sprintf(`
-		UPDATE %s SET taken_at = ? WHERE id = ?`, o.outboxTable)); err != nil {
-		return fmt.Errorf("could not prepare update taken_at statement: %w", err)
+		return fmt.Errorf("could not prepare claim events statement: %w", err)
 	}
 
 	if o.deleteEventStmt, err = o.db.Prepare(fmt.Sprintf(`DELETE FROM %s WHERE id = ?`, o.outboxTable)); err != nil {
@@ -299,17 +304,19 @@ func (o *Outbox) Start() {
 	go o.runUnifiedProcessor()
 }
 
-// Close implements the Close method of the eventhorizon.EventBus interface.
+// Close stops the processing goroutine and releases the prepared statements.
+// It deliberately does NOT close the underlying *sql.DB: the database is supplied
+// by the caller (see NewOutbox) and may be shared with other components, so its
+// owner is responsible for closing it.
 func (o *Outbox) Close() error {
 	o.cancel()
 	o.wg.Wait()
 	o.insertEventStmt.Close()
-	o.selectEventsStmt.Close()
-	o.updateTakenAtStmt.Close()
+	o.claimEventsStmt.Close()
 	o.deleteEventStmt.Close()
 	o.updateHandlersStmt.Close()
 	o.updateRetryStmt.Close()
-	return o.db.Close()
+	return nil
 }
 
 func (o *Outbox) runUnifiedProcessor() {
@@ -492,43 +499,29 @@ func (o *Outbox) processBatch(ctx context.Context) (int, error) {
 }
 
 func (o *Outbox) fetchAndLockEvents(ctx context.Context) ([]*outboxDoc, error) {
-	tx, err := o.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
+	claimedAt := time.Now()
+	staleBefore := claimedAt.Add(-PeriodicSweepAge)
 
-	rows, err := tx.StmtContext(ctx, o.selectEventsStmt).Query(time.Now().Add(-PeriodicSweepAge))
+	// A single UPDATE ... RETURNING claims the batch and returns the claimed rows
+	// atomically. There is no select-then-update window, so concurrent processes
+	// can never claim the same row. All returned rows must be consumed for the
+	// statement to run to completion (RETURNING requirement).
+	rows, err := o.claimEventsStmt.QueryContext(ctx, claimedAt, staleBefore)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	var eventsToProcess []*outboxDoc
 	for rows.Next() {
 		r, err := o.scanOutboxDoc(rows)
 		if err != nil {
-			rows.Close()
 			return nil, err
 		}
 		eventsToProcess = append(eventsToProcess, r)
 	}
-	rows.Close() // It's important to close before committing.
-
-	if len(eventsToProcess) == 0 {
-		tx.Commit()
-		return nil, nil
-	}
-
-	now := time.Now()
-	for _, r := range eventsToProcess {
-		if _, err := tx.Stmt(o.updateTakenAtStmt).ExecContext(ctx, now, r.ID.String()); err != nil {
-			return nil, err
-		}
-	}
-
-	// End the transaction that locks the rows.
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("could not commit transaction locking events: %w", err)
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	return eventsToProcess, nil
