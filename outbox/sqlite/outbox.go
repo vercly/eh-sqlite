@@ -14,7 +14,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	jsoniter "github.com/json-iterator/go"
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 	eh "github.com/vercly/eventhorizon"
 	ehcodec "github.com/vercly/eventhorizon/codec/json"
 	"github.com/vercly/eventhorizon/uuid"
@@ -299,17 +299,30 @@ func (o *Outbox) Start() {
 	go o.runUnifiedProcessor()
 }
 
-// Close implements the Close method of the eventhorizon.EventBus interface.
+// Close stops the outbox processor and closes prepared statements.
+// The caller owns the shared *sql.DB and is responsible for closing it.
 func (o *Outbox) Close() error {
 	o.cancel()
 	o.wg.Wait()
-	o.insertEventStmt.Close()
-	o.selectEventsStmt.Close()
-	o.updateTakenAtStmt.Close()
-	o.deleteEventStmt.Close()
-	o.updateHandlersStmt.Close()
-	o.updateRetryStmt.Close()
-	return o.db.Close()
+
+	var closeErr error
+	for _, stmt := range []*sql.Stmt{
+		o.insertEventStmt,
+		o.selectEventsStmt,
+		o.updateTakenAtStmt,
+		o.deleteEventStmt,
+		o.updateHandlersStmt,
+		o.updateRetryStmt,
+	} {
+		if stmt == nil {
+			continue
+		}
+		if err := stmt.Close(); err != nil && closeErr == nil {
+			closeErr = err
+		}
+	}
+
+	return closeErr
 }
 
 func (o *Outbox) runUnifiedProcessor() {

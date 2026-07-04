@@ -23,7 +23,7 @@ Example of usage:
 		eh "github.com/vercly/eventhorizon"
 		"github.com/vercly/eventhorizon/commandbus/local"
 		"github.com/vercly/eventhorizon/middleware/commandhandler/async"
-		_ "modernc.org/sqlite"
+		_ "github.com/mattn/go-sqlite3"
 	)
 
 	// 1. Define your command.
@@ -57,7 +57,7 @@ Example of usage:
 
 	func main() {
 		// 3. Set up the database (in-memory SQLite for example).
-		db, err := sql.Open("sqlite", ":memory:")
+		db, err := sql.Open("sqlite3", ":memory:")
 		if err != nil {
 			log.Fatalf("could not open db: %v", err)
 		}
@@ -91,6 +91,5 @@ Example of usage:
 
 		log.Println("Main: command dispatched. Check DB for 'completed' status.")
 	}
-
 */
 package durable

@@ -428,33 +428,29 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, id uuid.UUID, snapshot eh
 	return nil
 }
 
-// Close implements the Close method of the eventhorizon.EventStore interface.
+// Close closes prepared statements owned by the event store.
+// The caller owns the shared *sql.DB and is responsible for closing it.
 func (s *EventStore) Close() error {
-	if s.stmtInsertEvent != nil {
-		s.stmtInsertEvent.Close()
+	var closeErr error
+	for _, stmt := range []*sql.Stmt{
+		s.stmtInsertEvent,
+		s.stmtSelectEvents,
+		s.stmtSelectStream,
+		s.stmtInsertStream,
+		s.stmtUpdateStream,
+		s.stmtUpdateAllStream,
+		s.stmtInsertSnapshot,
+		s.stmtSelectSnapshot,
+	} {
+		if stmt == nil {
+			continue
+		}
+		if err := stmt.Close(); err != nil && closeErr == nil {
+			closeErr = err
+		}
 	}
-	if s.stmtSelectEvents != nil {
-		s.stmtSelectEvents.Close()
-	}
-	if s.stmtSelectStream != nil {
-		s.stmtSelectStream.Close()
-	}
-	if s.stmtInsertStream != nil {
-		s.stmtInsertStream.Close()
-	}
-	if s.stmtUpdateStream != nil {
-		s.stmtUpdateStream.Close()
-	}
-	if s.stmtUpdateAllStream != nil {
-		s.stmtUpdateAllStream.Close()
-	}
-	if s.stmtInsertSnapshot != nil {
-		s.stmtInsertSnapshot.Close()
-	}
-	if s.stmtSelectSnapshot != nil {
-		s.stmtSelectSnapshot.Close()
-	}
-	return s.db.Close()
+
+	return closeErr
 }
 
 func isSnapshotEmpty(s eh.Snapshot) bool {

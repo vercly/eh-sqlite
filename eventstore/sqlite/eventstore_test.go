@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 	eh "github.com/vercly/eventhorizon"
 	"github.com/vercly/eventhorizon/eventstore"
 	"github.com/vercly/eventhorizon/mocks"
@@ -111,6 +111,22 @@ func TestWithEventHandler(t *testing.T) {
 	}
 }
 
+func TestEventStoreCloseDoesNotCloseSharedDB(t *testing.T) {
+	db := newTestDB(t)
+	store, err := NewEventStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Ping(); err != nil {
+		t.Fatalf("shared db should remain open after event store close: %v", err)
+	}
+}
+
 func newTestEventStore(t testing.TB) (*EventStore, error) {
 	t.Helper()
 
@@ -126,7 +142,7 @@ func newTestDB(t testing.TB) *sql.DB {
 	}
 	f.Close()
 
-	db, err := sql.Open("sqlite", addTimestampParams(f.Name()))
+	db, err := sql.Open("sqlite3", f.Name()+"?_journal=wal&_busy_timeout=5000&_synchronous=normal&_fk=1&_loc=auto")
 	if err != nil {
 		t.Fatal(err)
 	}
