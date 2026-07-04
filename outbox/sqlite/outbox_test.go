@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -11,6 +12,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
+	txctx "github.com/vercly/eh-sqlite/context/sqlite"
 	eh "github.com/vercly/eventhorizon"
 	"github.com/vercly/eventhorizon/mocks"
 	"github.com/vercly/eventhorizon/outbox"
@@ -33,8 +35,10 @@ func TestOutboxAddHandler(t *testing.T) {
 
 func TestOutboxIntegration(t *testing.T) {
 	// Shorter sweeps for testing
-	PeriodicSweepInterval = 2 * time.Second
-	PeriodicSweepAge = 2 * time.Second
+	restoreSweepInterval := setPeriodicSweepInterval(t, 2*time.Second)
+	defer restoreSweepInterval()
+	restoreSweepAge := setPeriodicSweepAge(t, 2*time.Second)
+	defer restoreSweepAge()
 
 	db := newTestDB(t)
 
@@ -88,6 +92,63 @@ func TestOutboxCloseDoesNotCloseSharedDB(t *testing.T) {
 	}
 }
 
+func TestOutboxHandleEventRequiresStart(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, mocks.NewEventHandler("start_guard_handler")); err != nil {
+		t.Fatal(err)
+	}
+
+	err = o.HandleEvent(ctx, newTestEvent("before-start"))
+	if !errors.Is(err, ErrOutboxNotStarted) {
+		t.Fatalf("HandleEvent before Start error = %v, want ErrOutboxNotStarted", err)
+	}
+	if got := outboxRowCount(t, db); got != 0 {
+		t.Fatalf("outbox rows before Start = %d, want 0", got)
+	}
+	if got := deadLetterRowCount(t, db); got != 0 {
+		t.Fatalf("dead letter rows before Start = %d, want 0", got)
+	}
+
+	o.Start()
+	o.Start()
+
+	if err := o.HandleEvent(WithDelay(ctx, time.Hour), newTestEvent("after-start")); err != nil {
+		t.Fatal(err)
+	}
+	if got := outboxRowCount(t, db); got != 1 {
+		t.Fatalf("outbox rows after Start = %d, want 1", got)
+	}
+}
+
+func TestOutboxNotifySignalsScheduleWhenWatchChannelFull(t *testing.T) {
+	db := newTestDB(t)
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	for range cap(o.watchCh) {
+		o.watchCh <- &outboxDoc{Ctx: context.Background()}
+	}
+
+	o.notify(&outboxDoc{Ctx: context.Background()})
+
+	select {
+	case <-o.scheduleCh:
+	default:
+		t.Fatal("schedule signal was not queued when watchCh was full")
+	}
+}
+
 func TestOutboxProcessesStaleTakenAtAfterRestart(t *testing.T) {
 	restoreSweepAge := setPeriodicSweepAge(t, 25*time.Millisecond)
 	defer restoreSweepAge()
@@ -99,19 +160,8 @@ func TestOutboxProcessesStaleTakenAtAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstHandler := mocks.NewEventHandler("stale_handler")
-	if err := firstOutbox.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, firstHandler); err != nil {
-		t.Fatal(err)
-	}
-	if err := firstOutbox.HandleEvent(ctx, newTestEvent("stale")); err != nil {
-		t.Fatal(err)
-	}
+	seedOutboxEvent(t, db, firstOutbox, newTestEvent("stale"), "stale_handler", time.Now(), time.Now(), sql.NullTime{Time: time.Now().Add(-2 * PeriodicSweepAge), Valid: true})
 	if err := firstOutbox.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	staleTakenAt := time.Now().Add(-2 * PeriodicSweepAge)
-	if _, err := db.Exec(`UPDATE outbox SET taken_at = ?`, staleTakenAt); err != nil {
 		t.Fatal(err)
 	}
 
@@ -152,18 +202,8 @@ func TestOutboxDoesNotProcessFreshTakenAtBeforeSweepAge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstHandler := mocks.NewEventHandler("fresh_handler")
-	if err := firstOutbox.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, firstHandler); err != nil {
-		t.Fatal(err)
-	}
-	if err := firstOutbox.HandleEvent(ctx, newTestEvent("fresh")); err != nil {
-		t.Fatal(err)
-	}
+	seedOutboxEvent(t, db, firstOutbox, newTestEvent("fresh"), "fresh_handler", time.Now(), time.Now(), sql.NullTime{Time: time.Now(), Valid: true})
 	if err := firstOutbox.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := db.Exec(`UPDATE outbox SET taken_at = ?`, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -207,6 +247,7 @@ func TestOutboxConcurrentPublishDoesNotLoseRows(t *testing.T) {
 	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, mocks.NewEventHandler("concurrent_handler")); err != nil {
 		t.Fatal(err)
 	}
+	o.Start()
 
 	const events = 100
 	var wg sync.WaitGroup
@@ -215,7 +256,7 @@ func TestOutboxConcurrentPublishDoesNotLoseRows(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if err := o.HandleEvent(ctx, newTestEvent(fmt.Sprintf("event-%d", i))); err != nil {
+			if err := o.HandleEvent(WithDelay(ctx, time.Hour), newTestEvent(fmt.Sprintf("event-%d", i))); err != nil {
 				errCh <- err
 			}
 		}(i)
@@ -232,6 +273,168 @@ func TestOutboxConcurrentPublishDoesNotLoseRows(t *testing.T) {
 
 	if got := outboxRowCount(t, db); got != events {
 		t.Fatalf("outbox rows after concurrent publish = %d, want %d", got, events)
+	}
+}
+
+func TestOutboxAvailableAtMigrationBackfillsExistingRows(t *testing.T) {
+	db := newTestDB(t)
+	createdAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+
+	if _, err := db.Exec(`
+		CREATE TABLE outbox (
+			id TEXT PRIMARY KEY,
+			event_type TEXT NOT NULL,
+			aggregate_id TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL,
+			taken_at TIMESTAMP,
+			handlers TEXT NOT NULL,
+			event_blob TEXT NOT NULL,
+			retry_count INTEGER DEFAULT 0
+		);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO outbox (id, event_type, aggregate_id, created_at, handlers, event_blob, retry_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, uuid.New().String(), mocks.EventType.String(), uuid.New().String(), createdAt, "[]", "{}", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	var availableAt time.Time
+	if err := db.QueryRow(`SELECT available_at FROM outbox LIMIT 1`).Scan(&availableAt); err != nil {
+		t.Fatal(err)
+	}
+	if !availableAt.Equal(createdAt) {
+		t.Fatalf("available_at = %s, want %s", availableAt, createdAt)
+	}
+}
+
+func TestOutboxDelayedEventWaitsForAvailableAtTimer(t *testing.T) {
+	restoreSweepInterval := setPeriodicSweepInterval(t, time.Hour)
+	defer restoreSweepInterval()
+
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	handler := mocks.NewEventHandler("delayed_handler")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
+		t.Fatal(err)
+	}
+
+	o.Start()
+
+	if err := o.HandleEvent(WithDelay(ctx, 300*time.Millisecond), newTestEvent("delayed")); err != nil {
+		t.Fatal(err)
+	}
+	if handler.Wait(100 * time.Millisecond) {
+		t.Fatal("delayed event was dispatched before available_at")
+	}
+	if !handler.Wait(2 * time.Second) {
+		t.Fatal("delayed event was not dispatched by the available_at timer")
+	}
+}
+
+func TestOutboxMetadataAvailableAtOverridesContextDelay(t *testing.T) {
+	restoreSweepInterval := setPeriodicSweepInterval(t, time.Hour)
+	defer restoreSweepInterval()
+
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	handler := mocks.NewEventHandler("metadata_delay_handler")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
+		t.Fatal(err)
+	}
+
+	o.Start()
+
+	availableAt := time.Now().Add(300 * time.Millisecond)
+	event := eh.NewEvent(mocks.EventType, &mocks.EventData{Content: "metadata-delay"}, time.Now(),
+		eh.ForAggregate(mocks.AggregateType, uuid.New(), 1),
+		eh.WithMetadata(map[string]any{metadataAvailableAtKey: availableAt.Format(time.RFC3339Nano)}),
+	)
+	if err := o.HandleEvent(WithDelay(ctx, time.Hour), event); err != nil {
+		t.Fatal(err)
+	}
+	if handler.Wait(100 * time.Millisecond) {
+		t.Fatal("metadata-delayed event was dispatched before available_at")
+	}
+	if !handler.Wait(2 * time.Second) {
+		t.Fatal("metadata available_at did not override context delay")
+	}
+}
+
+func TestOutboxNoMatchWritesDeadLetter(t *testing.T) {
+	db := newTestDB(t)
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+	o.Start()
+
+	if err := o.HandleEvent(context.Background(), newTestEvent("no-match")); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := outboxRowCount(t, db); got != 0 {
+		t.Fatalf("outbox rows = %d, want 0", got)
+	}
+	if got := deadLetterRowCount(t, db); got != 1 {
+		t.Fatalf("dead letter rows = %d, want 1", got)
+	}
+
+	var handlerType, source, errMsg string
+	if err := db.QueryRow(`SELECT handler_type, source, error FROM dead_letters LIMIT 1`).Scan(&handlerType, &source, &errMsg); err != nil {
+		t.Fatal(err)
+	}
+	if handlerType != "no_match" || source != "outbox" || errMsg != "no matching handlers" {
+		t.Fatalf("dead letter = (%s, %s, %s), want no_match/outbox/no matching handlers", handlerType, source, errMsg)
+	}
+}
+
+func TestOutboxNoMatchDeadLetterRollsBackWithTransaction(t *testing.T) {
+	db := newTestDB(t)
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+	o.Start()
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := o.HandleEvent(txctx.NewContextWithTx(context.Background(), tx), newTestEvent("rollback-no-match")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := deadLetterRowCount(t, db); got != 0 {
+		t.Fatalf("dead letter rows after rollback = %d, want 0", got)
+	}
+	if got := outboxRowCount(t, db); got != 0 {
+		t.Fatalf("outbox rows after rollback = %d, want 0", got)
 	}
 }
 
@@ -258,6 +461,16 @@ func newTestDB(t testing.TB) *sql.DB {
 	return db
 }
 
+func setPeriodicSweepInterval(t testing.TB, interval time.Duration) func() {
+	t.Helper()
+
+	previous := PeriodicSweepInterval
+	PeriodicSweepInterval = interval
+	return func() {
+		PeriodicSweepInterval = previous
+	}
+}
+
 func setPeriodicSweepAge(t testing.TB, age time.Duration) func() {
 	t.Helper()
 
@@ -274,11 +487,38 @@ func newTestEvent(content string) eh.Event {
 	)
 }
 
+func seedOutboxEvent(t testing.TB, db *sql.DB, o *Outbox, event eh.Event, handlerType string, createdAt, availableAt time.Time, takenAt sql.NullTime) {
+	t.Helper()
+
+	eventBlob, err := o.codec.MarshalEvent(context.Background(), event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlersBlob := fmt.Sprintf(`["%s"]`, handlerType)
+
+	if _, err := db.Exec(`
+		INSERT INTO outbox (id, event_type, aggregate_id, created_at, available_at, taken_at, handlers, event_blob, retry_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, uuid.New().String(), event.EventType().String(), event.AggregateID().String(), createdAt, availableAt, takenAt, handlersBlob, string(eventBlob), 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func outboxRowCount(t testing.TB, db *sql.DB) int {
 	t.Helper()
 
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM outbox`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func deadLetterRowCount(t testing.TB, db *sql.DB) int {
+	t.Helper()
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM dead_letters`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	return count

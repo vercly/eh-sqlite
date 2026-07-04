@@ -2,6 +2,9 @@ package sqlite
 
 import "errors"
 
+// ErrOutboxNotStarted is returned when publishing is attempted before Start.
+var ErrOutboxNotStarted = errors.New("outbox not started")
+
 // ErrorSeverity defines how an outbox error should be treated
 type ErrorSeverity int
 

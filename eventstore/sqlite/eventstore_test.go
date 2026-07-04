@@ -3,11 +3,13 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"testing"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	outboxsqlite "github.com/vercly/eh-sqlite/outbox/sqlite"
 	eh "github.com/vercly/eventhorizon"
 	"github.com/vercly/eventhorizon/eventstore"
 	"github.com/vercly/eventhorizon/mocks"
@@ -127,6 +129,71 @@ func TestEventStoreCloseDoesNotCloseSharedDB(t *testing.T) {
 	}
 }
 
+func TestEventStoreNotifiesInTXOutboxAfterCommit(t *testing.T) {
+	restoreSweepInterval := setOutboxSweepInterval(t, time.Hour)
+	defer restoreSweepInterval()
+
+	db := newTestDB(t)
+	o, err := outboxsqlite.NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	handler := mocks.NewEventHandler("after_commit_handler")
+	if err := o.AddHandler(context.Background(), eh.MatchEvents{mocks.EventType}, handler); err != nil {
+		t.Fatal(err)
+	}
+	o.Start()
+
+	store, err := NewEventStore(db, WithEventHandlerInTX(o))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	event := eh.NewEventForAggregate(mocks.EventType, &mocks.EventData{Content: "after-commit"},
+		time.Now(), mocks.AggregateType, uuid.New(), 1)
+	if err := store.Save(context.Background(), []eh.Event{event}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if !handler.Wait(100 * time.Millisecond) {
+		t.Fatal("in-TX outbox event was not dispatched quickly after commit")
+	}
+}
+
+func TestEventStoreRollsBackInTXNoMatchDeadLetter(t *testing.T) {
+	db := newTestDB(t)
+	o, err := outboxsqlite.NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+	o.Start()
+
+	store, err := NewEventStore(db, WithEventHandlerInTX(failingAfterOutboxHandler{outbox: o}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	event := eh.NewEventForAggregate(mocks.EventType, &mocks.EventData{Content: "rollback-no-match"},
+		time.Now(), mocks.AggregateType, uuid.New(), 1)
+	err = store.Save(context.Background(), []eh.Event{event}, 0)
+	if err == nil {
+		t.Fatal("expected save error")
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM dead_letters`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("dead letter rows after rollback = %d, want 0", count)
+	}
+}
+
 func newTestEventStore(t testing.TB) (*EventStore, error) {
 	t.Helper()
 
@@ -153,4 +220,29 @@ func newTestDB(t testing.TB) *sql.DB {
 	})
 
 	return db
+}
+
+type failingAfterOutboxHandler struct {
+	outbox *outboxsqlite.Outbox
+}
+
+func (h failingAfterOutboxHandler) HandlerType() eh.EventHandlerType {
+	return "failing_after_outbox"
+}
+
+func (h failingAfterOutboxHandler) HandleEvent(ctx context.Context, event eh.Event) error {
+	if err := h.outbox.HandleEvent(ctx, event); err != nil {
+		return err
+	}
+	return errors.New("force rollback after outbox")
+}
+
+func setOutboxSweepInterval(t testing.TB, interval time.Duration) func() {
+	t.Helper()
+
+	previous := outboxsqlite.PeriodicSweepInterval
+	outboxsqlite.PeriodicSweepInterval = interval
+	return func() {
+		outboxsqlite.PeriodicSweepInterval = previous
+	}
 }

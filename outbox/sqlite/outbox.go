@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,29 +30,53 @@ var (
 	PeriodicSweepAge = 15 * time.Second
 )
 
+const metadataAvailableAtKey = "outbox.available_at"
+
+type availableAtContextKey struct{}
+
+// WithDelay returns a context that asks the outbox to make the event available
+// after the provided delay. Non-positive delays are treated as immediate.
+func WithDelay(ctx context.Context, delay time.Duration) context.Context {
+	if delay <= 0 {
+		return WithAvailableAt(ctx, time.Now())
+	}
+	return WithAvailableAt(ctx, time.Now().Add(delay))
+}
+
+// WithAvailableAt returns a context that asks the outbox to make the event
+// available at the provided time. Event metadata key "outbox.available_at" takes
+// precedence over this context value.
+func WithAvailableAt(ctx context.Context, availableAt time.Time) context.Context {
+	return context.WithValue(ctx, availableAtContextKey{}, availableAt)
+}
+
 // Outbox implements an eventhorizon.Outbox for SQLite.
 type Outbox struct {
-	db             *sql.DB
-	outboxTable    string
-	handlers       []*matcherHandler
-	handlersByType map[eh.EventHandlerType]*matcherHandler
-	handlersMu     sync.RWMutex
-	watchCh        chan *outboxDoc
-	errCh          chan error
-	cctx           context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
-	codec          eh.EventCodec
-	maxRetries     int
-	maxGoroutines  int
+	db              *sql.DB
+	outboxTable     string
+	deadLetterTable string
+	handlers        []*matcherHandler
+	handlersByType  map[eh.EventHandlerType]*matcherHandler
+	handlersMu      sync.RWMutex
+	watchCh         chan *outboxDoc
+	scheduleCh      chan struct{}
+	errCh           chan error
+	cctx            context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	started         atomic.Bool
+	codec           eh.EventCodec
+	maxRetries      int
+	maxGoroutines   int
 
-	insertEventStmt     *sql.Stmt
-	selectEventsStmt    *sql.Stmt
-	updateTakenAtStmt   *sql.Stmt
-	deleteEventStmt     *sql.Stmt
-	updateHandlersStmt  *sql.Stmt
-	updateRetryStmt     *sql.Stmt
-	addRetryCountColumn *sql.Stmt
+	insertEventStmt      *sql.Stmt
+	selectEventsStmt     *sql.Stmt
+	updateTakenAtStmt    *sql.Stmt
+	deleteEventStmt      *sql.Stmt
+	updateHandlersStmt   *sql.Stmt
+	updateRetryStmt      *sql.Stmt
+	insertDeadLetterStmt *sql.Stmt
+	nextAvailableAtStmt  *sql.Stmt
 }
 
 type matcherHandler struct {
@@ -64,16 +89,18 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	o := &Outbox{
-		db:             db,
-		outboxTable:    "outbox",
-		handlersByType: map[eh.EventHandlerType]*matcherHandler{},
-		watchCh:        make(chan *outboxDoc, 100),
-		errCh:          make(chan error, 100),
-		cctx:           ctx,
-		cancel:         cancel,
-		codec:          &ehcodec.EventCodec{},
-		maxRetries:     10, // Default to 10
-		maxGoroutines:  10, // Default to 10 concurrent HTTP handlers
+		db:              db,
+		outboxTable:     "outbox",
+		deadLetterTable: "dead_letters",
+		handlersByType:  map[eh.EventHandlerType]*matcherHandler{},
+		watchCh:         make(chan *outboxDoc, 100),
+		scheduleCh:      make(chan struct{}, 1),
+		errCh:           make(chan error, 100),
+		cctx:            ctx,
+		cancel:          cancel,
+		codec:           &ehcodec.EventCodec{},
+		maxRetries:      10, // Default to 10
+		maxGoroutines:   10, // Default to 10 concurrent HTTP handlers
 	}
 
 	for _, option := range options {
@@ -91,6 +118,7 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 				event_type TEXT NOT NULL,
 				aggregate_id TEXT NOT NULL,
 				created_at TIMESTAMP NOT NULL,
+				available_at TIMESTAMP,
 				taken_at TIMESTAMP,
 
 				handlers TEXT NOT NULL, 
@@ -109,9 +137,9 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 		return nil, fmt.Errorf("could not create outbox table: %w", err)
 	}
 
-	// Try to add the retry_count column to existing tables.
-	// We ignore the error because SQLite does not support ADD COLUMN IF NOT EXISTS.
-	o.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN retry_count INTEGER DEFAULT 0;`, o.outboxTable))
+	if err := o.ensureSchema(); err != nil {
+		return nil, err
+	}
 
 	if err := o.prepareStatements(); err != nil {
 		return nil, fmt.Errorf("could not prepare statements: %w", err)
@@ -127,6 +155,51 @@ func WithTableName(outbox string) Option {
 		o.outboxTable = outbox
 		return nil
 	}
+}
+
+func (o *Outbox) ensureSchema() error {
+	for _, stmt := range []string{
+		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN retry_count INTEGER DEFAULT 0;`, o.outboxTable),
+		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN available_at TIMESTAMP;`, o.outboxTable),
+	} {
+		if _, err := o.db.Exec(stmt); err != nil && !isDuplicateColumnError(err) {
+			return fmt.Errorf("could not migrate outbox table: %w", err)
+		}
+	}
+
+	if _, err := o.db.Exec(fmt.Sprintf(`UPDATE %s SET available_at = created_at WHERE available_at IS NULL;`, o.outboxTable)); err != nil {
+		return fmt.Errorf("could not backfill outbox available_at: %w", err)
+	}
+	if _, err := o.db.Exec(fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%s_taken_available ON %s (taken_at, available_at);`, o.outboxTable, o.outboxTable)); err != nil {
+		return fmt.Errorf("could not create outbox availability index: %w", err)
+	}
+
+	if _, err := o.db.Exec(fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %[1]s (
+			id TEXT PRIMARY KEY,
+			source TEXT NOT NULL,
+			event_type TEXT NOT NULL,
+			aggregate_id TEXT NOT NULL,
+			handler_type TEXT NOT NULL,
+			outbox_id TEXT,
+			remaining_handlers TEXT,
+			blob TEXT NOT NULL,
+			error TEXT NOT NULL,
+			retry_count INTEGER DEFAULT 0,
+			created_at TIMESTAMP NOT NULL,
+			dead_at TIMESTAMP NOT NULL
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_%[1]s_source_created ON %[1]s (source, created_at);
+	`, o.deadLetterTable)); err != nil {
+		return fmt.Errorf("could not create dead letters table: %w", err)
+	}
+
+	return nil
+}
+
+func isDuplicateColumnError(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "duplicate column")
 }
 
 // WithMaxRetries sets the maximum number of error retries before an event is dropped.
@@ -147,17 +220,17 @@ func WithMaxGoroutines(max int) Option {
 
 func (o *Outbox) prepareStatements() (err error) {
 	if o.insertEventStmt, err = o.db.Prepare(fmt.Sprintf(`
-		INSERT INTO %s (id, event_type, aggregate_id, created_at, taken_at, handlers, event_blob)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO %s (id, event_type, aggregate_id, created_at, available_at, taken_at, handlers, event_blob)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, o.outboxTable)); err != nil {
 		return fmt.Errorf("could not prepare insert event statement: %w", err)
 	}
 
 	if o.selectEventsStmt, err = o.db.Prepare(fmt.Sprintf(`
-		SELECT id, event_type, aggregate_id, created_at, taken_at, handlers, event_blob, retry_count
+		SELECT id, event_type, aggregate_id, created_at, available_at, taken_at, handlers, event_blob, retry_count
 		FROM %s
-		WHERE taken_at IS NULL OR taken_at < ?
-		ORDER BY created_at ASC LIMIT 50
+		WHERE (taken_at IS NULL OR taken_at < ?) AND available_at <= ?
+		ORDER BY created_at ASC, id ASC LIMIT 50
 	`, o.outboxTable)); err != nil {
 		return fmt.Errorf("could not prepare select events statement: %w", err)
 	}
@@ -177,6 +250,20 @@ func (o *Outbox) prepareStatements() (err error) {
 
 	if o.updateRetryStmt, err = o.db.Prepare(fmt.Sprintf(`UPDATE %s SET retry_count = retry_count + 1 WHERE id = ?`, o.outboxTable)); err != nil {
 		return fmt.Errorf("could not prepare update retry statement: %w", err)
+	}
+	if o.insertDeadLetterStmt, err = o.db.Prepare(fmt.Sprintf(`
+		INSERT INTO %s (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, o.deadLetterTable)); err != nil {
+		return fmt.Errorf("could not prepare insert dead letter statement: %w", err)
+	}
+	if o.nextAvailableAtStmt, err = o.db.Prepare(fmt.Sprintf(`
+		SELECT available_at
+		FROM %s
+		WHERE (taken_at IS NULL OR taken_at < ?) AND available_at > ?
+		ORDER BY available_at ASC, id ASC LIMIT 1
+	`, o.outboxTable)); err != nil {
+		return fmt.Errorf("could not prepare next available statement: %w", err)
 	}
 	return nil
 }
@@ -214,18 +301,29 @@ type outboxDoc struct {
 	ID    uuid.UUID
 	Event eh.Event
 	// Ctx is the context of the event, which is not persisted to the database.
-	Ctx        context.Context
-	Handlers   []string
-	CreatedAt  time.Time
-	TakenAt    sql.NullTime
-	RetryCount int
+	Ctx         context.Context
+	Handlers    []string
+	CreatedAt   time.Time
+	AvailableAt time.Time
+	TakenAt     sql.NullTime
+	RetryCount  int
 }
 
 // HandleEvent implements the HandleEvent method of the eventhorizon.EventHandler interface.
+// Start must be called before publishing.
 func (o *Outbox) HandleEvent(ctx context.Context, event eh.Event) error {
+	if !o.started.Load() {
+		return ErrOutboxNotStarted
+	}
+
 	eventBlob, err := o.codec.MarshalEvent(ctx, event)
 	if err != nil {
 		return fmt.Errorf("could not marshal event: %w", err)
+	}
+	now := time.Now()
+	availableAt, err := availableAtFor(ctx, event, now)
+	if err != nil {
+		return err
 	}
 
 	o.handlersMu.RLock()
@@ -237,16 +335,6 @@ func (o *Outbox) HandleEvent(ctx context.Context, event eh.Event) error {
 	}
 	o.handlersMu.RUnlock()
 
-	// if none handler matches there is no need to process it
-	if len(matchingHandlers) == 0 {
-		return nil
-	}
-
-	handlersBlob, err := jsoniter.Marshal(matchingHandlers)
-	if err != nil {
-		return fmt.Errorf("could not marshal handlers: %w", err)
-	}
-
 	tx, txOk := sqlite.TxFromContext(ctx)
 	if !txOk {
 		tx, err = o.db.Begin()
@@ -256,12 +344,31 @@ func (o *Outbox) HandleEvent(ctx context.Context, event eh.Event) error {
 		defer tx.Rollback()
 	}
 
+	if len(matchingHandlers) == 0 {
+		if err := o.insertNoMatchDeadLetter(ctx, tx, event, eventBlob, now); err != nil {
+			return err
+		}
+		if !txOk {
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("could not commit transaction: %w", err)
+			}
+		}
+		return nil
+	}
+
+	handlersBlob, err := jsoniter.Marshal(matchingHandlers)
+	if err != nil {
+		return fmt.Errorf("could not marshal handlers: %w", err)
+	}
+
+	outboxID := uuid.New()
 	// Insert the promoted fields AND the blob.
 	if _, err := tx.Stmt(o.insertEventStmt).Exec(
-		uuid.New().String(),
+		outboxID.String(),
 		event.EventType().String(),
 		event.AggregateID().String(),
-		time.Now(),
+		now,
+		availableAt,
 		sql.NullTime{},
 		string(handlersBlob),
 		string(eventBlob),
@@ -276,25 +383,108 @@ func (o *Outbox) HandleEvent(ctx context.Context, event eh.Event) error {
 	}
 
 	r := &outboxDoc{
-		ID:        uuid.New(),
-		Event:     event,
-		Ctx:       ctx,
-		Handlers:  matchingHandlers,
-		CreatedAt: time.Now(),
+		ID:          outboxID,
+		Event:       event,
+		Ctx:         ctx,
+		Handlers:    matchingHandlers,
+		CreatedAt:   now,
+		AvailableAt: availableAt,
 	}
 
-	// Signal our worker that there's immediate work to do.
-	// This is the equivalent of the channel push, but it's just a notification.
-	select {
-	case o.watchCh <- r:
-	default: // If channel is full, the periodic sweep will pick it up.
+	if !txOk {
+		o.notify(r)
 	}
 
 	return nil
 }
 
-// Start method launches ONE unified processor.
+func availableAtFor(ctx context.Context, event eh.Event, now time.Time) (time.Time, error) {
+	if metadata := event.Metadata(); metadata != nil {
+		if raw, ok := metadata[metadataAvailableAtKey]; ok {
+			availableAt, err := parseAvailableAt(raw)
+			if err != nil {
+				return time.Time{}, fmt.Errorf("invalid %s metadata: %w", metadataAvailableAtKey, err)
+			}
+			if availableAt.Before(now) {
+				return now, nil
+			}
+			return availableAt, nil
+		}
+	}
+
+	if raw, ok := ctx.Value(availableAtContextKey{}).(time.Time); ok {
+		if raw.Before(now) {
+			return now, nil
+		}
+		return raw, nil
+	}
+
+	return now, nil
+}
+
+func parseAvailableAt(raw any) (time.Time, error) {
+	switch v := raw.(type) {
+	case time.Time:
+		return v, nil
+	case string:
+		if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+			return t, nil
+		}
+		return time.Parse(time.RFC3339, v)
+	default:
+		return time.Time{}, fmt.Errorf("unsupported value type %T", raw)
+	}
+}
+
+func (o *Outbox) insertNoMatchDeadLetter(ctx context.Context, tx *sql.Tx, event eh.Event, eventBlob []byte, now time.Time) error {
+	if _, err := tx.Stmt(o.insertDeadLetterStmt).ExecContext(
+		ctx,
+		uuid.New().String(),
+		"outbox",
+		event.EventType().String(),
+		event.AggregateID().String(),
+		"no_match",
+		sql.NullString{},
+		"[]",
+		string(eventBlob),
+		"no matching handlers",
+		0,
+		now,
+		now,
+	); err != nil {
+		return fmt.Errorf("could not insert no-match dead letter: %w", err)
+	}
+	return nil
+}
+
+// NotifyAfterCommit wakes the outbox processor after an external transaction
+// using this outbox has committed. Callers using sqlite.NewContextWithTx with
+// their own transaction must call this after commit; EventStore.Save does it for
+// in-transaction handlers automatically.
+func (o *Outbox) NotifyAfterCommit(ctx context.Context) {
+	o.notify(&outboxDoc{Ctx: ctx})
+}
+
+func (o *Outbox) notify(r *outboxDoc) {
+	select {
+	case o.watchCh <- r:
+	default:
+		o.notifySchedule()
+	}
+}
+
+func (o *Outbox) notifySchedule() {
+	select {
+	case o.scheduleCh <- struct{}{}:
+	default:
+	}
+}
+
+// Start launches one unified processor. Calling Start more than once is safe.
 func (o *Outbox) Start() {
+	if !o.started.CompareAndSwap(false, true) {
+		return
+	}
 	o.wg.Add(1) // Only one worker goroutine.
 	go o.runUnifiedProcessor()
 }
@@ -313,6 +503,8 @@ func (o *Outbox) Close() error {
 		o.deleteEventStmt,
 		o.updateHandlersStmt,
 		o.updateRetryStmt,
+		o.insertDeadLetterStmt,
+		o.nextAvailableAtStmt,
 	} {
 		if stmt == nil {
 			continue
@@ -330,6 +522,38 @@ func (o *Outbox) runUnifiedProcessor() {
 
 	ticker := time.NewTicker(PeriodicSweepInterval)
 	defer ticker.Stop()
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	var timerCh <-chan time.Time
+	resetTimer := func() {
+		timerCh = nil
+		next, ok, err := o.nextAvailableAt(o.cctx)
+		if err != nil {
+			o.sendError(err, nil, o.cctx)
+			return
+		}
+		if !ok {
+			return
+		}
+		delay := time.Until(next)
+		if delay < 0 {
+			delay = 0
+		}
+		timer.Reset(delay)
+		timerCh = timer.C
+	}
+	stopTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+	defer stopTimer()
+	resetTimer()
 
 	// The main loop now only cares about being woken up.
 	// The actual processing loop is inside the handler for the triggers.
@@ -337,20 +561,49 @@ func (o *Outbox) runUnifiedProcessor() {
 		select {
 		// --- Trigger 1: The Fast Path (from watchCh) ---
 		case r := <-o.watchCh:
+			stopTimer()
 			// A signal has arrived. We know there is at least one new event.
 			// We will now enter a "work loop" that continues until the outbox is empty.
 			o.processUntilEmpty(r.Ctx)
+			resetTimer()
 
 		// --- Trigger 2: The Slow Path (from ticker) ---
 		case <-ticker.C:
+			stopTimer()
 			// The ticker is our safety net. It also triggers the same work loop.
 			o.processUntilEmpty(o.cctx)
+			resetTimer()
+
+		case <-timerCh:
+			stopTimer()
+			o.processUntilEmpty(o.cctx)
+			resetTimer()
+
+		case <-o.scheduleCh:
+			stopTimer()
+			o.processUntilEmpty(o.cctx)
+			resetTimer()
 
 		// --- Trigger 3: Shutdown ---
 		case <-o.cctx.Done():
 			return
 		}
 	}
+}
+
+func (o *Outbox) nextAvailableAt(ctx context.Context) (time.Time, bool, error) {
+	var next sql.NullTime
+	now := time.Now()
+	if err := o.nextAvailableAtStmt.QueryRowContext(ctx, now.Add(-PeriodicSweepAge), now).Scan(&next); err != nil {
+		if err == sql.ErrNoRows {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, fmt.Errorf("could not query next available outbox event: %w", err)
+	}
+	if !next.Valid {
+		return time.Time{}, false, nil
+	}
+	return next.Time, true, nil
 }
 
 // Add this new method to the Outbox.
@@ -411,12 +664,12 @@ func (o *Outbox) Errors() <-chan error {
 
 func (o *Outbox) scanOutboxDoc(rows *sql.Rows) (*outboxDoc, error) {
 	var id, eventType, aggregateID, handlersBlob, eventBlob string
-	var createdAt, takenAt sql.NullTime
+	var createdAt, availableAt, takenAt sql.NullTime
 	var retryCount int
 
 	// Fallback to not failing if the schema is old and retryCount hasn't been added yet in a result set
 	// Note: We're selecting specific columns, so we must add retry_count to the select statement.
-	if err := rows.Scan(&id, &eventType, &aggregateID, &createdAt, &takenAt, &handlersBlob, &eventBlob, &retryCount); err != nil {
+	if err := rows.Scan(&id, &eventType, &aggregateID, &createdAt, &availableAt, &takenAt, &handlersBlob, &eventBlob, &retryCount); err != nil {
 		return nil, fmt.Errorf("could not scan row: %w", err)
 	}
 
@@ -431,13 +684,14 @@ func (o *Outbox) scanOutboxDoc(rows *sql.Rows) (*outboxDoc, error) {
 	}
 
 	return &outboxDoc{
-		ID:         uuid.MustParse(id),
-		Event:      event,
-		Ctx:        ctx,
-		Handlers:   handlers,
-		CreatedAt:  createdAt.Time,
-		TakenAt:    takenAt,
-		RetryCount: retryCount,
+		ID:          uuid.MustParse(id),
+		Event:       event,
+		Ctx:         ctx,
+		Handlers:    handlers,
+		CreatedAt:   createdAt.Time,
+		AvailableAt: availableAt.Time,
+		TakenAt:     takenAt,
+		RetryCount:  retryCount,
 	}, nil
 }
 
@@ -511,7 +765,8 @@ func (o *Outbox) fetchAndLockEvents(ctx context.Context) ([]*outboxDoc, error) {
 	}
 	defer tx.Rollback()
 
-	rows, err := tx.StmtContext(ctx, o.selectEventsStmt).Query(time.Now().Add(-PeriodicSweepAge))
+	now := time.Now()
+	rows, err := tx.StmtContext(ctx, o.selectEventsStmt).Query(now.Add(-PeriodicSweepAge), now)
 	if err != nil {
 		return nil, err
 	}
@@ -532,7 +787,6 @@ func (o *Outbox) fetchAndLockEvents(ctx context.Context) ([]*outboxDoc, error) {
 		return nil, nil
 	}
 
-	now := time.Now()
 	for _, r := range eventsToProcess {
 		if _, err := tx.Stmt(o.updateTakenAtStmt).ExecContext(ctx, now, r.ID.String()); err != nil {
 			return nil, err

@@ -34,6 +34,10 @@ type EventStore struct {
 	stmtSelectSnapshot  *sql.Stmt
 }
 
+type afterCommitNotifier interface {
+	NotifyAfterCommit(context.Context)
+}
+
 // NewEventStore creates a new EventStore.
 func NewEventStore(db *sql.DB, options ...Option) (*EventStore, error) {
 	s := &EventStore{
@@ -293,6 +297,9 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 			Err: fmt.Errorf("could not commit transaction: %w", err),
 			Op:  eh.EventStoreOpSave,
 		}
+	}
+	if notifier, ok := s.eventHandlerInTX.(afterCommitNotifier); ok {
+		notifier.NotifyAfterCommit(ctx)
 	}
 
 	if s.eventHandlerAfterSave != nil {
