@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"slices"
 	"strings"
@@ -85,6 +86,61 @@ type Outbox struct {
 type matcherHandler struct {
 	eh.EventMatcher
 	eh.EventHandler
+	dispatchMode    DispatchMode
+	partitionShards int
+}
+
+// DispatchMode controls ordering and concurrency for a registered event handler.
+type DispatchMode int
+
+const (
+	// Serial dispatches at most one event at a time for a handler.
+	Serial DispatchMode = iota
+	// PartitionByAggregate dispatches one ordered queue per aggregate shard.
+	PartitionByAggregate
+)
+
+const defaultPartitionShards = 16
+
+// HandlerOption configures per-handler dispatch behaviour.
+type HandlerOption func(*handlerOptions) error
+
+type handlerOptions struct {
+	dispatchMode    DispatchMode
+	partitionShards int
+}
+
+func defaultHandlerOptions() handlerOptions {
+	return handlerOptions{
+		dispatchMode:    Serial,
+		partitionShards: defaultPartitionShards,
+	}
+}
+
+// WithDispatchMode sets the dispatch mode for a handler. AddHandler defaults
+// to Serial for RabbitMQ CONCURRENCY=1 parity.
+func WithDispatchMode(mode DispatchMode) HandlerOption {
+	return func(opts *handlerOptions) error {
+		switch mode {
+		case Serial, PartitionByAggregate:
+			opts.dispatchMode = mode
+			return nil
+		default:
+			return fmt.Errorf("unknown dispatch mode: %d", mode)
+		}
+	}
+}
+
+// WithPartitionShards sets the number of shards used by PartitionByAggregate.
+// Values below one are rejected.
+func WithPartitionShards(shards int) HandlerOption {
+	return func(opts *handlerOptions) error {
+		if shards < 1 {
+			return fmt.Errorf("partition shards must be >= 1")
+		}
+		opts.partitionShards = shards
+		return nil
+	}
 }
 
 // NewOutbox creates a new Outbox.
@@ -276,6 +332,12 @@ func (o *Outbox) HandlerType() eh.EventHandlerType {
 
 // AddHandler implements the AddHandler method of the eventhorizon.Outbox interface.
 func (o *Outbox) AddHandler(ctx context.Context, m eh.EventMatcher, h eh.EventHandler) error {
+	return o.AddHandlerWithOptions(ctx, m, h)
+}
+
+// AddHandlerWithOptions registers an event handler with explicit dispatch
+// options. The default AddHandler path uses Serial dispatch.
+func (o *Outbox) AddHandlerWithOptions(ctx context.Context, m eh.EventMatcher, h eh.EventHandler, options ...HandlerOption) error {
 	if m == nil {
 		return eh.ErrMissingMatcher
 	}
@@ -290,7 +352,19 @@ func (o *Outbox) AddHandler(ctx context.Context, m eh.EventMatcher, h eh.EventHa
 		return eh.ErrHandlerAlreadyAdded
 	}
 
-	mh := &matcherHandler{m, h}
+	handlerOptions := defaultHandlerOptions()
+	for _, option := range options {
+		if err := option(&handlerOptions); err != nil {
+			return err
+		}
+	}
+
+	mh := &matcherHandler{
+		EventMatcher:    m,
+		EventHandler:    h,
+		dispatchMode:    handlerOptions.dispatchMode,
+		partitionShards: handlerOptions.partitionShards,
+	}
 	o.handlers = append(o.handlers, mh)
 	o.handlersByType[h.HandlerType()] = mh
 
@@ -705,6 +779,22 @@ type processedResult struct {
 	failedDropDueToRetries bool
 }
 
+type dispatchItem struct {
+	event   *outboxDoc
+	handler *matcherHandler
+}
+
+type dispatchQueue struct {
+	items []dispatchItem
+}
+
+type handlerDispatchResult struct {
+	eventID     uuid.UUID
+	handlerType string
+	err         error
+	fatal       bool
+}
+
 // processBatch - main procesing batch
 func (o *Outbox) processBatch(ctx context.Context) (int, error) {
 	eventsToProcess, err := o.fetchAndLockEvents(ctx)
@@ -715,50 +805,184 @@ func (o *Outbox) processBatch(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	g, _ := errgroup.WithContext(ctx)
-	g.SetLimit(o.maxGoroutines)
-
-	// Since we are interacting with the database, we want to serialize the queries to avoid 'database is locked' errors under WAL.
-	// But we DO want to run dispatchEvent asynchronously.
-	// So we create channels to funnel the results of dispatchEvents back into a single routine that updates DB records.
-	resultsCh := make(chan processedResult, len(eventsToProcess))
-
-	for _, req := range eventsToProcess {
-		req := req // capture loop var
-		g.Go(func() error {
-			// dispatchEvent runs multiple handlers for ONE event and returns how many succeeded/failed
-			successfulHandlers, failedHandlers, fatalError, errMsg := o.dispatchEvent(req)
-
-			res := processedResult{
-				r:                  req,
-				successfulHandlers: successfulHandlers,
-				errorMessage:       errMsg,
-			}
-
-			if fatalError {
-				res.failedFatal = failedHandlers
-			} else if failedHandlers > 0 {
-				res.failedRetryable = failedHandlers
-				if req.RetryCount >= o.maxRetries { // Check poison pill logic limit
-					res.failedDropDueToRetries = true
-				}
-			}
-
-			// We don't abort errgroup on handler errors; we want to process all messages in batch.
-			resultsCh <- res
-			return nil
-		})
+	results := make(map[string]*processedResult, len(eventsToProcess))
+	for _, event := range eventsToProcess {
+		results[event.ID.String()] = &processedResult{r: event}
 	}
 
-	// Wait in a separate goroutine so we can close results channel
-	go func() {
-		g.Wait()
-		close(resultsCh)
-	}()
+	queues, itemCount := o.buildDispatchQueues(eventsToProcess)
+	if itemCount > 0 {
+		handlerResultsCh := make(chan handlerDispatchResult, itemCount)
+		waitErrCh := make(chan error, 1)
+
+		g, _ := errgroup.WithContext(ctx)
+		limit := o.maxGoroutines
+		if limit < 1 {
+			limit = 1
+		}
+		g.SetLimit(limit)
+		for _, queue := range queues {
+			queue := queue
+			g.Go(func() error {
+				for _, item := range queue.items {
+					handlerResultsCh <- o.dispatchHandler(item)
+				}
+				return nil
+			})
+		}
+
+		go func() {
+			waitErrCh <- g.Wait()
+			close(handlerResultsCh)
+		}()
+
+		for handlerResult := range handlerResultsCh {
+			res := results[handlerResult.eventID.String()]
+			if res == nil {
+				continue
+			}
+			if handlerResult.err != nil {
+				if handlerResult.fatal {
+					res.failedFatal++
+				} else {
+					res.failedRetryable++
+				}
+				if res.errorMessage == "" {
+					res.errorMessage = handlerResult.err.Error()
+				}
+				continue
+			}
+			res.successfulHandlers = append(res.successfulHandlers, handlerResult.handlerType)
+		}
+
+		if err := <-waitErrCh; err != nil {
+			return 0, err
+		}
+	}
+
+	resultsCh := make(chan processedResult, len(eventsToProcess))
+	for _, event := range eventsToProcess {
+		res := results[event.ID.String()]
+		if res.failedRetryable > 0 && event.RetryCount >= o.maxRetries {
+			res.failedDropDueToRetries = true
+		}
+		resultsCh <- *res
+	}
+	close(resultsCh)
 
 	o.updateEventsDB(ctx, resultsCh)
 
 	return len(eventsToProcess), nil
+}
+
+func (o *Outbox) buildDispatchQueues(eventsToProcess []*outboxDoc) ([]*dispatchQueue, int) {
+	handlersByType := o.snapshotHandlersByType()
+	queuesByKey := make(map[string]*dispatchQueue)
+	queues := make([]*dispatchQueue, 0)
+	itemCount := 0
+
+	for _, event := range eventsToProcess {
+		for _, handlerType := range event.Handlers {
+			handler := handlersByType[handlerType]
+			if handler == nil || !handler.Match(event.Event) {
+				continue
+			}
+			key := dispatchQueueKey(handler, event.Event)
+			queue := queuesByKey[key]
+			if queue == nil {
+				queue = &dispatchQueue{}
+				queues = append(queues, queue)
+				queuesByKey[key] = queue
+			}
+			queue.items = append(queue.items, dispatchItem{
+				event:   event,
+				handler: handler,
+			})
+			itemCount++
+		}
+	}
+
+	return queues, itemCount
+}
+
+func (o *Outbox) snapshotHandlersByType() map[string]*matcherHandler {
+	o.handlersMu.RLock()
+	defer o.handlersMu.RUnlock()
+
+	handlers := make(map[string]*matcherHandler, len(o.handlersByType))
+	for handlerType, handler := range o.handlersByType {
+		handlers[handlerType.String()] = handler
+	}
+	return handlers
+}
+
+func dispatchQueueKey(handler *matcherHandler, event eh.Event) string {
+	handlerType := handler.HandlerType().String()
+	if handler.dispatchMode != PartitionByAggregate {
+		return handlerType
+	}
+
+	key := eventPartitionKey(event)
+	if key == "" {
+		return handlerType
+	}
+
+	shards := handler.partitionShards
+	if shards < 1 {
+		shards = defaultPartitionShards
+	}
+	return fmt.Sprintf("%s:%d", handlerType, hashPartition(key, shards))
+}
+
+func eventPartitionKey(event eh.Event) string {
+	if aggregateID := event.AggregateID(); aggregateID != uuid.Nil {
+		return aggregateID.String()
+	}
+	metadata := event.Metadata()
+	for _, key := range []string{"correlation_id", "CorrelationId", "correlationId", "x-correlation-id"} {
+		if value, ok := metadata[key]; ok {
+			if partitionKey := metadataPartitionKey(value); partitionKey != "" {
+				return partitionKey
+			}
+		}
+	}
+	return ""
+}
+
+func metadataPartitionKey(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case fmt.Stringer:
+		return strings.TrimSpace(v.String())
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+}
+
+func hashPartition(key string, shards int) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % uint32(shards))
+}
+
+func (o *Outbox) dispatchHandler(item dispatchItem) handlerDispatchResult {
+	handlerType := item.handler.HandlerType().String()
+	if err := item.handler.HandleEvent(item.event.Ctx, item.event.Event); err != nil {
+		severity := GetSeverity(err)
+		wrappedErr := fmt.Errorf("could not handle event (%s): %w", item.handler.HandlerType(), err)
+		o.sendError(wrappedErr, item.event.Event, item.event.Ctx)
+		return handlerDispatchResult{
+			eventID:     item.event.ID,
+			handlerType: handlerType,
+			err:         wrappedErr,
+			fatal:       severity == SeverityFatal,
+		}
+	}
+	return handlerDispatchResult{
+		eventID:     item.event.ID,
+		handlerType: handlerType,
+	}
 }
 
 func (o *Outbox) fetchAndLockEvents(ctx context.Context) ([]*outboxDoc, error) {
@@ -887,64 +1111,4 @@ func (o *Outbox) insertTerminalDeadLetter(ctx context.Context, r *outboxDoc, rea
 		return fmt.Errorf("could not insert outbox dead letter: %w", err)
 	}
 	return nil
-}
-
-// dispatchEvent - Returns a list of handlers that completed successfully.
-// Also returns count of failed handlers and a boolean indicating if ANY failure was Fatal.
-func (o *Outbox) dispatchEvent(r *outboxDoc) ([]string, int, bool, string) {
-	var successfulHandlers []string
-	var failedHandlers int
-	var fatalError uint32 // use uint32 for atomic ops across goroutines, though here it's 1 event 1 goroutine
-	var firstError string
-
-	handlerSet := make(map[string]struct{})
-	for _, h := range r.Handlers {
-		handlerSet[h] = struct{}{}
-	}
-
-	o.handlersMu.RLock()
-	defer o.handlersMu.RUnlock()
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	for _, mh := range o.handlers {
-		mh := mh // local variable for closure
-		// Check if this handler is even on the list of handlers to be processed for this event.
-		if _, ok := handlerSet[mh.HandlerType().String()]; !ok {
-			continue
-		}
-
-		if !mh.Match(r.Event) {
-			continue
-		}
-
-		wg.Add(1)
-		go func(hnd *matcherHandler) {
-			defer wg.Done()
-			if err := hnd.HandleEvent(r.Ctx, r.Event); err != nil {
-				severity := GetSeverity(err)
-
-				if severity == SeverityFatal {
-					atomic.StoreUint32(&fatalError, 1)
-				}
-				err = fmt.Errorf("could not handle event (%s): %w", hnd.HandlerType(), err)
-				o.sendError(err, r.Event, r.Ctx)
-
-				mu.Lock()
-				failedHandlers++
-				if firstError == "" {
-					firstError = err.Error()
-				}
-				mu.Unlock()
-			} else {
-				mu.Lock()
-				successfulHandlers = append(successfulHandlers, hnd.HandlerType().String())
-				mu.Unlock()
-			}
-		}(mh)
-	}
-
-	wg.Wait()
-	return successfulHandlers, failedHandlers, atomic.LoadUint32(&fatalError) == 1, firstError
 }

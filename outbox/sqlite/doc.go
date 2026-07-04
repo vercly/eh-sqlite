@@ -8,6 +8,10 @@
 // or with WithAvailableAt/WithDelay on the context. Metadata takes precedence
 // over the context helper; if neither is present the event is available now.
 //
+// AddHandler registers handlers with Serial dispatch by default. Use
+// AddHandlerWithOptions with WithDispatchMode(PartitionByAggregate) and
+// WithPartitionShards to opt into per-aggregate ordered shards.
+//
 // When HandleEvent is called with an external transaction in the context via
 // context/sqlite.NewContextWithTx, the caller must call NotifyAfterCommit after
 // committing that transaction. eventstore/sqlite.EventStore.Save does this

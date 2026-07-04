@@ -3,10 +3,12 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -527,6 +529,252 @@ func TestOutboxTerminalFailureWritesDeadLetter(t *testing.T) {
 	}
 }
 
+func TestOutboxSerialDispatchPreservesCreatedAtIDOrder(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	handler := newOrderingHandler("serial_order_handler")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
+		t.Fatal(err)
+	}
+
+	createdAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+	for range 100 {
+		id := uuid.New().String()
+		seedOutboxEventWithID(t, db, o, id, newTestEvent(id), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	}
+	expected := outboxIDsInDispatchOrder(t, db)
+
+	processAllBatches(t, o, ctx)
+
+	if got := handler.Contents(); !slicesEqual(got, expected) {
+		t.Fatalf("serial order mismatch\n got: %v\nwant: %v", got, expected)
+	}
+}
+
+func TestOutboxSerialDispatchDoesNotOverlapHandler(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	handler := newConcurrencyHandler("serial_no_overlap_handler", time.Millisecond)
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
+		t.Fatal(err)
+	}
+
+	createdAt := time.Now().Add(-time.Minute)
+	for i := range 20 {
+		id := uuid.New().String()
+		seedOutboxEventWithID(t, db, o, id, newTestEvent(fmt.Sprintf("event-%d", i)), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	}
+
+	processAllBatches(t, o, ctx)
+
+	if got := handler.MaxInFlight(); got != 1 {
+		t.Fatalf("max in-flight = %d, want 1", got)
+	}
+}
+
+func TestOutboxPartitionByAggregatePreservesSameAggregateOrder(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	handler := newOrderingHandler("partition_same_aggregate_handler")
+	if err := o.AddHandlerWithOptions(ctx, eh.MatchEvents{mocks.EventType}, handler, WithDispatchMode(PartitionByAggregate), WithPartitionShards(8)); err != nil {
+		t.Fatal(err)
+	}
+
+	aggregateID := uuid.New()
+	createdAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+	for range 50 {
+		id := uuid.New().String()
+		seedOutboxEventWithID(t, db, o, id, newTestEventForAggregate(id, aggregateID), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	}
+	expected := outboxIDsInDispatchOrder(t, db)
+
+	processAllBatches(t, o, ctx)
+
+	if got := handler.Contents(); !slicesEqual(got, expected) {
+		t.Fatalf("partition order mismatch\n got: %v\nwant: %v", got, expected)
+	}
+}
+
+func TestOutboxPartitionByAggregateAllowsDifferentAggregatesInParallel(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db, WithMaxGoroutines(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	entered := make(chan string, 2)
+	release := make(chan struct{})
+	handler := newBlockingHandler("partition_parallel_handler", entered, release)
+	if err := o.AddHandlerWithOptions(ctx, eh.MatchEvents{mocks.EventType}, handler, WithDispatchMode(PartitionByAggregate), WithPartitionShards(16)); err != nil {
+		t.Fatal(err)
+	}
+
+	aggregates := aggregateIDsForDistinctShards(t, 2, 16)
+	createdAt := time.Now().Add(-time.Minute)
+	for i, aggregateID := range aggregates {
+		id := uuid.New().String()
+		seedOutboxEventWithID(t, db, o, id, newTestEventForAggregate(fmt.Sprintf("event-%d", i), aggregateID), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := o.processBatch(ctx)
+		done <- err
+	}()
+
+	waitForEntries(t, entered, 2)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := handler.MaxInFlight(); got < 2 {
+		t.Fatalf("max in-flight = %d, want at least 2", got)
+	}
+}
+
+func TestOutboxPartitionByAggregateUsesCorrelationIDFallback(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db, WithMaxGoroutines(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	entered := make(chan string, 2)
+	release := make(chan struct{})
+	handler := newBlockingHandler("partition_correlation_handler", entered, release)
+	if err := o.AddHandlerWithOptions(ctx, eh.MatchEvents{mocks.EventType}, handler, WithDispatchMode(PartitionByAggregate), WithPartitionShards(16)); err != nil {
+		t.Fatal(err)
+	}
+
+	correlationIDs := correlationIDsForDistinctShards(t, 2, 16)
+	createdAt := time.Now().Add(-time.Minute)
+	for i, correlationID := range correlationIDs {
+		id := uuid.New().String()
+		event := eh.NewEvent(mocks.EventType, &mocks.EventData{Content: fmt.Sprintf("event-%d", i)}, time.Now(),
+			eh.WithMetadata(map[string]any{"correlation_id": correlationID}),
+		)
+		seedOutboxEventWithID(t, db, o, id, event, []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := o.processBatch(ctx)
+		done <- err
+	}()
+
+	waitForEntries(t, entered, 2)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := handler.MaxInFlight(); got < 2 {
+		t.Fatalf("max in-flight = %d, want at least 2", got)
+	}
+}
+
+func TestOutboxDispatchRespectsGlobalMaxGoroutines(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db, WithMaxGoroutines(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	handler := newConcurrencyHandler("partition_cap_handler", 10*time.Millisecond)
+	if err := o.AddHandlerWithOptions(ctx, eh.MatchEvents{mocks.EventType}, handler, WithDispatchMode(PartitionByAggregate), WithPartitionShards(16)); err != nil {
+		t.Fatal(err)
+	}
+
+	aggregates := aggregateIDsForDistinctShards(t, 8, 16)
+	createdAt := time.Now().Add(-time.Minute)
+	for i, aggregateID := range aggregates {
+		id := uuid.New().String()
+		seedOutboxEventWithID(t, db, o, id, newTestEventForAggregate(fmt.Sprintf("event-%d", i), aggregateID), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	}
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != len(aggregates) {
+		t.Fatalf("processed = %d, want %d", processed, len(aggregates))
+	}
+	if got := handler.MaxInFlight(); got > 2 {
+		t.Fatalf("max in-flight = %d, want <= 2", got)
+	}
+}
+
+func TestOutboxPartialSuccessKeepsOnlyFailedHandlerForRetry(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db, WithRetryBackoff("FIXED:2:200ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	successHandler := mocks.NewEventHandler("partial_success_handler")
+	failingHandler := mocks.NewEventHandler("partial_failing_handler")
+	failingHandler.Err = errors.New("temporary failure")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, successHandler); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, failingHandler); err != nil {
+		t.Fatal(err)
+	}
+
+	createdAt := time.Now().Add(-time.Minute)
+	id := uuid.New().String()
+	seedOutboxEventWithID(t, db, o, id, newTestEvent("partial"), []string{successHandler.Type, failingHandler.Type}, createdAt, createdAt, sql.NullTime{})
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	var handlersBlob string
+	var retryCount int
+	var takenAt sql.NullTime
+	if err := db.QueryRow(`SELECT handlers, retry_count, taken_at FROM outbox WHERE id = ?`, id).Scan(&handlersBlob, &retryCount, &takenAt); err != nil {
+		t.Fatal(err)
+	}
+	var handlers []string
+	if err := json.Unmarshal([]byte(handlersBlob), &handlers); err != nil {
+		t.Fatal(err)
+	}
+	if !slicesEqual(handlers, []string{failingHandler.Type}) {
+		t.Fatalf("remaining handlers = %v, want [%s]", handlers, failingHandler.Type)
+	}
+	if retryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", retryCount)
+	}
+	if takenAt.Valid {
+		t.Fatal("taken_at should be cleared for retry")
+	}
+}
+
 func newTestDB(t testing.TB) *sql.DB {
 	t.Helper()
 
@@ -576,6 +824,12 @@ func newTestEvent(content string) eh.Event {
 	)
 }
 
+func newTestEventForAggregate(content string, aggregateID uuid.UUID) eh.Event {
+	return eh.NewEvent(mocks.EventType, &mocks.EventData{Content: content}, time.Now(),
+		eh.ForAggregate(mocks.AggregateType, aggregateID, 1),
+	)
+}
+
 func seedOutboxEvent(t testing.TB, db *sql.DB, o *Outbox, event eh.Event, handlerType string, createdAt, availableAt time.Time, takenAt sql.NullTime) {
 	t.Helper()
 
@@ -591,6 +845,234 @@ func seedOutboxEvent(t testing.TB, db *sql.DB, o *Outbox, event eh.Event, handle
 	`, uuid.New().String(), event.EventType().String(), event.AggregateID().String(), createdAt, availableAt, takenAt, handlersBlob, string(eventBlob), 0); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func seedOutboxEventWithID(t testing.TB, db *sql.DB, o *Outbox, id string, event eh.Event, handlers []string, createdAt, availableAt time.Time, takenAt sql.NullTime) {
+	t.Helper()
+
+	eventBlob, err := o.codec.MarshalEvent(context.Background(), event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlersBlob, err := json.Marshal(handlers)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Exec(`
+		INSERT INTO outbox (id, event_type, aggregate_id, created_at, available_at, taken_at, handlers, event_blob, retry_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, id, event.EventType().String(), event.AggregateID().String(), createdAt, availableAt, takenAt, string(handlersBlob), string(eventBlob), 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func processAllBatches(t testing.TB, o *Outbox, ctx context.Context) {
+	t.Helper()
+
+	for {
+		processed, err := o.processBatch(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if processed == 0 {
+			return
+		}
+	}
+}
+
+func outboxIDsInDispatchOrder(t testing.TB, db *sql.DB) []string {
+	t.Helper()
+
+	rows, err := db.Query(`SELECT id FROM outbox ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+func aggregateIDsForDistinctShards(t testing.TB, count, shards int) []uuid.UUID {
+	t.Helper()
+
+	seen := map[int]bool{}
+	var ids []uuid.UUID
+	for attempts := 0; len(ids) < count && attempts < 10000; attempts++ {
+		id := uuid.New()
+		shard := hashPartition(id.String(), shards)
+		if seen[shard] {
+			continue
+		}
+		seen[shard] = true
+		ids = append(ids, id)
+	}
+	if len(ids) != count {
+		t.Fatalf("generated %d distinct shard aggregate IDs, want %d", len(ids), count)
+	}
+	return ids
+}
+
+func correlationIDsForDistinctShards(t testing.TB, count, shards int) []string {
+	t.Helper()
+
+	seen := map[int]bool{}
+	var ids []string
+	for i := 0; len(ids) < count && i < 10000; i++ {
+		id := fmt.Sprintf("correlation-%d", i)
+		shard := hashPartition(id, shards)
+		if seen[shard] {
+			continue
+		}
+		seen[shard] = true
+		ids = append(ids, id)
+	}
+	if len(ids) != count {
+		t.Fatalf("generated %d distinct shard correlation IDs, want %d", len(ids), count)
+	}
+	return ids
+}
+
+type orderingHandler struct {
+	Type string
+	mu   sync.Mutex
+	seen []string
+}
+
+func newOrderingHandler(handlerType string) *orderingHandler {
+	return &orderingHandler{Type: handlerType}
+}
+
+func (h *orderingHandler) HandlerType() eh.EventHandlerType {
+	return eh.EventHandlerType(h.Type)
+}
+
+func (h *orderingHandler) HandleEvent(_ context.Context, event eh.Event) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.seen = append(h.seen, eventContent(event))
+	return nil
+}
+
+func (h *orderingHandler) Contents() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return append([]string(nil), h.seen...)
+}
+
+type concurrencyHandler struct {
+	Type     string
+	delay    time.Duration
+	inFlight atomic.Int64
+	max      atomic.Int64
+}
+
+func newConcurrencyHandler(handlerType string, delay time.Duration) *concurrencyHandler {
+	return &concurrencyHandler{Type: handlerType, delay: delay}
+}
+
+func (h *concurrencyHandler) HandlerType() eh.EventHandlerType {
+	return eh.EventHandlerType(h.Type)
+}
+
+func (h *concurrencyHandler) HandleEvent(context.Context, eh.Event) error {
+	current := h.inFlight.Add(1)
+	updateMax(&h.max, current)
+	if h.delay > 0 {
+		time.Sleep(h.delay)
+	}
+	h.inFlight.Add(-1)
+	return nil
+}
+
+func (h *concurrencyHandler) MaxInFlight() int64 {
+	return h.max.Load()
+}
+
+type blockingHandler struct {
+	Type     string
+	entered  chan<- string
+	release  <-chan struct{}
+	inFlight atomic.Int64
+	max      atomic.Int64
+}
+
+func newBlockingHandler(handlerType string, entered chan<- string, release <-chan struct{}) *blockingHandler {
+	return &blockingHandler{Type: handlerType, entered: entered, release: release}
+}
+
+func (h *blockingHandler) HandlerType() eh.EventHandlerType {
+	return eh.EventHandlerType(h.Type)
+}
+
+func (h *blockingHandler) HandleEvent(_ context.Context, event eh.Event) error {
+	current := h.inFlight.Add(1)
+	updateMax(&h.max, current)
+	h.entered <- eventContent(event)
+	<-h.release
+	h.inFlight.Add(-1)
+	return nil
+}
+
+func (h *blockingHandler) MaxInFlight() int64 {
+	return h.max.Load()
+}
+
+func updateMax(max *atomic.Int64, value int64) {
+	for {
+		current := max.Load()
+		if value <= current {
+			return
+		}
+		if max.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
+func waitForEntries(t testing.TB, entered <-chan string, count int) {
+	t.Helper()
+
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < count; i++ {
+		select {
+		case <-entered:
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d parallel entries, got %d", count, i)
+		}
+	}
+}
+
+func eventContent(event eh.Event) string {
+	if data, ok := event.Data().(*mocks.EventData); ok {
+		return data.Content
+	}
+	return fmt.Sprint(event.Data())
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func outboxRowCount(t testing.TB, db *sql.DB) int {
