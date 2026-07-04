@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/vercly/eh-sqlite/backoff"
 	"github.com/vercly/eh-sqlite/context/sqlite"
+	dl "github.com/vercly/eh-sqlite/deadletter"
 	"github.com/vercly/eh-sqlite/internal/deadletter"
 	"golang.org/x/sync/errgroup"
 
@@ -55,23 +55,24 @@ func WithAvailableAt(ctx context.Context, availableAt time.Time) context.Context
 
 // Outbox implements an eventhorizon.Outbox for SQLite.
 type Outbox struct {
-	db              *sql.DB
-	outboxTable     string
-	deadLetterTable string
-	handlers        []*matcherHandler
-	handlersByType  map[eh.EventHandlerType]*matcherHandler
-	handlersMu      sync.RWMutex
-	watchCh         chan *outboxDoc
-	scheduleCh      chan struct{}
-	errCh           chan error
-	cctx            context.Context
-	cancel          context.CancelFunc
-	wg              sync.WaitGroup
-	started         atomic.Bool
-	codec           eh.EventCodec
-	maxRetries      int
-	maxGoroutines   int
-	retryBackoff    backoff.Config
+	db               *sql.DB
+	outboxTable      string
+	deadLetterTable  string
+	handlers         []*matcherHandler
+	handlersByType   map[eh.EventHandlerType]*matcherHandler
+	handlersMu       sync.RWMutex
+	watchCh          chan *outboxDoc
+	scheduleCh       chan struct{}
+	errCh            chan error
+	cctx             context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	started          atomic.Bool
+	codec            eh.EventCodec
+	maxRetries       int
+	maxGoroutines    int
+	retryBackoff     backoff.Config
+	deadLetterExport dl.Exporter
 
 	insertEventStmt      *sql.Stmt
 	selectEventsStmt     *sql.Stmt
@@ -270,6 +271,15 @@ func WithRetryBackoff(pattern string) Option {
 func WithMaxGoroutines(max int) Option {
 	return func(o *Outbox) error {
 		o.maxGoroutines = max
+		return nil
+	}
+}
+
+// WithDeadLetterExporter registers a best-effort exporter called after a
+// dead_letters row is inserted. Export failures do not roll back the DB write.
+func WithDeadLetterExporter(exporter dl.Exporter) Option {
+	return func(o *Outbox) error {
+		o.deadLetterExport = exporter
 		return nil
 	}
 }
@@ -771,12 +781,14 @@ func (o *Outbox) scanOutboxDoc(rows *sql.Rows) (*outboxDoc, error) {
 }
 
 type processedResult struct {
-	r                      *outboxDoc
-	successfulHandlers     []string
-	failedRetryable        int
-	failedFatal            int
-	errorMessage           string
-	failedDropDueToRetries bool
+	r                  *outboxDoc
+	successfulHandlers []string
+	failedHandlers     map[string]handlerFailure
+}
+
+type handlerFailure struct {
+	err   string
+	fatal bool
 }
 
 type dispatchItem struct {
@@ -807,7 +819,10 @@ func (o *Outbox) processBatch(ctx context.Context) (int, error) {
 
 	results := make(map[string]*processedResult, len(eventsToProcess))
 	for _, event := range eventsToProcess {
-		results[event.ID.String()] = &processedResult{r: event}
+		results[event.ID.String()] = &processedResult{
+			r:              event,
+			failedHandlers: map[string]handlerFailure{},
+		}
 	}
 
 	queues, itemCount := o.buildDispatchQueues(eventsToProcess)
@@ -842,13 +857,11 @@ func (o *Outbox) processBatch(ctx context.Context) (int, error) {
 				continue
 			}
 			if handlerResult.err != nil {
-				if handlerResult.fatal {
-					res.failedFatal++
-				} else {
-					res.failedRetryable++
-				}
-				if res.errorMessage == "" {
-					res.errorMessage = handlerResult.err.Error()
+				if _, ok := res.failedHandlers[handlerResult.handlerType]; !ok {
+					res.failedHandlers[handlerResult.handlerType] = handlerFailure{
+						err:   handlerResult.err.Error(),
+						fatal: handlerResult.fatal,
+					}
 				}
 				continue
 			}
@@ -863,9 +876,6 @@ func (o *Outbox) processBatch(ctx context.Context) (int, error) {
 	resultsCh := make(chan processedResult, len(eventsToProcess))
 	for _, event := range eventsToProcess {
 		res := results[event.ID.String()]
-		if res.failedRetryable > 0 && event.RetryCount >= o.maxRetries {
-			res.failedDropDueToRetries = true
-		}
 		resultsCh <- *res
 	}
 	close(resultsCh)
@@ -1033,24 +1043,49 @@ func (o *Outbox) updateEventsDB(ctx context.Context, resultsCh <-chan processedR
 	for res := range resultsCh {
 		r := res.r
 
-		// If nothing worked and it's a poison pill due to max retries or a fatal error
-		if res.failedDropDueToRetries || res.failedFatal > 0 {
-			o.sendError(fmt.Errorf("event dropped outbox: max retries reached or fatal error encountered"), r.Event, ctx)
-			if err := o.insertTerminalDeadLetter(ctx, r, res.errorMessage); err != nil {
-				o.sendError(err, r.Event, ctx)
+		successful := stringSet(res.successfulHandlers)
+		terminalFailures := make(map[string]handlerFailure)
+		retryableFailures := make(map[string]handlerFailure)
+		for handlerType, failure := range res.failedHandlers {
+			if failure.fatal || r.RetryCount >= o.maxRetries {
+				terminalFailures[handlerType] = failure
+				continue
 			}
-			if _, err := o.deleteEventStmt.ExecContext(ctx, r.ID.String()); err != nil {
-				o.sendError(fmt.Errorf("could not delete fully processed/dropped event: %w", err), r.Event, ctx)
-			}
-			continue
+			retryableFailures[handlerType] = failure
 		}
 
-		// Update the list of remaining handlers
+		intendedRemainingHandlers := make([]string, 0, len(r.Handlers))
+		for _, required := range r.Handlers {
+			if successful[required] {
+				continue
+			}
+			if _, terminal := terminalFailures[required]; terminal {
+				continue
+			}
+			intendedRemainingHandlers = append(intendedRemainingHandlers, required)
+		}
+
+		terminalRemoved := make(map[string]bool, len(terminalFailures))
+		if len(terminalFailures) > 0 {
+			o.sendError(fmt.Errorf("event handler moved to dead letters"), r.Event, ctx)
+			for handlerType, failure := range terminalFailures {
+				if err := o.insertOutboxDeadLetter(ctx, r, handlerType, intendedRemainingHandlers, failure.err); err != nil {
+					o.sendError(err, r.Event, ctx)
+					continue
+				}
+				terminalRemoved[handlerType] = true
+			}
+		}
+
 		remainingHandlers := make([]string, 0, len(r.Handlers))
 		for _, required := range r.Handlers {
-			if !slices.Contains(res.successfulHandlers, required) {
-				remainingHandlers = append(remainingHandlers, required)
+			if successful[required] {
+				continue
 			}
+			if terminalRemoved[required] {
+				continue
+			}
+			remainingHandlers = append(remainingHandlers, required)
 		}
 
 		if len(remainingHandlers) == 0 {
@@ -1059,7 +1094,7 @@ func (o *Outbox) updateEventsDB(ctx context.Context, resultsCh <-chan processedR
 				o.sendError(fmt.Errorf("could not delete fully processed event: %w", err), r.Event, ctx)
 			}
 		} else {
-			if res.failedRetryable > 0 {
+			if len(retryableFailures) > 0 {
 				nextRetryCount := r.RetryCount + 1
 				availableAt := time.Now().Add(o.retryBackoff.DelayFunc(int64(nextRetryCount)))
 				if _, err := o.scheduleRetryStmt.ExecContext(ctx, availableAt, r.ID.String()); err != nil {
@@ -1080,12 +1115,20 @@ func (o *Outbox) updateEventsDB(ctx context.Context, resultsCh <-chan processedR
 	}
 }
 
-func (o *Outbox) insertTerminalDeadLetter(ctx context.Context, r *outboxDoc, reason string) error {
+func stringSet(values []string) map[string]bool {
+	set := make(map[string]bool, len(values))
+	for _, value := range values {
+		set[value] = true
+	}
+	return set
+}
+
+func (o *Outbox) insertOutboxDeadLetter(ctx context.Context, r *outboxDoc, handlerType string, remainingHandlers []string, reason string) error {
 	eventBlob, err := o.codec.MarshalEvent(ctx, r.Event)
 	if err != nil {
 		return fmt.Errorf("could not marshal dead letter event: %w", err)
 	}
-	remainingHandlers, err := jsoniter.Marshal(r.Handlers)
+	remainingHandlersBlob, err := jsoniter.Marshal(remainingHandlers)
 	if err != nil {
 		return fmt.Errorf("could not marshal dead letter handlers: %w", err)
 	}
@@ -1093,22 +1136,40 @@ func (o *Outbox) insertTerminalDeadLetter(ctx context.Context, r *outboxDoc, rea
 		reason = "max retries reached or fatal handler error"
 	}
 	now := time.Now()
-	if _, err := o.insertDeadLetterStmt.ExecContext(
-		ctx,
-		uuid.New().String(),
-		"outbox",
-		r.Event.EventType().String(),
-		r.Event.AggregateID().String(),
-		strings.Join(r.Handlers, ","),
-		r.ID.String(),
-		string(remainingHandlers),
-		string(eventBlob),
-		reason,
-		r.RetryCount,
-		r.CreatedAt,
-		now,
+	record := dl.Record{
+		ID:                uuid.New().String(),
+		Source:            "outbox",
+		EventType:         r.Event.EventType().String(),
+		AggregateID:       r.Event.AggregateID().String(),
+		HandlerType:       handlerType,
+		OutboxID:          r.ID.String(),
+		RemainingHandlers: string(remainingHandlersBlob),
+		Blob:              string(eventBlob),
+		Error:             reason,
+		RetryCount:        r.RetryCount,
+		CreatedAt:         r.CreatedAt,
+		DeadAt:            now,
+	}
+	if _, err := o.insertDeadLetterStmt.ExecContext(ctx,
+		record.ID,
+		record.Source,
+		record.EventType,
+		record.AggregateID,
+		record.HandlerType,
+		record.OutboxID,
+		record.RemainingHandlers,
+		record.Blob,
+		record.Error,
+		record.RetryCount,
+		record.CreatedAt,
+		record.DeadAt,
 	); err != nil {
 		return fmt.Errorf("could not insert outbox dead letter: %w", err)
+	}
+	if o.deadLetterExport != nil {
+		if err := o.deadLetterExport.ExportDeadLetter(ctx, record); err != nil {
+			o.sendError(fmt.Errorf("could not export outbox dead letter: %w", err), r.Event, ctx)
+		}
 	}
 	return nil
 }

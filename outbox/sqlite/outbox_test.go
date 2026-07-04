@@ -13,6 +13,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	dl "github.com/vercly/eh-sqlite/deadletter"
 
 	txctx "github.com/vercly/eh-sqlite/context/sqlite"
 	eh "github.com/vercly/eventhorizon"
@@ -526,6 +527,213 @@ func TestOutboxTerminalFailureWritesDeadLetter(t *testing.T) {
 	}
 	if source != "outbox" || handlerType != "terminal_handler" {
 		t.Fatalf("dead letter = (%s, %s), want outbox/terminal_handler", source, handlerType)
+	}
+}
+
+func TestOutboxFatalHandlerDeadLetterDoesNotDropSuccessfulHandler(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	successHandler := mocks.NewEventHandler("fatal_success_handler")
+	fatalHandler := mocks.NewEventHandler("fatal_failed_handler")
+	fatalHandler.Err = fatalOutboxError{err: errors.New("fatal handler failure")}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, successHandler); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, fatalHandler); err != nil {
+		t.Fatal(err)
+	}
+
+	id := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute)
+	seedOutboxEventWithID(t, db, o, id, newTestEvent("fatal-success"), []string{successHandler.Type, fatalHandler.Type}, createdAt, createdAt, sql.NullTime{})
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	if got := outboxRowCount(t, db); got != 0 {
+		t.Fatalf("outbox rows = %d, want 0", got)
+	}
+	assertDeadLetterHandlers(t, db, []string{fatalHandler.Type})
+	record := deadLetterRecordByHandler(t, db, fatalHandler.Type)
+	if record.OutboxID != id {
+		t.Fatalf("outbox_id = %s, want %s", record.OutboxID, id)
+	}
+	if record.RemainingHandlers != "[]" {
+		t.Fatalf("remaining_handlers = %s, want []", record.RemainingHandlers)
+	}
+}
+
+func TestOutboxFatalHandlerDeadLetterLeavesRetryableHandler(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db, WithRetryBackoff("FIXED:2:200ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	fatalHandler := mocks.NewEventHandler("mixed_fatal_handler")
+	fatalHandler.Err = fatalOutboxError{err: errors.New("fatal handler failure")}
+	retryableHandler := mocks.NewEventHandler("mixed_retry_handler")
+	retryableHandler.Err = errors.New("temporary handler failure")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, fatalHandler); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, retryableHandler); err != nil {
+		t.Fatal(err)
+	}
+
+	id := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute)
+	seedOutboxEventWithID(t, db, o, id, newTestEvent("fatal-retry"), []string{fatalHandler.Type, retryableHandler.Type}, createdAt, createdAt, sql.NullTime{})
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	assertDeadLetterHandlers(t, db, []string{fatalHandler.Type})
+	assertOutboxHandlers(t, db, id, []string{retryableHandler.Type})
+	var retryCount int
+	var availableAt time.Time
+	var takenAt sql.NullTime
+	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox WHERE id = ?`, id).Scan(&retryCount, &availableAt, &takenAt); err != nil {
+		t.Fatal(err)
+	}
+	if retryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", retryCount)
+	}
+	if !availableAt.After(time.Now().Add(100 * time.Millisecond)) {
+		t.Fatalf("available_at = %s, want future retry", availableAt)
+	}
+	if takenAt.Valid {
+		t.Fatal("taken_at should be cleared for retry")
+	}
+	record := deadLetterRecordByHandler(t, db, fatalHandler.Type)
+	if record.RemainingHandlers != fmt.Sprintf(`["%s"]`, retryableHandler.Type) {
+		t.Fatalf("remaining_handlers = %s, want retryable handler only", record.RemainingHandlers)
+	}
+}
+
+func TestOutboxExhaustedRetriesWritesDeadLetterPerFailedHandler(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db, WithMaxRetries(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	first := mocks.NewEventHandler("exhausted_first_handler")
+	first.Err = errors.New("first failure")
+	second := mocks.NewEventHandler("exhausted_second_handler")
+	second.Err = errors.New("second failure")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, second); err != nil {
+		t.Fatal(err)
+	}
+
+	id := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute)
+	seedOutboxEventWithID(t, db, o, id, newTestEvent("exhausted"), []string{first.Type, second.Type}, createdAt, createdAt, sql.NullTime{})
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	if got := outboxRowCount(t, db); got != 0 {
+		t.Fatalf("outbox rows = %d, want 0", got)
+	}
+	assertDeadLetterHandlers(t, db, []string{first.Type, second.Type})
+	if got := deadLetterRowCount(t, db); got != 2 {
+		t.Fatalf("dead letter rows = %d, want 2", got)
+	}
+}
+
+func TestOutboxPermanentFailureDoesNotBlockRemainingReceiver(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	fatalHandler := mocks.NewEventHandler("first_permanent_handler")
+	fatalHandler.Err = fatalOutboxError{err: errors.New("fatal handler failure")}
+	remainingHandler := mocks.NewEventHandler("remaining_handler")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, fatalHandler); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, remainingHandler); err != nil {
+		t.Fatal(err)
+	}
+
+	id := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute)
+	seedOutboxEventWithID(t, db, o, id, newTestEvent("remaining"), []string{fatalHandler.Type}, createdAt, createdAt, sql.NullTime{})
+	seedOutboxEventWithID(t, db, o, uuid.New().String(), newTestEvent("next"), []string{remainingHandler.Type}, createdAt, createdAt, sql.NullTime{})
+
+	processAllBatches(t, o, ctx)
+
+	if got := outboxRowCount(t, db); got != 0 {
+		t.Fatalf("outbox rows = %d, want 0", got)
+	}
+	if !remainingHandler.Wait(time.Second) {
+		t.Fatal("remaining receiver did not process its event")
+	}
+	assertDeadLetterHandlers(t, db, []string{fatalHandler.Type})
+}
+
+func TestOutboxDeadLetterExporterBestEffort(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	exporter := &recordingDeadLetterExporter{err: errors.New("disk full")}
+	o, err := NewOutbox(db, WithMaxRetries(0), WithDeadLetterExporter(exporter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	first := mocks.NewEventHandler("export_first_handler")
+	first.Err = errors.New("first failure")
+	second := mocks.NewEventHandler("export_second_handler")
+	second.Err = errors.New("second failure")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, second); err != nil {
+		t.Fatal(err)
+	}
+
+	createdAt := time.Now().Add(-time.Minute)
+	seedOutboxEventWithID(t, db, o, uuid.New().String(), newTestEvent("export"), []string{first.Type, second.Type}, createdAt, createdAt, sql.NullTime{})
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	if got := deadLetterRowCount(t, db); got != 2 {
+		t.Fatalf("dead letter rows = %d, want 2", got)
+	}
+	if got := len(exporter.Records()); got != 2 {
+		t.Fatalf("exported records = %d, want 2", got)
 	}
 }
 
@@ -1093,4 +1301,112 @@ func deadLetterRowCount(t testing.TB, db *sql.DB) int {
 		t.Fatal(err)
 	}
 	return count
+}
+
+type fatalOutboxError struct {
+	err error
+}
+
+func (e fatalOutboxError) Error() string {
+	return e.err.Error()
+}
+
+func (e fatalOutboxError) Unwrap() error {
+	return e.err
+}
+
+func (e fatalOutboxError) OutboxSeverity() ErrorSeverity {
+	return SeverityFatal
+}
+
+type recordingDeadLetterExporter struct {
+	mu      sync.Mutex
+	records []dl.Record
+	err     error
+}
+
+func (e *recordingDeadLetterExporter) ExportDeadLetter(_ context.Context, record dl.Record) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.records = append(e.records, record)
+	return e.err
+}
+
+func (e *recordingDeadLetterExporter) Records() []dl.Record {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return append([]dl.Record(nil), e.records...)
+}
+
+func assertDeadLetterHandlers(t testing.TB, db *sql.DB, want []string) {
+	t.Helper()
+
+	rows, err := db.Query(`SELECT handler_type FROM dead_letters WHERE source = 'outbox' ORDER BY handler_type ASC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var got []string
+	for rows.Next() {
+		var handlerType string
+		if err := rows.Scan(&handlerType); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, handlerType)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	want = append([]string(nil), want...)
+	sortStrings(want)
+	if !slicesEqual(got, want) {
+		t.Fatalf("dead letter handlers = %v, want %v", got, want)
+	}
+}
+
+func assertOutboxHandlers(t testing.TB, db *sql.DB, outboxID string, want []string) {
+	t.Helper()
+
+	var handlersBlob string
+	if err := db.QueryRow(`SELECT handlers FROM outbox WHERE id = ?`, outboxID).Scan(&handlersBlob); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	if err := json.Unmarshal([]byte(handlersBlob), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !slicesEqual(got, want) {
+		t.Fatalf("outbox handlers = %v, want %v", got, want)
+	}
+}
+
+type deadLetterRow struct {
+	OutboxID          string
+	RemainingHandlers string
+}
+
+func deadLetterRecordByHandler(t testing.TB, db *sql.DB, handlerType string) deadLetterRow {
+	t.Helper()
+
+	var record deadLetterRow
+	if err := db.QueryRow(`
+		SELECT outbox_id, remaining_handlers
+		FROM dead_letters
+		WHERE source = 'outbox' AND handler_type = ?
+	`, handlerType).Scan(&record.OutboxID, &record.RemainingHandlers); err != nil {
+		t.Fatal(err)
+	}
+	return record
+}
+
+func sortStrings(values []string) {
+	for i := 1; i < len(values); i++ {
+		for j := i; j > 0 && values[j] < values[j-1]; j-- {
+			values[j], values[j-1] = values[j-1], values[j]
+		}
+	}
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	dl "github.com/vercly/eh-sqlite/deadletter"
 	"github.com/vercly/eh-sqlite/middleware/commandhandler/durable"
 	"github.com/vercly/eh-sqlite/tracing"
 	eh "github.com/vercly/eventhorizon"
@@ -195,6 +196,52 @@ func TestDurableTracingPanicRecoveryBecomesPermanentDeadLetter(t *testing.T) {
 	assertDeadLetters(t, db, 1)
 }
 
+func TestDurablePermanentCommandCallsDeadLetterExporter(t *testing.T) {
+	db := newDurableTestDB(t)
+	exporter := &recordingDeadLetterExporter{}
+	handler := &recordingCommandHandler{err: fatalTestError{}}
+	wrapped := newWrappedHandler(t, db, handler,
+		durable.WithMaxRetries(2),
+		durable.WithRetryBackoff("FIXED:2:1ms"),
+		durable.WithDeadLetterExporter(exporter),
+	)
+
+	if err := wrapped.HandleCommand(context.Background(), testCommand{ID: uuid.New()}); err == nil {
+		t.Fatal("HandleCommand error = nil, want fatal error")
+	}
+
+	assertTaskState(t, db, "failed_permanent", 0)
+	assertDeadLetters(t, db, 1)
+	records := exporter.Records()
+	if len(records) != 1 {
+		t.Fatalf("exported records = %d, want 1", len(records))
+	}
+	if records[0].Source != "command" || records[0].HandlerType != "command_handler" {
+		t.Fatalf("exported record = (%s, %s), want command/command_handler", records[0].Source, records[0].HandlerType)
+	}
+}
+
+func TestDurableFailedPermanentIsNotDeadLetteredAgain(t *testing.T) {
+	db := newDurableTestDB(t)
+	handler := &recordingCommandHandler{err: fatalTestError{}}
+	wrapped := newWrappedHandler(t, db, handler, durable.WithMaxRetries(2), durable.WithRetryBackoff("FIXED:2:1ms"))
+
+	if err := wrapped.HandleCommand(context.Background(), testCommand{ID: uuid.New()}); err == nil {
+		t.Fatal("HandleCommand error = nil, want fatal error")
+	}
+	assertDeadLetters(t, db, 1)
+
+	assertSweepProcessed(t, db, wrapped, 0, durable.WithMaxRetries(2), durable.WithRetryBackoff("FIXED:2:1ms"))
+	if err := durable.Resume(context.Background(), db, wrapped, durable.WithMaxRetries(2), durable.WithRetryBackoff("FIXED:2:1ms")); err != nil {
+		t.Fatal(err)
+	}
+
+	assertDeadLetters(t, db, 1)
+	if handler.Attempts() != 1 {
+		t.Fatalf("handler attempts = %d, want 1", handler.Attempts())
+	}
+}
+
 func newWrappedHandler(t testing.TB, db *sql.DB, handler eh.CommandHandler, options ...durable.Option) eh.CommandHandler {
 	t.Helper()
 
@@ -299,4 +346,24 @@ func newDurableTestDB(t testing.TB) *sql.DB {
 		os.Remove(f.Name())
 	})
 	return db
+}
+
+type recordingDeadLetterExporter struct {
+	mu      sync.Mutex
+	records []dl.Record
+}
+
+func (e *recordingDeadLetterExporter) ExportDeadLetter(_ context.Context, record dl.Record) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.records = append(e.records, record)
+	return nil
+}
+
+func (e *recordingDeadLetterExporter) Records() []dl.Record {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return append([]dl.Record(nil), e.records...)
 }

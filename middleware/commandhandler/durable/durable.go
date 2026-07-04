@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/vercly/eh-sqlite/backoff"
+	dl "github.com/vercly/eh-sqlite/deadletter"
 	"github.com/vercly/eh-sqlite/internal/deadletter"
 	eh "github.com/vercly/eventhorizon"
 	"github.com/vercly/eventhorizon/codec/json"
@@ -78,6 +79,7 @@ type config struct {
 	retryBackoff  backoff.Config
 	sweepInterval time.Duration
 	stuckTimeout  time.Duration
+	exporter      dl.Exporter
 }
 
 func defaultConfig() config {
@@ -121,6 +123,14 @@ func WithSweepInterval(interval time.Duration) Option {
 func WithStuckTimeout(timeout time.Duration) Option {
 	return func(c *config) {
 		c.stuckTimeout = timeout
+	}
+}
+
+// WithDeadLetterExporter registers a best-effort exporter called after a
+// command dead_letters row is inserted. Export failures do not roll back DB.
+func WithDeadLetterExporter(exporter dl.Exporter) Option {
+	return func(c *config) {
+		c.exporter = exporter
 	}
 }
 
@@ -331,7 +341,7 @@ func (m *Middleware) markPermanent(ctx context.Context, taskID int64, cmd eh.Com
 	if err != nil {
 		return err
 	}
-	return insertCommandDeadLetter(ctx, m.db, task, cmd, execErr)
+	return insertCommandDeadLetter(ctx, m.db, task, cmd, execErr, m.cfg.exporter)
 }
 
 // Resume dispatches unfinished commands from the database to the command bus.
@@ -474,16 +484,34 @@ func loadTask(ctx context.Context, db *sql.DB, taskID int64) (taskRecord, error)
 	return task, nil
 }
 
-func insertCommandDeadLetter(ctx context.Context, db *sql.DB, task taskRecord, cmd eh.Command, execErr error) error {
+func insertCommandDeadLetter(ctx context.Context, db *sql.DB, task taskRecord, cmd eh.Command, execErr error, exporter dl.Exporter) error {
 	reason := "command failed permanently"
 	if execErr != nil {
 		reason = execErr.Error()
 	}
+	record := dl.Record{
+		ID:                uuid.New().String(),
+		Source:            "command",
+		EventType:         task.commandType,
+		AggregateID:       cmd.AggregateID().String(),
+		HandlerType:       "command_handler",
+		RemainingHandlers: "[]",
+		Blob:              string(task.commandBlob),
+		Error:             reason,
+		RetryCount:        task.retryCount,
+		CreatedAt:         task.createdAt,
+		DeadAt:            time.Now(),
+	}
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
 		VALUES (?, 'command', ?, ?, 'command_handler', NULL, '[]', ?, ?, ?, ?, ?)
-	`, uuid.New().String(), task.commandType, cmd.AggregateID().String(), string(task.commandBlob), reason, task.retryCount, task.createdAt, time.Now()); err != nil {
+	`, record.ID, record.EventType, record.AggregateID, record.Blob, record.Error, record.RetryCount, record.CreatedAt, record.DeadAt); err != nil {
 		return fmt.Errorf("durable: could not insert command dead letter: %w", err)
+	}
+	if exporter != nil {
+		if err := exporter.ExportDeadLetter(ctx, record); err != nil {
+			log.Printf("durable: could not export command dead letter: %v", err)
+		}
 	}
 	return nil
 }
