@@ -735,6 +735,42 @@ func TestOutboxDeadLetterExporterBestEffort(t *testing.T) {
 	if got := len(exporter.Records()); got != 2 {
 		t.Fatalf("exported records = %d, want 2", got)
 	}
+	if got := exportedDeadLetterCount(t, db); got != 0 {
+		t.Fatalf("exported dead letters = %d, want 0 after exporter error", got)
+	}
+}
+
+func TestOutboxDeadLetterExporterMarksExportedAt(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	exporter := &recordingDeadLetterExporter{}
+	o, err := NewOutbox(db, WithMaxRetries(0), WithDeadLetterExporter(exporter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	handler := mocks.NewEventHandler("export_success_handler")
+	handler.Err = errors.New("handler failure")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
+		t.Fatal(err)
+	}
+
+	createdAt := time.Now().Add(-time.Minute)
+	seedOutboxEventWithID(t, db, o, uuid.New().String(), newTestEvent("export-success"), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	if got := deadLetterRowCount(t, db); got != 1 {
+		t.Fatalf("dead letter rows = %d, want 1", got)
+	}
+	if got := exportedDeadLetterCount(t, db); got != 1 {
+		t.Fatalf("exported dead letters = %d, want 1", got)
+	}
 }
 
 func TestOutboxSerialDispatchPreservesCreatedAtIDOrder(t *testing.T) {
@@ -1298,6 +1334,16 @@ func deadLetterRowCount(t testing.TB, db *sql.DB) int {
 
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM dead_letters`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func exportedDeadLetterCount(t testing.TB, db *sql.DB) int {
+	t.Helper()
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM dead_letters WHERE exported_at IS NOT NULL`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	return count

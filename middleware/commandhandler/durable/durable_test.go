@@ -219,6 +219,9 @@ func TestDurablePermanentCommandCallsDeadLetterExporter(t *testing.T) {
 	if records[0].Source != "command" || records[0].HandlerType != "command_handler" {
 		t.Fatalf("exported record = (%s, %s), want command/command_handler", records[0].Source, records[0].HandlerType)
 	}
+	if got := exportedDeadLetterCount(t, db); got != 1 {
+		t.Fatalf("exported dead letters = %d, want 1", got)
+	}
 }
 
 func TestDurableFailedPermanentIsNotDeadLetteredAgain(t *testing.T) {
@@ -326,6 +329,16 @@ func assertDeadLetters(t testing.TB, db *sql.DB, want int) {
 	if count != want {
 		t.Fatalf("command dead letters = %d, want %d", count, want)
 	}
+}
+
+func exportedDeadLetterCount(t testing.TB, db *sql.DB) int {
+	t.Helper()
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM dead_letters WHERE exported_at IS NOT NULL`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
 }
 
 func newDurableTestDB(t testing.TB) *sql.DB {

@@ -511,7 +511,16 @@ func insertCommandDeadLetter(ctx context.Context, db *sql.DB, task taskRecord, c
 	if exporter != nil {
 		if err := exporter.ExportDeadLetter(ctx, record); err != nil {
 			log.Printf("durable: could not export command dead letter: %v", err)
+		} else if err := markCommandDeadLetterExported(ctx, db, record.ID, time.Now()); err != nil {
+			log.Printf("durable: could not mark command dead letter exported: %v", err)
 		}
+	}
+	return nil
+}
+
+func markCommandDeadLetterExported(ctx context.Context, db *sql.DB, id string, exportedAt time.Time) error {
+	if _, err := db.ExecContext(ctx, `UPDATE dead_letters SET exported_at = ? WHERE id = ?`, exportedAt, id); err != nil {
+		return err
 	}
 	return nil
 }

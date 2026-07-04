@@ -735,6 +735,7 @@ func (o *Outbox) drainWatchChannel() {
 
 // Helper to send errors.
 func (o *Outbox) sendError(err error, event eh.Event, ctx context.Context) {
+	recordErrorSeverity(GetSeverity(err))
 	select {
 	case o.errCh <- &eh.OutboxError{Err: err, Ctx: ctx, Event: event}:
 	default:
@@ -1169,7 +1170,16 @@ func (o *Outbox) insertOutboxDeadLetter(ctx context.Context, r *outboxDoc, handl
 	if o.deadLetterExport != nil {
 		if err := o.deadLetterExport.ExportDeadLetter(ctx, record); err != nil {
 			o.sendError(fmt.Errorf("could not export outbox dead letter: %w", err), r.Event, ctx)
+		} else if err := o.markDeadLetterExported(ctx, record.ID, time.Now()); err != nil {
+			o.sendError(fmt.Errorf("could not mark outbox dead letter exported: %w", err), r.Event, ctx)
 		}
+	}
+	return nil
+}
+
+func (o *Outbox) markDeadLetterExported(ctx context.Context, id string, exportedAt time.Time) error {
+	if _, err := o.db.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET exported_at = ? WHERE id = ?`, o.deadLetterTable), exportedAt, id); err != nil {
+		return err
 	}
 	return nil
 }
