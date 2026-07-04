@@ -17,42 +17,33 @@ package tracing
 import (
 	"context"
 	"fmt"
+
 	"github.com/vercly/eh-sqlite/middleware/commandhandler/durable"
 	eh "github.com/vercly/eventhorizon"
 )
 
-// NewDurableHandler wraps a command handler with logic to automatically interact
-// with the durable middleware. It fetches the completion function from the context
-// and calls it after the inner handler is done.
+type PanicError struct {
+	Value any
+}
+
+func (e PanicError) Error() string {
+	return fmt.Sprintf("panic recovered in durable handler: %v", e.Value)
+}
+
+func (e PanicError) DurableSeverity() durable.ErrorSeverity {
+	return durable.SeverityFatal
+}
+
+// NewDurableHandler wraps a command handler with panic recovery. Durable
+// completion is handled by the durable middleware itself.
 func NewDurableHandler(handler eh.CommandHandler) eh.CommandHandler {
 	return eh.CommandHandlerFunc(func(ctx context.Context, cmd eh.Command) (err error) {
-		// Get the completion function from the context.
-		completionFunc, ok := durable.GetCompletionFunc(ctx)
-		if !ok {
-			// If there's no completion function, this command is not durable.
-			// We can just execute it directly.
-			return handler.HandleCommand(ctx, cmd)
-		}
-
-		// Ensure the completion function is always called.
 		defer func() {
 			if r := recover(); r != nil {
-				// Handle panics in the inner handler.
-				err = fmt.Errorf("panic recovered in durable handler: %v", r)
-				completionFunc("failed_permanent", err)
+				err = PanicError{Value: r}
 			}
 		}()
 
-		// Execute the actual command handler.
-		err = handler.HandleCommand(ctx, cmd)
-
-		// Report the result.
-		if err != nil {
-			completionFunc("failed_permanent", err)
-		} else {
-			completionFunc("completed", nil)
-		}
-
-		return err
+		return handler.HandleCommand(ctx, cmd)
 	})
 }

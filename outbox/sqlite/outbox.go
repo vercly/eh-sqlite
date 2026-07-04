@@ -11,7 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/vercly/eh-sqlite/backoff"
 	"github.com/vercly/eh-sqlite/context/sqlite"
+	"github.com/vercly/eh-sqlite/internal/deadletter"
 	"golang.org/x/sync/errgroup"
 
 	jsoniter "github.com/json-iterator/go"
@@ -68,13 +70,14 @@ type Outbox struct {
 	codec           eh.EventCodec
 	maxRetries      int
 	maxGoroutines   int
+	retryBackoff    backoff.Config
 
 	insertEventStmt      *sql.Stmt
 	selectEventsStmt     *sql.Stmt
 	updateTakenAtStmt    *sql.Stmt
 	deleteEventStmt      *sql.Stmt
 	updateHandlersStmt   *sql.Stmt
-	updateRetryStmt      *sql.Stmt
+	scheduleRetryStmt    *sql.Stmt
 	insertDeadLetterStmt *sql.Stmt
 	nextAvailableAtStmt  *sql.Stmt
 }
@@ -101,6 +104,7 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 		codec:           &ehcodec.EventCodec{},
 		maxRetries:      10, // Default to 10
 		maxGoroutines:   10, // Default to 10 concurrent HTTP handlers
+		retryBackoff:    backoff.FixedConfig(10, PeriodicSweepAge),
 	}
 
 	for _, option := range options {
@@ -174,25 +178,8 @@ func (o *Outbox) ensureSchema() error {
 		return fmt.Errorf("could not create outbox availability index: %w", err)
 	}
 
-	if _, err := o.db.Exec(fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %[1]s (
-			id TEXT PRIMARY KEY,
-			source TEXT NOT NULL,
-			event_type TEXT NOT NULL,
-			aggregate_id TEXT NOT NULL,
-			handler_type TEXT NOT NULL,
-			outbox_id TEXT,
-			remaining_handlers TEXT,
-			blob TEXT NOT NULL,
-			error TEXT NOT NULL,
-			retry_count INTEGER DEFAULT 0,
-			created_at TIMESTAMP NOT NULL,
-			dead_at TIMESTAMP NOT NULL
-		);
-
-		CREATE INDEX IF NOT EXISTS idx_%[1]s_source_created ON %[1]s (source, created_at);
-	`, o.deadLetterTable)); err != nil {
-		return fmt.Errorf("could not create dead letters table: %w", err)
+	if err := deadletter.EnsureSchema(o.db, o.deadLetterTable); err != nil {
+		return err
 	}
 
 	return nil
@@ -206,6 +193,19 @@ func isDuplicateColumnError(err error) bool {
 func WithMaxRetries(retries int) Option {
 	return func(o *Outbox) error {
 		o.maxRetries = retries
+		return nil
+	}
+}
+
+// WithRetryBackoff sets the retry delay curve. The pattern accepts STD, EXP,
+// PROG, FIXED, or comma-separated durations.
+func WithRetryBackoff(pattern string) Option {
+	return func(o *Outbox) error {
+		cfg := backoff.ParseConfig(pattern)
+		o.retryBackoff = cfg
+		if cfg.MaxRetries > 0 {
+			o.maxRetries = cfg.MaxRetries
+		}
 		return nil
 	}
 }
@@ -248,8 +248,9 @@ func (o *Outbox) prepareStatements() (err error) {
 		return fmt.Errorf("could not prepare update handlers statement: %w", err)
 	}
 
-	if o.updateRetryStmt, err = o.db.Prepare(fmt.Sprintf(`UPDATE %s SET retry_count = retry_count + 1 WHERE id = ?`, o.outboxTable)); err != nil {
-		return fmt.Errorf("could not prepare update retry statement: %w", err)
+	if o.scheduleRetryStmt, err = o.db.Prepare(fmt.Sprintf(`
+		UPDATE %s SET retry_count = retry_count + 1, available_at = ?, taken_at = NULL WHERE id = ?`, o.outboxTable)); err != nil {
+		return fmt.Errorf("could not prepare schedule retry statement: %w", err)
 	}
 	if o.insertDeadLetterStmt, err = o.db.Prepare(fmt.Sprintf(`
 		INSERT INTO %s (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
@@ -502,7 +503,7 @@ func (o *Outbox) Close() error {
 		o.updateTakenAtStmt,
 		o.deleteEventStmt,
 		o.updateHandlersStmt,
-		o.updateRetryStmt,
+		o.scheduleRetryStmt,
 		o.insertDeadLetterStmt,
 		o.nextAvailableAtStmt,
 	} {
@@ -700,6 +701,7 @@ type processedResult struct {
 	successfulHandlers     []string
 	failedRetryable        int
 	failedFatal            int
+	errorMessage           string
 	failedDropDueToRetries bool
 }
 
@@ -725,11 +727,12 @@ func (o *Outbox) processBatch(ctx context.Context) (int, error) {
 		req := req // capture loop var
 		g.Go(func() error {
 			// dispatchEvent runs multiple handlers for ONE event and returns how many succeeded/failed
-			successfulHandlers, failedHandlers, fatalError := o.dispatchEvent(req)
+			successfulHandlers, failedHandlers, fatalError, errMsg := o.dispatchEvent(req)
 
 			res := processedResult{
 				r:                  req,
 				successfulHandlers: successfulHandlers,
+				errorMessage:       errMsg,
 			}
 
 			if fatalError {
@@ -809,18 +812,11 @@ func (o *Outbox) updateEventsDB(ctx context.Context, resultsCh <-chan processedR
 		// If nothing worked and it's a poison pill due to max retries or a fatal error
 		if res.failedDropDueToRetries || res.failedFatal > 0 {
 			o.sendError(fmt.Errorf("event dropped outbox: max retries reached or fatal error encountered"), r.Event, ctx)
+			if err := o.insertTerminalDeadLetter(ctx, r, res.errorMessage); err != nil {
+				o.sendError(err, r.Event, ctx)
+			}
 			if _, err := o.deleteEventStmt.ExecContext(ctx, r.ID.String()); err != nil {
 				o.sendError(fmt.Errorf("could not delete fully processed/dropped event: %w", err), r.Event, ctx)
-			}
-			continue
-		}
-
-		if len(res.successfulHandlers) == 0 {
-			// Increment retry counter if no handler succeeded and it's not fatal.
-			if res.failedRetryable > 0 {
-				if _, err := o.updateRetryStmt.ExecContext(ctx, r.ID.String()); err != nil {
-					o.sendError(fmt.Errorf("could not increment event retry: %w", err), r.Event, ctx)
-				}
 			}
 			continue
 		}
@@ -839,7 +835,15 @@ func (o *Outbox) updateEventsDB(ctx context.Context, resultsCh <-chan processedR
 				o.sendError(fmt.Errorf("could not delete fully processed event: %w", err), r.Event, ctx)
 			}
 		} else {
-			// Update the list of handlers in the database
+			if res.failedRetryable > 0 {
+				nextRetryCount := r.RetryCount + 1
+				availableAt := time.Now().Add(o.retryBackoff.DelayFunc(int64(nextRetryCount)))
+				if _, err := o.scheduleRetryStmt.ExecContext(ctx, availableAt, r.ID.String()); err != nil {
+					o.sendError(fmt.Errorf("could not schedule event retry: %w", err), r.Event, ctx)
+				}
+				o.notifySchedule()
+			}
+
 			newHandlersBlob, err := jsoniter.Marshal(remainingHandlers)
 			if err != nil {
 				o.sendError(fmt.Errorf("could not marshal remaining handlers: %w", err), r.Event, ctx)
@@ -852,12 +856,46 @@ func (o *Outbox) updateEventsDB(ctx context.Context, resultsCh <-chan processedR
 	}
 }
 
+func (o *Outbox) insertTerminalDeadLetter(ctx context.Context, r *outboxDoc, reason string) error {
+	eventBlob, err := o.codec.MarshalEvent(ctx, r.Event)
+	if err != nil {
+		return fmt.Errorf("could not marshal dead letter event: %w", err)
+	}
+	remainingHandlers, err := jsoniter.Marshal(r.Handlers)
+	if err != nil {
+		return fmt.Errorf("could not marshal dead letter handlers: %w", err)
+	}
+	if reason == "" {
+		reason = "max retries reached or fatal handler error"
+	}
+	now := time.Now()
+	if _, err := o.insertDeadLetterStmt.ExecContext(
+		ctx,
+		uuid.New().String(),
+		"outbox",
+		r.Event.EventType().String(),
+		r.Event.AggregateID().String(),
+		strings.Join(r.Handlers, ","),
+		r.ID.String(),
+		string(remainingHandlers),
+		string(eventBlob),
+		reason,
+		r.RetryCount,
+		r.CreatedAt,
+		now,
+	); err != nil {
+		return fmt.Errorf("could not insert outbox dead letter: %w", err)
+	}
+	return nil
+}
+
 // dispatchEvent - Returns a list of handlers that completed successfully.
 // Also returns count of failed handlers and a boolean indicating if ANY failure was Fatal.
-func (o *Outbox) dispatchEvent(r *outboxDoc) ([]string, int, bool) {
+func (o *Outbox) dispatchEvent(r *outboxDoc) ([]string, int, bool, string) {
 	var successfulHandlers []string
 	var failedHandlers int
 	var fatalError uint32 // use uint32 for atomic ops across goroutines, though here it's 1 event 1 goroutine
+	var firstError string
 
 	handlerSet := make(map[string]struct{})
 	for _, h := range r.Handlers {
@@ -895,6 +933,9 @@ func (o *Outbox) dispatchEvent(r *outboxDoc) ([]string, int, bool) {
 
 				mu.Lock()
 				failedHandlers++
+				if firstError == "" {
+					firstError = err.Error()
+				}
 				mu.Unlock()
 			} else {
 				mu.Lock()
@@ -905,5 +946,5 @@ func (o *Outbox) dispatchEvent(r *outboxDoc) ([]string, int, bool) {
 	}
 
 	wg.Wait()
-	return successfulHandlers, failedHandlers, atomic.LoadUint32(&fatalError) == 1
+	return successfulHandlers, failedHandlers, atomic.LoadUint32(&fatalError) == 1, firstError
 }

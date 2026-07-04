@@ -17,23 +17,52 @@ package durable
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sync/atomic"
 	"time"
 
+	"github.com/vercly/eh-sqlite/backoff"
+	"github.com/vercly/eh-sqlite/internal/deadletter"
 	eh "github.com/vercly/eventhorizon"
 	"github.com/vercly/eventhorizon/codec/json"
 	"github.com/vercly/eventhorizon/uuid"
 )
 
-// --- Unexported context keys and types ---
+const (
+	statusNew             = "new"
+	statusProcessing      = "processing"
+	statusCompleted       = "completed"
+	statusFailedRetriable = "failed_retriable"
+	statusFailedPermanent = "failed_permanent"
+)
+
+const defaultSweepInterval = 15 * time.Second
+const defaultStuckTimeout = 5 * time.Minute
+
+// ErrorSeverity defines how a durable command error should be treated.
+type ErrorSeverity int
+
+const (
+	SeverityUnknown ErrorSeverity = iota
+	SeverityFatal
+	SeverityRetryable
+)
+
+// CategorizedError can be implemented by command handlers to override the
+// default retry behaviour. By default, handler errors are retryable.
+type CategorizedError interface {
+	error
+	DurableSeverity() ErrorSeverity
+}
+
 type taskCompletionFuncKey struct{}
+type taskIDContextKey struct{}
 
 // TaskCompletionFunc is a function that signals the completion status of a task.
 type TaskCompletionFunc func(status string, execErr error)
-
-// --- Public function to retrieve the callback ---
 
 // GetCompletionFunc retrieves the TaskCompletionFunc from the context, if it exists.
 func GetCompletionFunc(ctx context.Context) (TaskCompletionFunc, bool) {
@@ -41,61 +70,90 @@ func GetCompletionFunc(ctx context.Context) (TaskCompletionFunc, bool) {
 	return f, ok
 }
 
-// Middleware implements a durable command handling middleware that persists commands
-// to a database before passing them to the next handler. It provides a callback
-// in the context to update the task's status upon completion.
+// Option configures durable command persistence, retries, and sweeping.
+type Option func(*config)
+
+type config struct {
+	maxRetries    int
+	retryBackoff  backoff.Config
+	sweepInterval time.Duration
+	stuckTimeout  time.Duration
+}
+
+func defaultConfig() config {
+	return config{
+		maxRetries:    5,
+		retryBackoff:  backoff.DefaultConfig(),
+		sweepInterval: defaultSweepInterval,
+		stuckTimeout:  defaultStuckTimeout,
+	}
+}
+
+// WithMaxRetries sets the maximum number of retries after the initial attempt.
+func WithMaxRetries(maxRetries int) Option {
+	return func(c *config) {
+		c.maxRetries = maxRetries
+	}
+}
+
+// WithRetryBackoff sets the retry delay curve. The pattern accepts STD, EXP,
+// PROG, FIXED, or comma-separated durations.
+func WithRetryBackoff(pattern string) Option {
+	return func(c *config) {
+		cfg := backoff.ParseConfig(pattern)
+		c.retryBackoff = cfg
+		if cfg.MaxRetries > 0 {
+			c.maxRetries = cfg.MaxRetries
+		}
+	}
+}
+
+// WithSweepInterval sets how often the background sweeper checks retryable and
+// stuck tasks.
+func WithSweepInterval(interval time.Duration) Option {
+	return func(c *config) {
+		c.sweepInterval = interval
+	}
+}
+
+// WithStuckTimeout sets how long a processing task can stay locked before the
+// sweeper treats it as interrupted.
+func WithStuckTimeout(timeout time.Duration) Option {
+	return func(c *config) {
+		c.stuckTimeout = timeout
+	}
+}
+
+// Middleware implements a durable command handling middleware that persists
+// commands before passing them to the next handler.
 type Middleware struct {
 	db         *sql.DB
 	codec      eh.CommandCodec
+	cfg        config
 	insertStmt *sql.Stmt
-	updateStmt *sql.Stmt
 }
 
-// NewMiddleware creates a new Durable Middleware.
-// It also ensures the required `async_tasks` table exists in the database.
-func NewMiddleware(db *sql.DB) (eh.CommandHandlerMiddleware, error) {
-	// Ensure the async_tasks table exists.
-	if _, err := db.Exec(`
-			CREATE TABLE IF NOT EXISTS async_tasks (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				task_uuid TEXT NOT NULL UNIQUE,
-				command_type TEXT NOT NULL,
-				command_blob TEXT NOT NULL,
-				status TEXT NOT NULL CHECK(status IN ('new', 'processing', 'completed', 'failed_retriable', 'failed_permanent')),
-				retry_count INTEGER NOT NULL DEFAULT 0,
-				max_retries INTEGER NOT NULL DEFAULT 5,
-				created_at TIMESTAMP NOT NULL,
-				updated_at TIMESTAMP NOT NULL,
-				last_error TEXT,
-				locked_by TEXT,
-				locked_at TIMESTAMP,
-				next_retry_at TIMESTAMP
-			);
-		`); err != nil {
-		return nil, fmt.Errorf("durable: could not create async_tasks table: %w", err)
-	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_async_tasks_lookup ON async_tasks (status, next_retry_at);`); err != nil {
-		return nil, fmt.Errorf("durable: could not create async_tasks_lookup index: %w", err)
-	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_async_tasks_uuid ON async_tasks (task_uuid);`); err != nil {
-		return nil, fmt.Errorf("durable: could not create async_tasks_uuid index: %w", err)
+// NewMiddleware creates a new durable middleware and ensures the required
+// async_tasks and dead_letters tables exist.
+func NewMiddleware(db *sql.DB, options ...Option) (eh.CommandHandlerMiddleware, error) {
+	cfg := applyOptions(options...)
+	if err := ensureSchema(db); err != nil {
+		return nil, err
 	}
 
-	insertStmt, err := db.Prepare(`INSERT INTO async_tasks (task_uuid, command_type, command_blob, status, created_at, updated_at) VALUES (?, ?, ?, 'new', ?, ?)`)
+	insertStmt, err := db.Prepare(`
+		INSERT INTO async_tasks (task_uuid, command_type, command_blob, status, retry_count, max_retries, created_at, updated_at)
+		VALUES (?, ?, ?, 'new', 0, ?, ?, ?)
+	`)
 	if err != nil {
 		return nil, fmt.Errorf("durable: could not prepare insert statement: %w", err)
-	}
-
-	updateStmt, err := db.Prepare(`UPDATE async_tasks SET status = ?, last_error = ?, updated_at = ? WHERE id = ?`)
-	if err != nil {
-		return nil, fmt.Errorf("durable: could not prepare update statement: %w", err)
 	}
 
 	m := &Middleware{
 		db:         db,
 		codec:      json.CommandCodec{},
+		cfg:        cfg,
 		insertStmt: insertStmt,
-		updateStmt: updateStmt,
 	}
 
 	return func(h eh.CommandHandler) eh.CommandHandler {
@@ -105,16 +163,58 @@ func NewMiddleware(db *sql.DB) (eh.CommandHandlerMiddleware, error) {
 	}, nil
 }
 
+func applyOptions(options ...Option) config {
+	cfg := defaultConfig()
+	for _, option := range options {
+		option(&cfg)
+	}
+	return cfg
+}
+
+func ensureSchema(db *sql.DB) error {
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS async_tasks (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			task_uuid TEXT NOT NULL UNIQUE,
+			command_type TEXT NOT NULL,
+			command_blob TEXT NOT NULL,
+			status TEXT NOT NULL CHECK(status IN ('new', 'processing', 'completed', 'failed_retriable', 'failed_permanent')),
+			retry_count INTEGER NOT NULL DEFAULT 0,
+			max_retries INTEGER NOT NULL DEFAULT 5,
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL,
+			last_error TEXT,
+			locked_by TEXT,
+			locked_at TIMESTAMP,
+			next_retry_at TIMESTAMP
+		);
+	`); err != nil {
+		return fmt.Errorf("durable: could not create async_tasks table: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_async_tasks_lookup ON async_tasks (status, next_retry_at);`); err != nil {
+		return fmt.Errorf("durable: could not create async_tasks_lookup index: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_async_tasks_uuid ON async_tasks (task_uuid);`); err != nil {
+		return fmt.Errorf("durable: could not create async_tasks_uuid index: %w", err)
+	}
+	if err := deadletter.EnsureSchema(db, "dead_letters"); err != nil {
+		return fmt.Errorf("durable: %w", err)
+	}
+	return nil
+}
+
 func (m *Middleware) handler(ctx context.Context, cmd eh.Command, h eh.CommandHandler) error {
-	// 1. Save the command to the database.
+	if taskID, ok := ctx.Value(taskIDContextKey{}).(int64); ok {
+		return m.handleTask(ctx, taskID, cmd, h)
+	}
+
 	taskUUID := uuid.New()
 	now := time.Now()
-
 	cmdBlob, err := m.codec.MarshalCommand(ctx, cmd)
 	if err != nil {
 		return fmt.Errorf("durable: could not marshal command: %w", err)
 	}
-	res, err := m.insertStmt.ExecContext(ctx, taskUUID.String(), cmd.CommandType().String(), cmdBlob, now, now)
+	res, err := m.insertStmt.ExecContext(ctx, taskUUID.String(), cmd.CommandType().String(), cmdBlob, m.cfg.maxRetries, now, now)
 	if err != nil {
 		return fmt.Errorf("durable: could not save command to queue: %w", err)
 	}
@@ -123,75 +223,219 @@ func (m *Middleware) handler(ctx context.Context, cmd eh.Command, h eh.CommandHa
 		return fmt.Errorf("durable: could not get last insert ID: %w", err)
 	}
 
-	// 2. Define the robust completion callback.
+	return m.handleTask(ctx, taskID, cmd, h)
+}
+
+func (m *Middleware) handleTask(ctx context.Context, taskID int64, cmd eh.Command, h eh.CommandHandler) (err error) {
+	if err := m.markProcessing(ctx, taskID); err != nil {
+		return err
+	}
+
 	var completed atomic.Bool
 	completionFunc := func(status string, execErr error) {
 		if completed.Swap(true) {
-			return // Already called.
+			return
 		}
-
-		var errMsg sql.NullString
-		if execErr != nil {
-			errMsg.String = execErr.Error()
-			errMsg.Valid = true
-		}
-		if _, err := m.updateStmt.Exec(status, errMsg, time.Now(), taskID); err != nil {
+		if err := m.completeTask(ctx, taskID, cmd, status, execErr); err != nil {
 			log.Printf("durable middleware: CRITICAL: failed to update task status for taskID %d: %v", taskID, err)
 		}
 	}
-
-	// 3. Enrich the context with the callback.
 	taskCtx := context.WithValue(ctx, taskCompletionFuncKey{}, TaskCompletionFunc(completionFunc))
 
-	// 4. Call the next handler in the chain.
-	return h.HandleCommand(taskCtx, cmd)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("durable: panic recovered in handler: %v", recovered)
+			completionFunc(statusFailedPermanent, err)
+		}
+	}()
+
+	err = h.HandleCommand(taskCtx, cmd)
+	if !completed.Load() {
+		if err != nil {
+			if getSeverity(err) == SeverityFatal {
+				completionFunc(statusFailedPermanent, err)
+			} else {
+				completionFunc(statusFailedRetriable, err)
+			}
+		} else {
+			completionFunc(statusCompleted, nil)
+		}
+	}
+	return err
 }
 
-// Resume dispatches all unfinished commands from the database to the command bus.
-// This function should be called on application startup to recover from a crash.
-func Resume(ctx context.Context, db *sql.DB, bus eh.CommandHandler) error {
-	codec := json.CommandCodec{}
-	rows, err := db.QueryContext(ctx, `SELECT id, command_blob FROM async_tasks WHERE status = 'new' OR status = 'processing'`)
+func (m *Middleware) markProcessing(ctx context.Context, taskID int64) error {
+	now := time.Now()
+	if _, err := m.db.ExecContext(ctx, `
+		UPDATE async_tasks
+		SET status = 'processing', updated_at = ?, locked_by = ?, locked_at = ?, next_retry_at = NULL
+		WHERE id = ?
+	`, now, lockOwner(), now, taskID); err != nil {
+		return fmt.Errorf("durable: could not update task %d to processing: %w", taskID, err)
+	}
+	return nil
+}
+
+func (m *Middleware) completeTask(ctx context.Context, taskID int64, cmd eh.Command, status string, execErr error) error {
+	switch status {
+	case statusCompleted:
+		return m.updateFinalStatus(ctx, taskID, statusCompleted, execErr)
+	case statusFailedPermanent:
+		return m.markPermanent(ctx, taskID, cmd, execErr)
+	case statusFailedRetriable:
+		return m.scheduleRetry(ctx, taskID, cmd, execErr)
+	default:
+		return m.updateFinalStatus(ctx, taskID, status, execErr)
+	}
+}
+
+func (m *Middleware) updateFinalStatus(ctx context.Context, taskID int64, status string, execErr error) error {
+	errMsg := errorString(execErr)
+	if _, err := m.db.ExecContext(ctx, `
+		UPDATE async_tasks
+		SET status = ?, last_error = ?, updated_at = ?, locked_by = NULL, locked_at = NULL, next_retry_at = NULL
+		WHERE id = ?
+	`, status, errMsg, time.Now(), taskID); err != nil {
+		return fmt.Errorf("durable: could not update task %d status: %w", taskID, err)
+	}
+	return nil
+}
+
+func (m *Middleware) scheduleRetry(ctx context.Context, taskID int64, cmd eh.Command, execErr error) error {
+	task, err := loadTask(ctx, m.db, taskID)
+	if err != nil {
+		return err
+	}
+	if task.retryCount >= task.maxRetries {
+		return m.markPermanent(ctx, taskID, cmd, execErr)
+	}
+
+	nextRetryCount := task.retryCount + 1
+	nextRetryAt := time.Now().Add(m.cfg.retryBackoff.DelayFunc(int64(nextRetryCount)))
+	errMsg := errorString(execErr)
+	if _, err := m.db.ExecContext(ctx, `
+		UPDATE async_tasks
+		SET status = 'failed_retriable', retry_count = ?, last_error = ?, updated_at = ?, locked_by = NULL, locked_at = NULL, next_retry_at = ?
+		WHERE id = ?
+	`, nextRetryCount, errMsg, time.Now(), nextRetryAt, taskID); err != nil {
+		return fmt.Errorf("durable: could not schedule retry for task %d: %w", taskID, err)
+	}
+	return nil
+}
+
+func (m *Middleware) markPermanent(ctx context.Context, taskID int64, cmd eh.Command, execErr error) error {
+	if err := m.updateFinalStatus(ctx, taskID, statusFailedPermanent, execErr); err != nil {
+		return err
+	}
+	task, err := loadTask(ctx, m.db, taskID)
+	if err != nil {
+		return err
+	}
+	return insertCommandDeadLetter(ctx, m.db, task, cmd, execErr)
+}
+
+// Resume dispatches unfinished commands from the database to the command bus.
+// The bus may be wrapped with this durable middleware; existing task context
+// prevents duplicate async_tasks rows during re-dispatch.
+func Resume(ctx context.Context, db *sql.DB, bus eh.CommandHandler, options ...Option) error {
+	if err := ensureSchema(db); err != nil {
+		return err
+	}
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, command_blob
+		FROM async_tasks
+		WHERE status = 'new' OR status = 'processing'
+		ORDER BY created_at ASC, id ASC
+	`)
 	if err != nil {
 		return fmt.Errorf("durable: could not query for unfinished tasks: %w", err)
 	}
 	defer rows.Close()
 
-	type unfinishedTask struct {
-		id          int64
-		commandBlob []byte
+	tasks, err := scanDispatchTasks(rows)
+	if err != nil {
+		return err
 	}
+	return dispatchTasks(ctx, tasks, bus)
+}
 
-	var tasks []unfinishedTask
+// StartSweeper launches a background retry sweeper. The caller controls its
+// lifetime through ctx.
+func StartSweeper(ctx context.Context, db *sql.DB, bus eh.CommandHandler, options ...Option) error {
+	if err := ensureSchema(db); err != nil {
+		return err
+	}
+	cfg := applyOptions(options...)
+	go func() {
+		ticker := time.NewTicker(cfg.sweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if _, err := Sweep(ctx, db, bus, options...); err != nil {
+					log.Printf("durable: sweeper failed: %v", err)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return nil
+}
 
-	// 1. Read all tasks into memory first to avoid holding the connection.
+// Sweep dispatches retryable due tasks and stuck processing tasks once.
+func Sweep(ctx context.Context, db *sql.DB, bus eh.CommandHandler, options ...Option) (int, error) {
+	if err := ensureSchema(db); err != nil {
+		return 0, err
+	}
+	cfg := applyOptions(options...)
+	now := time.Now()
+	stuckBefore := now.Add(-cfg.stuckTimeout)
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, command_blob
+		FROM async_tasks
+		WHERE (status = 'failed_retriable' AND next_retry_at <= ?)
+		   OR (status = 'processing' AND locked_at IS NOT NULL AND locked_at < ?)
+		ORDER BY updated_at ASC, id ASC
+	`, now, stuckBefore)
+	if err != nil {
+		return 0, fmt.Errorf("durable: could not query retryable tasks: %w", err)
+	}
+	defer rows.Close()
+
+	tasks, err := scanDispatchTasks(rows)
+	if err != nil {
+		return 0, err
+	}
+	if err := dispatchTasks(ctx, tasks, bus); err != nil {
+		return len(tasks), err
+	}
+	return len(tasks), nil
+}
+
+type dispatchTask struct {
+	id          int64
+	commandBlob []byte
+}
+
+func scanDispatchTasks(rows *sql.Rows) ([]dispatchTask, error) {
+	var tasks []dispatchTask
 	for rows.Next() {
-		var task unfinishedTask
+		var task dispatchTask
 		if err := rows.Scan(&task.id, &task.commandBlob); err != nil {
-			log.Printf("durable: could not scan unfinished task: %v", err)
-			continue // Try next row
+			return nil, fmt.Errorf("durable: could not scan task: %w", err)
 		}
 		tasks = append(tasks, task)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("durable: error during row iteration: %w", err)
+		return nil, fmt.Errorf("durable: error during row iteration: %w", err)
 	}
-	// Close rows immediately to release the read connection.
-	rows.Close()
+	return tasks, nil
+}
 
-	if len(tasks) == 0 {
-		return nil // Nothing to do.
-	}
-
-	// 2. Now, process the tasks from the in-memory slice.
-	updateStatusStmt, err := db.PrepareContext(ctx, `UPDATE async_tasks SET status = 'processing', updated_at = ? WHERE id = ?`)
-	if err != nil {
-		return fmt.Errorf("durable: could not prepare status update statement: %w", err)
-	}
-	defer updateStatusStmt.Close()
-
+func dispatchTasks(ctx context.Context, tasks []dispatchTask, bus eh.CommandHandler) error {
+	codec := json.CommandCodec{}
 	for _, task := range tasks {
-		// The command codec can return a new context with data from the command (e.g. tracing).
 		cmd, cmdCtx, err := codec.UnmarshalCommand(ctx, task.commandBlob)
 		if err != nil {
 			log.Printf("durable: could not unmarshal command for task %d: %v", task.id, err)
@@ -200,20 +444,69 @@ func Resume(ctx context.Context, db *sql.DB, bus eh.CommandHandler) error {
 		if cmdCtx == nil {
 			cmdCtx = ctx
 		}
-
-		// Mark as processing before dispatching to avoid race conditions on quick restarts.
-		if _, err := updateStatusStmt.ExecContext(ctx, time.Now(), task.id); err != nil {
-			log.Printf("durable: could not update task %d to processing: %v", task.id, err)
-			continue
-		}
-
-		// Use the unmarshaled context when re-dispatching the command.
+		cmdCtx = context.WithValue(cmdCtx, taskIDContextKey{}, task.id)
 		if err := bus.HandleCommand(cmdCtx, cmd); err != nil {
 			log.Printf("durable: could not re-dispatch command for task %d: %v", task.id, err)
-			// The task remains in 'processing' state for a sweeper to find later.
-			continue
 		}
 	}
-
 	return nil
+}
+
+type taskRecord struct {
+	id          int64
+	taskUUID    string
+	commandType string
+	commandBlob []byte
+	retryCount  int
+	maxRetries  int
+	createdAt   time.Time
+}
+
+func loadTask(ctx context.Context, db *sql.DB, taskID int64) (taskRecord, error) {
+	var task taskRecord
+	if err := db.QueryRowContext(ctx, `
+		SELECT id, task_uuid, command_type, command_blob, retry_count, max_retries, created_at
+		FROM async_tasks
+		WHERE id = ?
+	`, taskID).Scan(&task.id, &task.taskUUID, &task.commandType, &task.commandBlob, &task.retryCount, &task.maxRetries, &task.createdAt); err != nil {
+		return taskRecord{}, fmt.Errorf("durable: could not load task %d: %w", taskID, err)
+	}
+	return task, nil
+}
+
+func insertCommandDeadLetter(ctx context.Context, db *sql.DB, task taskRecord, cmd eh.Command, execErr error) error {
+	reason := "command failed permanently"
+	if execErr != nil {
+		reason = execErr.Error()
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
+		VALUES (?, 'command', ?, ?, 'command_handler', NULL, '[]', ?, ?, ?, ?, ?)
+	`, uuid.New().String(), task.commandType, cmd.AggregateID().String(), string(task.commandBlob), reason, task.retryCount, task.createdAt, time.Now()); err != nil {
+		return fmt.Errorf("durable: could not insert command dead letter: %w", err)
+	}
+	return nil
+}
+
+func errorString(err error) sql.NullString {
+	if err == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: err.Error(), Valid: true}
+}
+
+func getSeverity(err error) ErrorSeverity {
+	var categorized CategorizedError
+	if errors.As(err, &categorized) {
+		return categorized.DurableSeverity()
+	}
+	return SeverityRetryable
+}
+
+func lockOwner() string {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		return "unknown"
+	}
+	return hostname
 }

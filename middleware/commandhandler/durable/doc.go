@@ -1,12 +1,12 @@
 /*
-Package durable provides a Command Handler Middleware for Event Horizon that
-ensures commands are persisted before being executed. This allows for retries
-and recovery in case of application failure.
+Package durable provides a command handler middleware that persists commands in
+SQLite before execution, automatically completes tasks from handler return
+values, and can retry interrupted or retryable failures with backoff.
 
-The middleware saves the command to a database table (`async_tasks`) and injects
-a `TaskCompletionFunc` into the context. Downstream handlers can retrieve this
-function using `GetCompletionFunc` and call it to signal the final status of
-the task, which updates the corresponding record in the database.
+By default, a successful handler return marks the task completed. A handler
+error is retryable unless it implements CategorizedError with SeverityFatal.
+Handlers that start their own async work can still retrieve TaskCompletionFunc
+from the context and call it manually; the first completion wins.
 
 Example of usage:
 
@@ -19,77 +19,59 @@ Example of usage:
 		"log"
 		"time"
 
-		"github.com/vercly/eh-sqlite/middleware/durable"
+		durable "github.com/vercly/eh-sqlite/middleware/commandhandler/durable"
 		eh "github.com/vercly/eventhorizon"
 		"github.com/vercly/eventhorizon/commandbus/local"
-		"github.com/vercly/eventhorizon/middleware/commandhandler/async"
+		"github.com/vercly/eventhorizon/uuid"
 		_ "github.com/mattn/go-sqlite3"
 	)
 
-	// 1. Define your command.
 	const MyCommandType eh.CommandType = "MyCommand"
 
 	type MyCommand struct {
-		Data string
+		ID uuid.UUID
 	}
 
-	// 2. Define your handler.
+	func (c MyCommand) AggregateID() uuid.UUID          { return c.ID }
+	func (c MyCommand) AggregateType() eh.AggregateType { return "example" }
+	func (c MyCommand) CommandType() eh.CommandType     { return MyCommandType }
+
 	type MyHandler struct{}
 
 	func (h *MyHandler) HandleCommand(ctx context.Context, cmd eh.Command) error {
-		// Get the completion callback from the context.
-		completionFunc, ok := durable.GetCompletionFunc(ctx)
-		if !ok {
-			// This should not happen if the middleware is configured correctly.
-			return fmt.Errorf("durable completion func not found in context")
+		if cmd.AggregateID() == uuid.Nil {
+			return fmt.Errorf("missing aggregate id")
 		}
-
-		log.Printf("handler: handling command: %s", cmd.CommandType())
-		// Simulate work.
-		time.Sleep(100 * time.Millisecond)
-
-		// Signal completion.
-		// The first argument is the status, the second is any execution error.
-		completionFunc("completed", nil)
-
 		return nil
 	}
 
 	func main() {
-		// 3. Set up the database (in-memory SQLite for example).
-		db, err := sql.Open("sqlite3", ":memory:")
+		db, err := sql.Open("sqlite3", "events.db")
 		if err != nil {
 			log.Fatalf("could not open db: %v", err)
 		}
 
-		// 4. Set up the command bus.
 		bus := local.New()
-
-		// 5. Create and register the handler.
-		handler := &MyHandler{}
-
-		// 6. Create middlewares.
-		asyncMiddleware, _ := async.NewMiddleware()
-		durableMiddleware, err := durable.NewMiddleware(db)
+		durableMiddleware, err := durable.NewMiddleware(db, durable.WithRetryBackoff("EXP:1.5:5:1m"))
 		if err != nil {
 			log.Fatalf("could not create durable middleware: %v", err)
 		}
 
-		// 7. Wrap the handler with all middlewares and set it on the bus.
-		// The middlewares are applied from first to last, so durableMiddleware is the outermost layer.
-		wrappedHandler := eh.UseCommandHandlerMiddleware(handler, durableMiddleware, asyncMiddleware)
+		wrappedHandler := eh.UseCommandHandlerMiddleware(&MyHandler{}, durableMiddleware)
 		bus.SetHandler(wrappedHandler, MyCommandType)
 
-		// 8. Handle a command.
-		cmd := eh.NewCommand(MyCommandType, &MyCommand{Data: "hello"}, time.Now())
-		if err := bus.HandleCommand(context.Background(), cmd); err != nil {
-			log.Fatalf("failed to handle command: %v", err)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := durable.StartSweeper(ctx, db, bus); err != nil {
+			log.Fatalf("could not start durable sweeper: %v", err)
 		}
 
-		// The command is handled asynchronously. Give it time to complete.
-		time.Sleep(500 * time.Millisecond)
+		cmd := MyCommand{ID: uuid.New()}
+		if err := bus.HandleCommand(context.Background(), cmd); err != nil {
+			log.Printf("command scheduled for retry: %v", err)
+		}
 
-		log.Println("Main: command dispatched. Check DB for 'completed' status.")
+		time.Sleep(500 * time.Millisecond)
 	}
 */
 package durable

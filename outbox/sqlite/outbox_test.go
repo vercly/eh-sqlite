@@ -438,6 +438,95 @@ func TestOutboxNoMatchDeadLetterRollsBackWithTransaction(t *testing.T) {
 	}
 }
 
+func TestOutboxRetryableErrorSchedulesBackoff(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	o, err := NewOutbox(db, WithMaxRetries(2), WithRetryBackoff("FIXED:2:200ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+	o.started.Store(true)
+
+	handler := mocks.NewEventHandler("retry_handler")
+	handler.Err = errors.New("temporary failure")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.HandleEvent(ctx, newTestEvent("retry")); err != nil {
+		t.Fatal(err)
+	}
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed count = %d, want 1", processed)
+	}
+
+	var retryCount int
+	var availableAt time.Time
+	var takenAt sql.NullTime
+	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox LIMIT 1`).Scan(&retryCount, &availableAt, &takenAt); err != nil {
+		t.Fatal(err)
+	}
+	if retryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", retryCount)
+	}
+	if !availableAt.After(time.Now().Add(100 * time.Millisecond)) {
+		t.Fatalf("available_at = %s, want retry backoff in the future", availableAt)
+	}
+	if takenAt.Valid {
+		t.Fatalf("taken_at valid = true, want retry row released")
+	}
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 0 {
+		t.Fatalf("immediate processed count = %d, want 0", processed)
+	}
+}
+
+func TestOutboxTerminalFailureWritesDeadLetter(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	o, err := NewOutbox(db, WithRetryBackoff("FIXED:1:1ms"), WithMaxRetries(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+	o.started.Store(true)
+
+	handler := mocks.NewEventHandler("terminal_handler")
+	handler.Err = errors.New("permanent failure")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.HandleEvent(ctx, newTestEvent("terminal")); err != nil {
+		t.Fatal(err)
+	}
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed count = %d, want 1", processed)
+	}
+
+	if got := outboxRowCount(t, db); got != 0 {
+		t.Fatalf("outbox rows = %d, want 0", got)
+	}
+	if got := deadLetterRowCount(t, db); got != 1 {
+		t.Fatalf("dead letter rows = %d, want 1", got)
+	}
+	var source, handlerType string
+	if err := db.QueryRow(`SELECT source, handler_type FROM dead_letters LIMIT 1`).Scan(&source, &handlerType); err != nil {
+		t.Fatal(err)
+	}
+	if source != "outbox" || handlerType != "terminal_handler" {
+		t.Fatalf("dead letter = (%s, %s), want outbox/terminal_handler", source, handlerType)
+	}
+}
+
 func newTestDB(t testing.TB) *sql.DB {
 	t.Helper()
 
