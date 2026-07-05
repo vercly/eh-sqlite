@@ -4,9 +4,9 @@ go 1.25.3
 
 require (
 	github.com/json-iterator/go v1.1.12
-	github.com/mattn/go-sqlite3 v1.14.44
+	github.com/mattn/go-sqlite3 v1.14.47
 	github.com/vercly/eventhorizon v0.16.3
-	golang.org/x/sync v0.20.0
+	golang.org/x/sync v0.21.0
 )
 
 require (
