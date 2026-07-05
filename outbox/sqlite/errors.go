@@ -38,6 +38,13 @@ var (
 	unknownErrors   atomic.Int64
 )
 
+var (
+	errUnknownDispatchMode            = errors.New("unknown dispatch mode")
+	errInvalidPartitionShards         = errors.New("partition shards must be >= 1")
+	errUnsupportedAvailableAtType     = errors.New("unsupported available_at value type")
+	errEventHandlerMovedToDeadLetters = errors.New("event handler moved to dead letters")
+)
+
 // GetSeverity unpacks the error chain to check if a specific ErrorSeverity
 // has been assigned, returning SeverityUnknown if no compliant error is found.
 func GetSeverity(err error) ErrorSeverity {
@@ -59,6 +66,8 @@ func ErrorSnapshot() ErrorCounts {
 
 func recordErrorSeverity(severity ErrorSeverity) {
 	switch severity {
+	case SeverityUnknown:
+		unknownErrors.Add(1)
 	case SeverityFatal:
 		fatalErrors.Add(1)
 	case SeverityRetryable:

@@ -140,10 +140,10 @@ func TestOutboxNotifySignalsScheduleWhenWatchChannelFull(t *testing.T) {
 	defer o.Close()
 
 	for range cap(o.watchCh) {
-		o.watchCh <- &outboxDoc{Ctx: context.Background()}
+		o.watchCh <- struct{}{}
 	}
 
-	o.notify(&outboxDoc{Ctx: context.Background()})
+	o.notify()
 
 	select {
 	case <-o.scheduleCh:
@@ -1151,7 +1151,7 @@ func outboxIDsInDispatchOrder(t testing.TB, db *sql.DB) []string {
 func aggregateIDsForDistinctShards(t testing.TB, count, shards int) []uuid.UUID {
 	t.Helper()
 
-	seen := map[int]bool{}
+	seen := map[uint64]bool{}
 	var ids []uuid.UUID
 	for attempts := 0; len(ids) < count && attempts < 10000; attempts++ {
 		id := uuid.New()
@@ -1171,7 +1171,7 @@ func aggregateIDsForDistinctShards(t testing.TB, count, shards int) []uuid.UUID 
 func correlationIDsForDistinctShards(t testing.TB, count, shards int) []string {
 	t.Helper()
 
-	seen := map[int]bool{}
+	seen := map[uint64]bool{}
 	var ids []string
 	for i := 0; len(ids) < count && i < 10000; i++ {
 		id := fmt.Sprintf("correlation-%d", i)

@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log"
@@ -18,6 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	jsoniter "github.com/json-iterator/go"
+	// Register the sqlite3 database/sql driver used by this package.
 	_ "github.com/mattn/go-sqlite3"
 	eh "github.com/vercly/eventhorizon"
 	ehcodec "github.com/vercly/eventhorizon/codec/json"
@@ -36,6 +38,31 @@ var (
 const metadataAvailableAtKey = "outbox.available_at"
 
 type availableAtContextKey struct{}
+
+type doneContext struct {
+	done <-chan struct{}
+}
+
+func (c doneContext) Deadline() (time.Time, bool) {
+	return time.Time{}, false
+}
+
+func (c doneContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c doneContext) Err() error {
+	select {
+	case <-c.done:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
+
+func (c doneContext) Value(any) any {
+	return nil
+}
 
 // WithDelay returns a context that asks the outbox to make the event available
 // after the provided delay. Non-positive delays are treated as immediate.
@@ -61,10 +88,10 @@ type Outbox struct {
 	handlers         []*matcherHandler
 	handlersByType   map[eh.EventHandlerType]*matcherHandler
 	handlersMu       sync.RWMutex
-	watchCh          chan *outboxDoc
+	watchCh          chan struct{}
 	scheduleCh       chan struct{}
 	errCh            chan error
-	cctx             context.Context
+	done             <-chan struct{}
 	cancel           context.CancelFunc
 	wg               sync.WaitGroup
 	started          atomic.Bool
@@ -127,7 +154,7 @@ func WithDispatchMode(mode DispatchMode) HandlerOption {
 			opts.dispatchMode = mode
 			return nil
 		default:
-			return fmt.Errorf("unknown dispatch mode: %d", mode)
+			return fmt.Errorf("%w: %d", errUnknownDispatchMode, mode)
 		}
 	}
 }
@@ -137,7 +164,7 @@ func WithDispatchMode(mode DispatchMode) HandlerOption {
 func WithPartitionShards(shards int) HandlerOption {
 	return func(opts *handlerOptions) error {
 		if shards < 1 {
-			return fmt.Errorf("partition shards must be >= 1")
+			return errInvalidPartitionShards
 		}
 		opts.partitionShards = shards
 		return nil
@@ -153,10 +180,10 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 		outboxTable:     "outbox",
 		deadLetterTable: "dead_letters",
 		handlersByType:  map[eh.EventHandlerType]*matcherHandler{},
-		watchCh:         make(chan *outboxDoc, 100),
+		watchCh:         make(chan struct{}, 100),
 		scheduleCh:      make(chan struct{}, 1),
 		errCh:           make(chan error, 100),
-		cctx:            ctx,
+		done:            ctx.Done(),
 		cancel:          cancel,
 		codec:           &ehcodec.EventCodec{},
 		maxRetries:      10, // Default to 10
@@ -268,9 +295,9 @@ func WithRetryBackoff(pattern string) Option {
 }
 
 // WithMaxGoroutines limits the number of concurrent handlers spawned during a single outbox sweep.
-func WithMaxGoroutines(max int) Option {
+func WithMaxGoroutines(limit int) Option {
 	return func(o *Outbox) error {
-		o.maxGoroutines = max
+		o.maxGoroutines = limit
 		return nil
 	}
 }
@@ -284,7 +311,8 @@ func WithDeadLetterExporter(exporter dl.Exporter) Option {
 	}
 }
 
-func (o *Outbox) prepareStatements() (err error) {
+func (o *Outbox) prepareStatements() error {
+	var err error
 	if o.insertEventStmt, err = o.db.Prepare(fmt.Sprintf(`
 		INSERT INTO %s (id, event_type, aggregate_id, created_at, available_at, taken_at, handlers, event_blob)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -347,7 +375,7 @@ func (o *Outbox) AddHandler(ctx context.Context, m eh.EventMatcher, h eh.EventHa
 
 // AddHandlerWithOptions registers an event handler with explicit dispatch
 // options. The default AddHandler path uses Serial dispatch.
-func (o *Outbox) AddHandlerWithOptions(ctx context.Context, m eh.EventMatcher, h eh.EventHandler, options ...HandlerOption) error {
+func (o *Outbox) AddHandlerWithOptions(_ context.Context, m eh.EventMatcher, h eh.EventHandler, options ...HandlerOption) error {
 	if m == nil {
 		return eh.ErrMissingMatcher
 	}
@@ -383,10 +411,8 @@ func (o *Outbox) AddHandlerWithOptions(ctx context.Context, m eh.EventMatcher, h
 
 // outboxDoc is the DB representation of an outbox entry.
 type outboxDoc struct {
-	ID    uuid.UUID
-	Event eh.Event
-	// Ctx is the context of the event, which is not persisted to the database.
-	Ctx         context.Context
+	ID          uuid.UUID
+	Event       eh.Event
 	Handlers    []string
 	CreatedAt   time.Time
 	AvailableAt time.Time
@@ -411,44 +437,77 @@ func (o *Outbox) HandleEvent(ctx context.Context, event eh.Event) error {
 		return err
 	}
 
+	matchingHandlers := o.matchingHandlers(event)
+	return o.storeEvent(ctx, event, eventBlob, now, availableAt, matchingHandlers)
+}
+
+func (o *Outbox) matchingHandlers(event eh.Event) []string {
 	o.handlersMu.RLock()
+	defer o.handlersMu.RUnlock()
+
 	matchingHandlers := make([]string, 0)
 	for _, mh := range o.handlers {
 		if mh.Match(event) {
 			matchingHandlers = append(matchingHandlers, mh.EventHandler.HandlerType().String())
 		}
 	}
-	o.handlersMu.RUnlock()
+	return matchingHandlers
+}
 
-	tx, txOk := sqlite.TxFromContext(ctx)
+func (o *Outbox) storeEvent(ctx context.Context, event eh.Event, eventBlob []byte, now, availableAt time.Time, matchingHandlers []string) error {
+	tx, txOk, err := o.txForEvent(ctx)
+	if err != nil {
+		return err
+	}
 	if !txOk {
-		tx, err = o.db.Begin()
-		if err != nil {
-			return fmt.Errorf("could not begin transaction: %w", err)
-		}
-		defer tx.Rollback()
+		defer rollbackTx(tx)
 	}
 
 	if len(matchingHandlers) == 0 {
-		if err := o.insertNoMatchDeadLetter(ctx, tx, event, eventBlob, now); err != nil {
-			return err
-		}
-		if !txOk {
-			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("could not commit transaction: %w", err)
-			}
-		}
-		return nil
+		return o.storeNoMatchEvent(ctx, tx, txOk, event, eventBlob, now)
 	}
+	return o.storeMatchedEvent(ctx, tx, txOk, event, eventBlob, now, availableAt, matchingHandlers)
+}
 
+func (o *Outbox) storeNoMatchEvent(ctx context.Context, tx *sql.Tx, txOk bool, event eh.Event, eventBlob []byte, now time.Time) error {
+	if err := o.insertNoMatchDeadLetter(ctx, tx, event, eventBlob, now); err != nil {
+		return err
+	}
+	return commitOwnedTx(tx, txOk)
+}
+
+func (o *Outbox) storeMatchedEvent(ctx context.Context, tx *sql.Tx, txOk bool, event eh.Event, eventBlob []byte, now, availableAt time.Time, matchingHandlers []string) error {
 	handlersBlob, err := jsoniter.Marshal(matchingHandlers)
 	if err != nil {
 		return fmt.Errorf("could not marshal handlers: %w", err)
 	}
 
 	outboxID := uuid.New()
-	// Insert the promoted fields AND the blob.
-	if _, err := tx.Stmt(o.insertEventStmt).Exec(
+	if err := o.insertOutboxEvent(ctx, tx, outboxID, event, eventBlob, handlersBlob, now, availableAt); err != nil {
+		return err
+	}
+
+	if err := commitOwnedTx(tx, txOk); err != nil {
+		return err
+	}
+
+	if !txOk {
+		o.notify()
+	}
+
+	return nil
+}
+
+func (o *Outbox) insertOutboxEvent(ctx context.Context, tx *sql.Tx, outboxID uuid.UUID, event eh.Event, eventBlob, handlersBlob []byte, now, availableAt time.Time) error {
+	insertStmt := tx.StmtContext(ctx, o.insertEventStmt)
+	defer func() {
+		if err := insertStmt.Close(); err != nil {
+			log.Printf("eventhorizon: could not close SQLite outbox insert statement: %s", err)
+		}
+	}()
+
+	if _, err := insertStmt.ExecContext(
+		ctx,
 		outboxID.String(),
 		event.EventType().String(),
 		event.AggregateID().String(),
@@ -460,27 +519,29 @@ func (o *Outbox) HandleEvent(ctx context.Context, event eh.Event) error {
 	); err != nil {
 		return fmt.Errorf("could not insert event into outbox: %w", err)
 	}
-
-	if !txOk {
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("could not commit transaction: %w", err)
-		}
-	}
-
-	r := &outboxDoc{
-		ID:          outboxID,
-		Event:       event,
-		Ctx:         ctx,
-		Handlers:    matchingHandlers,
-		CreatedAt:   now,
-		AvailableAt: availableAt,
-	}
-
-	if !txOk {
-		o.notify(r)
-	}
-
 	return nil
+}
+
+func commitOwnedTx(tx *sql.Tx, txOk bool) error {
+	if txOk {
+		return nil
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("could not commit transaction: %w", err)
+	}
+	return nil
+}
+
+func (o *Outbox) txForEvent(ctx context.Context) (*sql.Tx, bool, error) {
+	tx, txOk := sqlite.TxFromContext(ctx)
+	if txOk {
+		return tx, true, nil
+	}
+	tx, err := o.db.Begin()
+	if err != nil {
+		return nil, false, fmt.Errorf("could not begin transaction: %w", err)
+	}
+	return tx, false, nil
 }
 
 func availableAtFor(ctx context.Context, event eh.Event, now time.Time) (time.Time, error) {
@@ -517,12 +578,19 @@ func parseAvailableAt(raw any) (time.Time, error) {
 		}
 		return time.Parse(time.RFC3339, v)
 	default:
-		return time.Time{}, fmt.Errorf("unsupported value type %T", raw)
+		return time.Time{}, fmt.Errorf("%w: %T", errUnsupportedAvailableAtType, raw)
 	}
 }
 
 func (o *Outbox) insertNoMatchDeadLetter(ctx context.Context, tx *sql.Tx, event eh.Event, eventBlob []byte, now time.Time) error {
-	if _, err := tx.Stmt(o.insertDeadLetterStmt).ExecContext(
+	insertStmt := tx.StmtContext(ctx, o.insertDeadLetterStmt)
+	defer func() {
+		if err := insertStmt.Close(); err != nil {
+			log.Printf("eventhorizon: could not close SQLite outbox dead letter statement: %s", err)
+		}
+	}()
+
+	if _, err := insertStmt.ExecContext(
 		ctx,
 		uuid.New().String(),
 		"outbox",
@@ -547,12 +615,13 @@ func (o *Outbox) insertNoMatchDeadLetter(ctx context.Context, tx *sql.Tx, event 
 // their own transaction must call this after commit; EventStore.Save does it for
 // in-transaction handlers automatically.
 func (o *Outbox) NotifyAfterCommit(ctx context.Context) {
-	o.notify(&outboxDoc{Ctx: ctx})
+	_ = ctx
+	o.notify()
 }
 
-func (o *Outbox) notify(r *outboxDoc) {
+func (o *Outbox) notify() {
 	select {
-	case o.watchCh <- r:
+	case o.watchCh <- struct{}{}:
 	default:
 		o.notifySchedule()
 	}
@@ -602,6 +671,16 @@ func (o *Outbox) Close() error {
 	return closeErr
 }
 
+func (o *Outbox) runContext() context.Context {
+	return doneContext{done: o.done}
+}
+
+func rollbackTx(tx *sql.Tx) {
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		log.Printf("eventhorizon: could not roll back SQLite outbox transaction: %s", err)
+	}
+}
+
 func (o *Outbox) runUnifiedProcessor() {
 	defer o.wg.Done()
 
@@ -612,67 +691,46 @@ func (o *Outbox) runUnifiedProcessor() {
 		<-timer.C
 	}
 	var timerCh <-chan time.Time
-	resetTimer := func() {
-		timerCh = nil
-		next, ok, err := o.nextAvailableAt(o.cctx)
-		if err != nil {
-			o.sendError(err, nil, o.cctx)
-			return
-		}
-		if !ok {
-			return
-		}
-		delay := time.Until(next)
-		if delay < 0 {
-			delay = 0
-		}
-		timer.Reset(delay)
-		timerCh = timer.C
-	}
-	stopTimer := func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-	}
-	defer stopTimer()
-	resetTimer()
+	defer stopProcessorTimer(timer)
+	o.resetProcessorTimer(timer, &timerCh)
 
-	// The main loop now only cares about being woken up.
-	// The actual processing loop is inside the handler for the triggers.
 	for {
 		select {
-		// --- Trigger 1: The Fast Path (from watchCh) ---
-		case r := <-o.watchCh:
-			stopTimer()
-			// A signal has arrived. We know there is at least one new event.
-			// We will now enter a "work loop" that continues until the outbox is empty.
-			o.processUntilEmpty(r.Ctx)
-			resetTimer()
-
-		// --- Trigger 2: The Slow Path (from ticker) ---
+		case <-o.watchCh:
 		case <-ticker.C:
-			stopTimer()
-			// The ticker is our safety net. It also triggers the same work loop.
-			o.processUntilEmpty(o.cctx)
-			resetTimer()
-
 		case <-timerCh:
-			stopTimer()
-			o.processUntilEmpty(o.cctx)
-			resetTimer()
-
 		case <-o.scheduleCh:
-			stopTimer()
-			o.processUntilEmpty(o.cctx)
-			resetTimer()
-
-		// --- Trigger 3: Shutdown ---
-		case <-o.cctx.Done():
+		case <-o.done:
 			return
 		}
+		stopProcessorTimer(timer)
+		o.processUntilEmpty(o.runContext())
+		o.resetProcessorTimer(timer, &timerCh)
+	}
+}
+
+func (o *Outbox) resetProcessorTimer(timer *time.Timer, timerCh *<-chan time.Time) {
+	*timerCh = nil
+	next, ok, err := o.nextAvailableAt(o.runContext())
+	if err != nil {
+		o.sendError(o.runContext(), err, nil)
+		return
+	}
+	if !ok {
+		return
+	}
+	delay := max(time.Until(next), 0)
+	timer.Reset(delay)
+	*timerCh = timer.C
+}
+
+func stopProcessorTimer(timer *time.Timer) {
+	if timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
 	}
 }
 
@@ -680,7 +738,7 @@ func (o *Outbox) nextAvailableAt(ctx context.Context) (time.Time, bool, error) {
 	var next sql.NullTime
 	now := time.Now()
 	if err := o.nextAvailableAtStmt.QueryRowContext(ctx, now.Add(-PeriodicSweepAge), now).Scan(&next); err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return time.Time{}, false, nil
 		}
 		return time.Time{}, false, fmt.Errorf("could not query next available outbox event: %w", err)
@@ -702,7 +760,7 @@ func (o *Outbox) processUntilEmpty(ctx context.Context) {
 		// but we will modify it to return the number of events it processed.
 		processedCount, err := o.processBatch(ctx)
 		if err != nil {
-			o.sendError(err, nil, ctx)
+			o.sendError(ctx, err, nil)
 			// On error, we stop processing this batch to avoid hammering a failing system.
 			// The ticker will try again later.
 			return
@@ -734,7 +792,7 @@ func (o *Outbox) drainWatchChannel() {
 }
 
 // Helper to send errors.
-func (o *Outbox) sendError(err error, event eh.Event, ctx context.Context) {
+func (o *Outbox) sendError(ctx context.Context, err error, event eh.Event) {
 	recordErrorSeverity(GetSeverity(err))
 	select {
 	case o.errCh <- &eh.OutboxError{Err: err, Ctx: ctx, Event: event}:
@@ -748,7 +806,7 @@ func (o *Outbox) Errors() <-chan error {
 	return o.errCh
 }
 
-func (o *Outbox) scanOutboxDoc(rows *sql.Rows) (*outboxDoc, error) {
+func (o *Outbox) scanOutboxDoc(rows *sql.Rows) (*outboxDoc, map[string]any, error) {
 	var id, eventType, aggregateID, handlersBlob, eventBlob string
 	var createdAt, availableAt, takenAt sql.NullTime
 	var retryCount int
@@ -756,29 +814,42 @@ func (o *Outbox) scanOutboxDoc(rows *sql.Rows) (*outboxDoc, error) {
 	// Fallback to not failing if the schema is old and retryCount hasn't been added yet in a result set
 	// Note: We're selecting specific columns, so we must add retry_count to the select statement.
 	if err := rows.Scan(&id, &eventType, &aggregateID, &createdAt, &availableAt, &takenAt, &handlersBlob, &eventBlob, &retryCount); err != nil {
-		return nil, fmt.Errorf("could not scan row: %w", err)
+		return nil, nil, fmt.Errorf("could not scan row: %w", err)
 	}
 
-	event, ctx, err := o.codec.UnmarshalEvent(o.cctx, []byte(eventBlob))
+	event, _, err := o.codec.UnmarshalEvent(o.runContext(), []byte(eventBlob))
 	if err != nil {
-		return nil, fmt.Errorf("could not unmarshal event blob: %w", err)
+		return nil, nil, fmt.Errorf("could not unmarshal event blob: %w", err)
+	}
+	eventContext, err := eventContextValues([]byte(eventBlob))
+	if err != nil {
+		return nil, nil, err
 	}
 
 	var handlers []string
 	if err := jsoniter.Unmarshal([]byte(handlersBlob), &handlers); err != nil {
-		return nil, fmt.Errorf("could not unmarshal handlers: %w", err)
+		return nil, nil, fmt.Errorf("could not unmarshal handlers: %w", err)
 	}
 
 	return &outboxDoc{
 		ID:          uuid.MustParse(id),
 		Event:       event,
-		Ctx:         ctx,
 		Handlers:    handlers,
 		CreatedAt:   createdAt.Time,
 		AvailableAt: availableAt.Time,
 		TakenAt:     takenAt,
 		RetryCount:  retryCount,
-	}, nil
+	}, eventContext, nil
+}
+
+func eventContextValues(eventBlob []byte) (map[string]any, error) {
+	var raw struct {
+		Context map[string]any `json:"context"`
+	}
+	if err := jsoniter.Unmarshal(eventBlob, &raw); err != nil {
+		return nil, fmt.Errorf("could not unmarshal event context: %w", err)
+	}
+	return raw.Context, nil
 }
 
 type processedResult struct {
@@ -810,7 +881,7 @@ type handlerDispatchResult struct {
 
 // processBatch - main procesing batch
 func (o *Outbox) processBatch(ctx context.Context) (int, error) {
-	eventsToProcess, err := o.fetchAndLockEvents(ctx)
+	eventsToProcess, eventContexts, err := o.fetchAndLockEvents(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -826,52 +897,8 @@ func (o *Outbox) processBatch(ctx context.Context) (int, error) {
 		}
 	}
 
-	queues, itemCount := o.buildDispatchQueues(eventsToProcess)
-	if itemCount > 0 {
-		handlerResultsCh := make(chan handlerDispatchResult, itemCount)
-		waitErrCh := make(chan error, 1)
-
-		g, _ := errgroup.WithContext(ctx)
-		limit := o.maxGoroutines
-		if limit < 1 {
-			limit = 1
-		}
-		g.SetLimit(limit)
-		for _, queue := range queues {
-			queue := queue
-			g.Go(func() error {
-				for _, item := range queue.items {
-					handlerResultsCh <- o.dispatchHandler(item)
-				}
-				return nil
-			})
-		}
-
-		go func() {
-			waitErrCh <- g.Wait()
-			close(handlerResultsCh)
-		}()
-
-		for handlerResult := range handlerResultsCh {
-			res := results[handlerResult.eventID.String()]
-			if res == nil {
-				continue
-			}
-			if handlerResult.err != nil {
-				if _, ok := res.failedHandlers[handlerResult.handlerType]; !ok {
-					res.failedHandlers[handlerResult.handlerType] = handlerFailure{
-						err:   handlerResult.err.Error(),
-						fatal: handlerResult.fatal,
-					}
-				}
-				continue
-			}
-			res.successfulHandlers = append(res.successfulHandlers, handlerResult.handlerType)
-		}
-
-		if err := <-waitErrCh; err != nil {
-			return 0, err
-		}
+	if err := o.dispatchEvents(ctx, eventsToProcess, eventContexts, results); err != nil {
+		return 0, err
 	}
 
 	resultsCh := make(chan processedResult, len(eventsToProcess))
@@ -884,6 +911,60 @@ func (o *Outbox) processBatch(ctx context.Context) (int, error) {
 	o.updateEventsDB(ctx, resultsCh)
 
 	return len(eventsToProcess), nil
+}
+
+func (o *Outbox) dispatchEvents(ctx context.Context, eventsToProcess []*outboxDoc, eventContexts map[string]map[string]any, results map[string]*processedResult) error {
+	queues, itemCount := o.buildDispatchQueues(eventsToProcess)
+	if itemCount == 0 {
+		return nil
+	}
+
+	handlerResultsCh := make(chan handlerDispatchResult, itemCount)
+	waitErrCh := make(chan error, 1)
+	g, _ := errgroup.WithContext(ctx)
+	g.SetLimit(max(o.maxGoroutines, 1))
+
+	for _, queue := range queues {
+		g.Go(func() error {
+			for _, item := range queue.items {
+				eventCtx := eh.UnmarshalContext(ctx, eventContexts[item.event.ID.String()])
+				handlerResultsCh <- o.dispatchHandler(eventCtx, item)
+			}
+			return nil
+		})
+	}
+
+	go func() {
+		waitErrCh <- g.Wait()
+		close(handlerResultsCh)
+	}()
+
+	o.collectHandlerResults(handlerResultsCh, results)
+	return <-waitErrCh
+}
+
+func (o *Outbox) collectHandlerResults(handlerResultsCh <-chan handlerDispatchResult, results map[string]*processedResult) {
+	for handlerResult := range handlerResultsCh {
+		res := results[handlerResult.eventID.String()]
+		if res == nil {
+			continue
+		}
+		if handlerResult.err != nil {
+			recordHandlerFailure(res, handlerResult)
+			continue
+		}
+		res.successfulHandlers = append(res.successfulHandlers, handlerResult.handlerType)
+	}
+}
+
+func recordHandlerFailure(res *processedResult, handlerResult handlerDispatchResult) {
+	if _, ok := res.failedHandlers[handlerResult.handlerType]; ok {
+		return
+	}
+	res.failedHandlers[handlerResult.handlerType] = handlerFailure{
+		err:   handlerResult.err.Error(),
+		fatal: handlerResult.fatal,
+	}
 }
 
 func (o *Outbox) buildDispatchQueues(eventsToProcess []*outboxDoc) ([]*dispatchQueue, int) {
@@ -971,18 +1052,21 @@ func metadataPartitionKey(value any) string {
 	}
 }
 
-func hashPartition(key string, shards int) int {
+func hashPartition(key string, shards int) uint64 {
+	if shards <= 1 {
+		return 0
+	}
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
-	return int(h.Sum32() % uint32(shards))
+	return uint64(h.Sum32()) % uint64(shards)
 }
 
-func (o *Outbox) dispatchHandler(item dispatchItem) handlerDispatchResult {
+func (o *Outbox) dispatchHandler(ctx context.Context, item dispatchItem) handlerDispatchResult {
 	handlerType := item.handler.HandlerType().String()
-	if err := item.handler.HandleEvent(item.event.Ctx, item.event.Event); err != nil {
+	if err := item.handler.HandleEvent(ctx, item.event.Event); err != nil {
 		severity := GetSeverity(err)
 		wrappedErr := fmt.Errorf("could not handle event (%s): %w", item.handler.HandlerType(), err)
-		o.sendError(wrappedErr, item.event.Event, item.event.Ctx)
+		o.sendError(ctx, wrappedErr, item.event.Event)
 		return handlerDispatchResult{
 			eventID:     item.event.ID,
 			handlerType: handlerType,
@@ -996,124 +1080,160 @@ func (o *Outbox) dispatchHandler(item dispatchItem) handlerDispatchResult {
 	}
 }
 
-func (o *Outbox) fetchAndLockEvents(ctx context.Context) ([]*outboxDoc, error) {
+func (o *Outbox) fetchAndLockEvents(ctx context.Context) ([]*outboxDoc, map[string]map[string]any, error) {
 	tx, err := o.db.Begin()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	defer tx.Rollback()
+	defer rollbackTx(tx)
 
 	now := time.Now()
-	rows, err := tx.StmtContext(ctx, o.selectEventsStmt).Query(now.Add(-PeriodicSweepAge), now)
+	eventsToProcess, eventContexts, err := o.selectEventsForProcessing(ctx, tx, now)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
-	var eventsToProcess []*outboxDoc
-	for rows.Next() {
-		r, err := o.scanOutboxDoc(rows)
-		if err != nil {
-			rows.Close()
-			return nil, err
-		}
-		eventsToProcess = append(eventsToProcess, r)
-	}
-	rows.Close() // It's important to close before committing.
 
 	if len(eventsToProcess) == 0 {
-		tx.Commit()
-		return nil, nil
+		if err := tx.Commit(); err != nil {
+			return nil, nil, fmt.Errorf("could not commit empty event lock transaction: %w", err)
+		}
+		return nil, nil, nil
 	}
 
+	updateStmt := tx.StmtContext(ctx, o.updateTakenAtStmt)
+	defer func() {
+		if err := updateStmt.Close(); err != nil {
+			log.Printf("eventhorizon: could not close SQLite outbox update statement: %s", err)
+		}
+	}()
+
 	for _, r := range eventsToProcess {
-		if _, err := tx.Stmt(o.updateTakenAtStmt).ExecContext(ctx, now, r.ID.String()); err != nil {
-			return nil, err
+		if _, err := updateStmt.ExecContext(ctx, now, r.ID.String()); err != nil {
+			return nil, nil, err
 		}
 	}
 
 	// End the transaction that locks the rows.
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("could not commit transaction locking events: %w", err)
+		return nil, nil, fmt.Errorf("could not commit transaction locking events: %w", err)
 	}
 
-	return eventsToProcess, nil
+	return eventsToProcess, eventContexts, nil
+}
+
+func (o *Outbox) selectEventsForProcessing(ctx context.Context, tx *sql.Tx, now time.Time) ([]*outboxDoc, map[string]map[string]any, error) {
+	selectStmt := tx.StmtContext(ctx, o.selectEventsStmt)
+	defer func() {
+		if err := selectStmt.Close(); err != nil {
+			log.Printf("eventhorizon: could not close SQLite outbox select statement: %s", err)
+		}
+	}()
+
+	rows, err := selectStmt.QueryContext(ctx, now.Add(-PeriodicSweepAge), now)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("eventhorizon: could not close SQLite outbox rows: %s", err)
+		}
+	}()
+
+	eventsToProcess := make([]*outboxDoc, 0)
+	eventContexts := make(map[string]map[string]any)
+	for rows.Next() {
+		r, eventCtx, err := o.scanOutboxDoc(rows)
+		if err != nil {
+			return nil, nil, err
+		}
+		eventContexts[r.ID.String()] = eventCtx
+		eventsToProcess = append(eventsToProcess, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	return eventsToProcess, eventContexts, nil
 }
 
 func (o *Outbox) updateEventsDB(ctx context.Context, resultsCh <-chan processedResult) {
-	// Read results back and perform serial SQLite updates
 	for res := range resultsCh {
-		r := res.r
-
-		successful := stringSet(res.successfulHandlers)
-		terminalFailures := make(map[string]handlerFailure)
-		retryableFailures := make(map[string]handlerFailure)
-		for handlerType, failure := range res.failedHandlers {
-			if failure.fatal || r.RetryCount >= o.maxRetries {
-				terminalFailures[handlerType] = failure
-				continue
-			}
-			retryableFailures[handlerType] = failure
-		}
-
-		intendedRemainingHandlers := make([]string, 0, len(r.Handlers))
-		for _, required := range r.Handlers {
-			if successful[required] {
-				continue
-			}
-			if _, terminal := terminalFailures[required]; terminal {
-				continue
-			}
-			intendedRemainingHandlers = append(intendedRemainingHandlers, required)
-		}
-
-		terminalRemoved := make(map[string]bool, len(terminalFailures))
-		if len(terminalFailures) > 0 {
-			o.sendError(fmt.Errorf("event handler moved to dead letters"), r.Event, ctx)
-			for handlerType, failure := range terminalFailures {
-				if err := o.insertOutboxDeadLetter(ctx, r, handlerType, intendedRemainingHandlers, failure.err); err != nil {
-					o.sendError(err, r.Event, ctx)
-					continue
-				}
-				terminalRemoved[handlerType] = true
-			}
-		}
-
-		remainingHandlers := make([]string, 0, len(r.Handlers))
-		for _, required := range r.Handlers {
-			if successful[required] {
-				continue
-			}
-			if terminalRemoved[required] {
-				continue
-			}
-			remainingHandlers = append(remainingHandlers, required)
-		}
-
-		if len(remainingHandlers) == 0 {
-			// All handlers have finished working, remove the event.
-			if _, err := o.deleteEventStmt.ExecContext(ctx, r.ID.String()); err != nil {
-				o.sendError(fmt.Errorf("could not delete fully processed event: %w", err), r.Event, ctx)
-			}
-		} else {
-			if len(retryableFailures) > 0 {
-				nextRetryCount := r.RetryCount + 1
-				availableAt := time.Now().Add(o.retryBackoff.DelayFunc(int64(nextRetryCount)))
-				if _, err := o.scheduleRetryStmt.ExecContext(ctx, availableAt, r.ID.String()); err != nil {
-					o.sendError(fmt.Errorf("could not schedule event retry: %w", err), r.Event, ctx)
-				}
-				o.notifySchedule()
-			}
-
-			newHandlersBlob, err := jsoniter.Marshal(remainingHandlers)
-			if err != nil {
-				o.sendError(fmt.Errorf("could not marshal remaining handlers: %w", err), r.Event, ctx)
-				continue
-			}
-			if _, err := o.updateHandlersStmt.ExecContext(ctx, string(newHandlersBlob), r.ID.String()); err != nil {
-				o.sendError(fmt.Errorf("could not update remaining handlers: %w", err), r.Event, ctx)
-			}
-		}
+		o.updateEventDB(ctx, res)
 	}
+}
+
+func (o *Outbox) updateEventDB(ctx context.Context, res processedResult) {
+	r := res.r
+	successful := stringSet(res.successfulHandlers)
+	terminalFailures, retryableFailures := o.classifyFailures(r, res.failedHandlers)
+	intendedRemainingHandlers := remainingHandlers(r.Handlers, successful, stringSetFromMap(terminalFailures))
+	terminalRemoved := o.moveTerminalFailures(ctx, r, terminalFailures, intendedRemainingHandlers)
+	remaining := remainingHandlers(r.Handlers, successful, terminalRemoved)
+
+	if len(remaining) == 0 {
+		o.deleteProcessedEvent(ctx, r)
+		return
+	}
+	o.updateRemainingEventHandlers(ctx, r, remaining, retryableFailures)
+}
+
+func (o *Outbox) classifyFailures(r *outboxDoc, failures map[string]handlerFailure) (map[string]handlerFailure, map[string]handlerFailure) {
+	terminalFailures := make(map[string]handlerFailure)
+	retryableFailures := make(map[string]handlerFailure)
+	for handlerType, failure := range failures {
+		if failure.fatal || r.RetryCount >= o.maxRetries {
+			terminalFailures[handlerType] = failure
+			continue
+		}
+		retryableFailures[handlerType] = failure
+	}
+	return terminalFailures, retryableFailures
+}
+
+func (o *Outbox) moveTerminalFailures(ctx context.Context, r *outboxDoc, terminalFailures map[string]handlerFailure, intendedRemainingHandlers []string) map[string]bool {
+	terminalRemoved := make(map[string]bool, len(terminalFailures))
+	if len(terminalFailures) == 0 {
+		return terminalRemoved
+	}
+
+	o.sendError(ctx, errEventHandlerMovedToDeadLetters, r.Event)
+	for handlerType, failure := range terminalFailures {
+		if err := o.insertOutboxDeadLetter(ctx, r, handlerType, intendedRemainingHandlers, failure.err); err != nil {
+			o.sendError(ctx, err, r.Event)
+			continue
+		}
+		terminalRemoved[handlerType] = true
+	}
+	return terminalRemoved
+}
+
+func (o *Outbox) deleteProcessedEvent(ctx context.Context, r *outboxDoc) {
+	if _, err := o.deleteEventStmt.ExecContext(ctx, r.ID.String()); err != nil {
+		o.sendError(ctx, fmt.Errorf("could not delete fully processed event: %w", err), r.Event)
+	}
+}
+
+func (o *Outbox) updateRemainingEventHandlers(ctx context.Context, r *outboxDoc, remainingHandlers []string, retryableFailures map[string]handlerFailure) {
+	if len(retryableFailures) > 0 {
+		o.scheduleRetry(ctx, r)
+	}
+
+	newHandlersBlob, err := jsoniter.Marshal(remainingHandlers)
+	if err != nil {
+		o.sendError(ctx, fmt.Errorf("could not marshal remaining handlers: %w", err), r.Event)
+		return
+	}
+	if _, err := o.updateHandlersStmt.ExecContext(ctx, string(newHandlersBlob), r.ID.String()); err != nil {
+		o.sendError(ctx, fmt.Errorf("could not update remaining handlers: %w", err), r.Event)
+	}
+}
+
+func (o *Outbox) scheduleRetry(ctx context.Context, r *outboxDoc) {
+	nextRetryCount := r.RetryCount + 1
+	availableAt := time.Now().Add(o.retryBackoff.DelayFunc(int64(nextRetryCount)))
+	if _, err := o.scheduleRetryStmt.ExecContext(ctx, availableAt, r.ID.String()); err != nil {
+		o.sendError(ctx, fmt.Errorf("could not schedule event retry: %w", err), r.Event)
+	}
+	o.notifySchedule()
 }
 
 func stringSet(values []string) map[string]bool {
@@ -1122,6 +1242,25 @@ func stringSet(values []string) map[string]bool {
 		set[value] = true
 	}
 	return set
+}
+
+func stringSetFromMap[T any](values map[string]T) map[string]bool {
+	set := make(map[string]bool, len(values))
+	for value := range values {
+		set[value] = true
+	}
+	return set
+}
+
+func remainingHandlers(requiredHandlers []string, successful, removed map[string]bool) []string {
+	remaining := make([]string, 0, len(requiredHandlers))
+	for _, required := range requiredHandlers {
+		if successful[required] || removed[required] {
+			continue
+		}
+		remaining = append(remaining, required)
+	}
+	return remaining
 }
 
 func (o *Outbox) insertOutboxDeadLetter(ctx context.Context, r *outboxDoc, handlerType string, remainingHandlers []string, reason string) error {
@@ -1169,9 +1308,9 @@ func (o *Outbox) insertOutboxDeadLetter(ctx context.Context, r *outboxDoc, handl
 	}
 	if o.deadLetterExport != nil {
 		if err := o.deadLetterExport.ExportDeadLetter(ctx, record); err != nil {
-			o.sendError(fmt.Errorf("could not export outbox dead letter: %w", err), r.Event, ctx)
+			o.sendError(ctx, fmt.Errorf("could not export outbox dead letter: %w", err), r.Event)
 		} else if err := o.markDeadLetterExported(ctx, record.ID, time.Now()); err != nil {
-			o.sendError(fmt.Errorf("could not mark outbox dead letter exported: %w", err), r.Event, ctx)
+			o.sendError(ctx, fmt.Errorf("could not mark outbox dead letter exported: %w", err), r.Event)
 		}
 	}
 	return nil
