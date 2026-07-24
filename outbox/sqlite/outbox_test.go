@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -36,26 +37,102 @@ func TestOutboxAddHandler(t *testing.T) {
 	outbox.TestAddHandler(t, o, context.Background())
 }
 
-func TestOutboxIntegration(t *testing.T) {
-	// Shorter sweeps for testing
+// TestOutboxIntegrationStaticRegistration covers the former AcceptanceTest
+// surface under the static-registration contract (all handlers before Start):
+// context marshal/unmarshal into handlers, multi-handler fan-out, and async
+// handler errors on Errors().
+func TestOutboxIntegrationStaticRegistration(t *testing.T) {
 	restoreSweepInterval := setPeriodicSweepInterval(t, 2*time.Second)
 	defer restoreSweepInterval()
 	restoreSweepAge := setPeriodicSweepAge(t, 2*time.Second)
 	defer restoreSweepAge()
 
 	db := newTestDB(t)
+	ctx := mocks.WithContextOne(context.Background(), "testval")
 
 	o, err := NewOutbox(db)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer o.Close()
 
-	o.Start()
+	handler := mocks.NewEventHandler("static_handler")
+	anotherHandler := mocks.NewEventHandler("static_another_handler")
+	otherHandler := mocks.NewEventHandler("static_other_handler")
+	errorHandler := mocks.NewEventHandler("static_error_handler")
+	errorHandler.Err = errors.New("handler error")
 
-	outbox.AcceptanceTest(t, o, context.Background(), "none")
+	// All registrations before Start.
+	for _, h := range []eh.EventHandler{handler, anotherHandler} {
+		if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventOtherType}, otherHandler); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchAll{}, errorHandler); err != nil {
+		t.Fatal(err)
+	}
 
-	if err := o.Close(); err != nil {
-		t.Error("there should be no error:", err)
+	if err := o.StartChecked(); err != nil {
+		t.Fatal(err)
+	}
+
+	id := uuid.New()
+	timestamp := time.Date(2009, time.November, 10, 23, 0, 0, 0, time.UTC)
+	event2 := eh.NewEvent(mocks.EventType, &mocks.EventData{Content: "event2"}, timestamp,
+		eh.ForAggregate(mocks.AggregateType, id, 2),
+		eh.WithMetadata(map[string]any{"meta": "data", "num": 42.0}),
+	)
+	if err := o.HandleEvent(ctx, event2); err != nil {
+		t.Fatal(err)
+	}
+
+	if !handler.Wait(3 * time.Second) {
+		t.Fatal("handler did not receive event")
+	}
+	handler.Lock()
+	if len(handler.Events) != 1 {
+		t.Fatalf("handler events = %d, want 1", len(handler.Events))
+	}
+	if val, ok := mocks.ContextOne(handler.Context); !ok || val != "testval" {
+		t.Fatalf("handler context = %v, want testval", handler.Context)
+	}
+	handler.Unlock()
+
+	if !anotherHandler.Wait(3 * time.Second) {
+		t.Fatal("another handler did not receive event")
+	}
+	anotherHandler.Lock()
+	if val, ok := mocks.ContextOne(anotherHandler.Context); !ok || val != "testval" {
+		t.Fatalf("another handler context = %v, want testval", anotherHandler.Context)
+	}
+	anotherHandler.Unlock()
+
+	// MatchAll error handler also sees the event; async error must appear.
+	// Drain until we see the handler error (other Errors may exist).
+	deadline := time.After(3 * time.Second)
+	found := false
+	for !found {
+		select {
+		case err := <-o.Errors():
+			if err != nil && strings.Contains(err.Error(), "handler error") {
+				found = true
+			}
+		case <-deadline:
+			t.Fatal("expected async handler error on Errors()")
+		}
+	}
+
+	// Event without data to the other-type handler.
+	eventOther := eh.NewEvent(mocks.EventOtherType, nil, timestamp,
+		eh.ForAggregate(mocks.AggregateType, uuid.New(), 1))
+	if err := o.HandleEvent(ctx, eventOther); err != nil {
+		t.Fatal(err)
+	}
+	if !otherHandler.Wait(3 * time.Second) {
+		t.Fatal("other handler did not receive event")
 	}
 }
 
@@ -120,14 +197,23 @@ func TestOutboxHandleEventRequiresStart(t *testing.T) {
 		t.Fatalf("dead letter rows before Start = %d, want 0", got)
 	}
 
-	o.Start()
-	o.Start()
+	if err := o.StartChecked(); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StartChecked(); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := o.HandleEvent(WithDelay(ctx, time.Hour), newTestEvent("after-start")); err != nil {
 		t.Fatal(err)
 	}
 	if got := outboxRowCount(t, db); got != 1 {
 		t.Fatalf("outbox rows after Start = %d, want 1", got)
+	}
+
+	// Registration is closed after Start.
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, mocks.NewEventHandler("late_handler")); !errors.Is(err, ErrOutboxAlreadyStarted) {
+		t.Fatalf("AddHandler after Start error = %v, want ErrOutboxAlreadyStarted", err)
 	}
 }
 
@@ -413,6 +499,226 @@ func TestOutboxNoMatchWritesDeadLetter(t *testing.T) {
 	}
 }
 
+// TestOutboxEmptyHandlersRematch dispatches rows with handlers=[] against the
+// current registration (replay rematch contract). Still unmatched rows stay
+// unclaimed and are never deleted.
+func TestOutboxEmptyHandlersRematch(t *testing.T) {
+	db := newTestDB(t)
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	handler := mocks.NewEventHandler("rematch_handler")
+	if err := o.AddHandler(context.Background(), eh.MatchEvents{mocks.EventType}, handler); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.StartChecked(); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	matchedID := uuid.New().String()
+	unmatchedID := uuid.New().String()
+	seedOutboxEventWithID(t, db, o, matchedID, newTestEvent("rematch-hit"), []string{}, now, now, sql.NullTime{})
+	// EventOtherType has no matching handler in this outbox.
+	other := eh.NewEvent(mocks.EventOtherType, &mocks.EventData{Content: "nope"}, now,
+		eh.ForAggregate(mocks.AggregateType, uuid.New(), 1))
+	seedOutboxEventWithID(t, db, o, unmatchedID, other, []string{}, now, now, sql.NullTime{})
+
+	processAllBatches(t, o, context.Background())
+	// Allow in-flight handler completion.
+	if !handler.Wait(3 * time.Second) {
+		t.Fatal("rematch handler did not receive event")
+	}
+
+	// Matched rematch row should complete and leave outbox.
+	var matchedLeft int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM outbox WHERE id = ?`, matchedID).Scan(&matchedLeft); err != nil {
+		t.Fatal(err)
+	}
+	if matchedLeft != 0 {
+		t.Fatalf("matched rematch row still in outbox")
+	}
+
+	// Unmatched rematch stays unclaimed (never deleted).
+	var unmatchedHandlers string
+	var unmatchedTaken sql.NullTime
+	if err := db.QueryRow(`SELECT handlers, taken_at FROM outbox WHERE id = ?`, unmatchedID).
+		Scan(&unmatchedHandlers, &unmatchedTaken); err != nil {
+		t.Fatal(err)
+	}
+	if unmatchedHandlers != "[]" || unmatchedTaken.Valid {
+		t.Fatalf("unmatched rematch: handlers=%s taken=%v (want [] unclaimed)", unmatchedHandlers, unmatchedTaken)
+	}
+}
+
+// TestOutboxRematchPartialSuccessRetryable keeps the failed handler after rematch.
+// Without persisting matched handlers at claim time, remainingHandlers([]) would
+// delete the row and silently drop retryable work.
+func TestOutboxRematchPartialSuccessRetryable(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db, WithMaxRetries(2), WithRetryBackoff("FIXED:2:200ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	successHandler := mocks.NewEventHandler("rematch_ok_handler")
+	retryHandler := mocks.NewEventHandler("rematch_retry_handler")
+	retryHandler.Err = errors.New("temporary rematch failure")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, successHandler); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, retryHandler); err != nil {
+		t.Fatal(err)
+	}
+
+	id := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute)
+	// Rematch sentinel: empty handlers list.
+	seedOutboxEventWithID(t, db, o, id, newTestEvent("rematch-partial-retry"), []string{}, createdAt, createdAt, sql.NullTime{})
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	if !successHandler.Wait(2 * time.Second) {
+		t.Fatal("success handler did not run")
+	}
+	// Row must survive with only the retryable handler remaining (no silent delete).
+	if got := outboxRowCount(t, db); got != 1 {
+		t.Fatalf("outbox rows = %d, want 1 (retryable work kept)", got)
+	}
+	assertOutboxHandlers(t, db, id, []string{retryHandler.Type})
+	var retryCount int
+	var availableAt time.Time
+	var takenAt sql.NullTime
+	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox WHERE id = ?`, id).
+		Scan(&retryCount, &availableAt, &takenAt); err != nil {
+		t.Fatal(err)
+	}
+	if retryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", retryCount)
+	}
+	if !availableAt.After(time.Now().Add(100 * time.Millisecond)) {
+		t.Fatalf("available_at = %s, want future retry backoff", availableAt)
+	}
+	if takenAt.Valid {
+		t.Fatal("taken_at should be cleared for retry")
+	}
+	if got := deadLetterRowCount(t, db); got != 0 {
+		t.Fatalf("dead letter rows = %d, want 0 for retryable failure", got)
+	}
+}
+
+// TestOutboxRematchPartialSuccessFatal DLQs only the fatal handler after rematch
+// and deletes the row when no retryable work remains (success was removed).
+func TestOutboxRematchPartialSuccessFatal(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	successHandler := mocks.NewEventHandler("rematch_fatal_ok_handler")
+	fatalHandler := mocks.NewEventHandler("rematch_fatal_bad_handler")
+	fatalHandler.Err = fatalOutboxError{err: errors.New("fatal rematch failure")}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, successHandler); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, fatalHandler); err != nil {
+		t.Fatal(err)
+	}
+
+	id := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute)
+	seedOutboxEventWithID(t, db, o, id, newTestEvent("rematch-partial-fatal"), []string{}, createdAt, createdAt, sql.NullTime{})
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	if !successHandler.Wait(2 * time.Second) {
+		t.Fatal("success handler did not run")
+	}
+	if got := outboxRowCount(t, db); got != 0 {
+		t.Fatalf("outbox rows = %d, want 0 after success+terminal", got)
+	}
+	assertDeadLetterHandlers(t, db, []string{fatalHandler.Type})
+	record := deadLetterRecordByHandler(t, db, fatalHandler.Type)
+	if record.OutboxID != id {
+		t.Fatalf("outbox_id = %s, want %s", record.OutboxID, id)
+	}
+	if record.RemainingHandlers != "[]" {
+		t.Fatalf("remaining_handlers = %s, want []", record.RemainingHandlers)
+	}
+}
+
+// TestOutboxRematchFatalLeavesRetryable mirrors mixed terminal+retryable finalize
+// after rematch from handlers=[] (persist matched set at claim).
+func TestOutboxRematchFatalLeavesRetryable(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db, WithRetryBackoff("FIXED:2:200ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	fatalHandler := mocks.NewEventHandler("rematch_mixed_fatal")
+	fatalHandler.Err = fatalOutboxError{err: errors.New("fatal rematch")}
+	retryableHandler := mocks.NewEventHandler("rematch_mixed_retry")
+	retryableHandler.Err = errors.New("temporary rematch")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, fatalHandler); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, retryableHandler); err != nil {
+		t.Fatal(err)
+	}
+
+	id := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute)
+	seedOutboxEventWithID(t, db, o, id, newTestEvent("rematch-fatal-retry"), []string{}, createdAt, createdAt, sql.NullTime{})
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	assertDeadLetterHandlers(t, db, []string{fatalHandler.Type})
+	assertOutboxHandlers(t, db, id, []string{retryableHandler.Type})
+	var retryCount int
+	var availableAt time.Time
+	var takenAt sql.NullTime
+	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox WHERE id = ?`, id).
+		Scan(&retryCount, &availableAt, &takenAt); err != nil {
+		t.Fatal(err)
+	}
+	if retryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", retryCount)
+	}
+	if takenAt.Valid {
+		t.Fatal("taken_at should be cleared for retry")
+	}
+	if !availableAt.After(time.Now().Add(100 * time.Millisecond)) {
+		t.Fatalf("available_at = %s, want future retry", availableAt)
+	}
+	record := deadLetterRecordByHandler(t, db, fatalHandler.Type)
+	if record.RemainingHandlers != fmt.Sprintf(`["%s"]`, retryableHandler.Type) {
+		t.Fatalf("remaining_handlers = %s, want retryable only", record.RemainingHandlers)
+	}
+}
+
 func TestOutboxNoMatchDeadLetterRollsBackWithTransaction(t *testing.T) {
 	db := newTestDB(t)
 	o, err := NewOutbox(db)
@@ -450,13 +756,13 @@ func TestOutboxRetryableErrorSchedulesBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer o.Close()
-	o.started.Store(true)
-
 	handler := mocks.NewEventHandler("retry_handler")
 	handler.Err = errors.New("temporary failure")
 	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
 		t.Fatal(err)
 	}
+	// Allow HandleEvent without starting the processor (unit path uses processBatch).
+	o.processorRunning.Store(true)
 
 	if err := o.HandleEvent(ctx, newTestEvent("retry")); err != nil {
 		t.Fatal(err)
@@ -498,13 +804,13 @@ func TestOutboxTerminalFailureWritesDeadLetter(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer o.Close()
-	o.started.Store(true)
-
 	handler := mocks.NewEventHandler("terminal_handler")
 	handler.Err = errors.New("permanent failure")
 	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
 		t.Fatal(err)
 	}
+	// Allow HandleEvent without starting the processor (unit path uses processBatch).
+	o.processorRunning.Store(true)
 
 	if err := o.HandleEvent(ctx, newTestEvent("terminal")); err != nil {
 		t.Fatal(err)
@@ -770,6 +1076,486 @@ func TestOutboxDeadLetterExporterMarksExportedAt(t *testing.T) {
 	}
 	if got := exportedDeadLetterCount(t, db); got != 1 {
 		t.Fatalf("exported dead letters = %d, want 1", got)
+	}
+}
+
+// TestOutboxDeadLetterExportAfterFinalize asserts that file export runs only after
+// the atomic finalize transaction has committed (DLQ + handlers/retry/delete).
+// The exporter observes the post-finalize DB state: the terminal handler is no
+// longer present on the outbox row (or the row is gone).
+func TestOutboxDeadLetterExportAfterFinalize(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	var observedHandlers []string
+	var outboxMissing bool
+	var deadLetterPresent bool
+	exporter := dl.ExportFunc(func(_ context.Context, record dl.Record) error {
+		var handlersBlob string
+		err := db.QueryRow(`SELECT handlers FROM outbox WHERE id = ?`, record.OutboxID).Scan(&handlersBlob)
+		if errors.Is(err, sql.ErrNoRows) {
+			outboxMissing = true
+		} else if err != nil {
+			t.Errorf("exporter could not read outbox: %v", err)
+			return nil
+		} else {
+			if err := json.Unmarshal([]byte(handlersBlob), &observedHandlers); err != nil {
+				t.Errorf("exporter could not unmarshal handlers: %v", err)
+			}
+		}
+		var count int
+		if err := db.QueryRow(`
+			SELECT COUNT(*) FROM dead_letters
+			WHERE source = ? AND outbox_id = ? AND handler_type = ?
+		`, record.Source, record.OutboxID, record.HandlerType).Scan(&count); err != nil {
+			t.Errorf("exporter could not read dead_letters: %v", err)
+			return nil
+		}
+		deadLetterPresent = count == 1
+		return nil
+	})
+
+	o, err := NewOutbox(db, WithMaxRetries(0), WithDeadLetterExporter(exporter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	handler := mocks.NewEventHandler("export_after_finalize_handler")
+	handler.Err = errors.New("terminal failure")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
+		t.Fatal(err)
+	}
+
+	outboxID := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute)
+	seedOutboxEventWithID(t, db, o, outboxID, newTestEvent("export-after-finalize"), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	if !deadLetterPresent {
+		t.Fatal("exporter must observe the committed dead_letters row")
+	}
+	if !outboxMissing {
+		// Single-handler terminal: outbox row must already be deleted when export runs.
+		t.Fatalf("exporter observed outbox handlers %v; want row deleted after finalize commit", observedHandlers)
+	}
+}
+
+// TestOutboxDeadLetterUniqueSourceOutboxHandler enforces uniqueness of
+// (source, outbox_id, handler_type) so a crash-replay cannot create duplicate DLQs.
+func TestOutboxDeadLetterUniqueSourceOutboxHandler(t *testing.T) {
+	db := newTestDB(t)
+	// EnsureSchema runs via NewOutbox.
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	now := time.Now()
+	if _, err := db.Exec(`
+		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
+		VALUES (?, 'outbox', 'Event', 'agg', 'handler_a', 'outbox-1', '[]', '{}', 'err', 0, ?, ?)
+	`, uuid.New().String(), now, now); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
+		VALUES (?, 'outbox', 'Event', 'agg', 'handler_a', 'outbox-1', '[]', '{}', 'err-dup', 0, ?, ?)
+	`, uuid.New().String(), now, now)
+	if err == nil {
+		t.Fatal("expected unique constraint violation for duplicate (source, outbox_id, handler_type)")
+	}
+
+	// Distinct handler_type for the same outbox id must still be allowed.
+	if _, err := db.Exec(`
+		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
+		VALUES (?, 'outbox', 'Event', 'agg', 'handler_b', 'outbox-1', '[]', '{}', 'err', 0, ?, ?)
+	`, uuid.New().String(), now, now); err != nil {
+		t.Fatalf("distinct handler_type insert failed: %v", err)
+	}
+}
+
+// TestOutboxFinalizeIdempotentOnReplay simulates a crash after DLQ insert but before
+// handlers were updated: the DLQ row already exists. Re-processing must not create a
+// second dead letter and must still remove the terminal handler (and apply retry fields).
+func TestOutboxFinalizeIdempotentOnReplay(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db, WithRetryBackoff("FIXED:2:200ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	fatalHandler := mocks.NewEventHandler("replay_fatal_handler")
+	fatalHandler.Err = fatalOutboxError{err: errors.New("fatal again")}
+	retryHandler := mocks.NewEventHandler("replay_retry_handler")
+	retryHandler.Err = errors.New("retryable again")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, fatalHandler); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, retryHandler); err != nil {
+		t.Fatal(err)
+	}
+
+	outboxID := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute)
+	event := newTestEvent("replay-finalize")
+	seedOutboxEventWithID(t, db, o, outboxID, event, []string{fatalHandler.Type, retryHandler.Type}, createdAt, createdAt, sql.NullTime{})
+
+	// Pre-seed a dead letter as if the previous attempt wrote DLQ then crashed.
+	eventBlob, err := o.codec.MarshalEvent(ctx, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if _, err := db.Exec(`
+		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
+		VALUES (?, 'outbox', ?, ?, ?, ?, ?, ?, 'previous fatal', 0, ?, ?)
+	`, uuid.New().String(), event.EventType().String(), event.AggregateID().String(), fatalHandler.Type, outboxID, fmt.Sprintf(`["%s"]`, retryHandler.Type), string(eventBlob), createdAt, now); err != nil {
+		t.Fatal(err)
+	}
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	if got := deadLetterRowCount(t, db); got != 1 {
+		t.Fatalf("dead letter rows = %d, want 1 (no duplicate on replay)", got)
+	}
+	assertOutboxHandlers(t, db, outboxID, []string{retryHandler.Type})
+	var retryCount int
+	var availableAt time.Time
+	var takenAt sql.NullTime
+	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox WHERE id = ?`, outboxID).Scan(&retryCount, &availableAt, &takenAt); err != nil {
+		t.Fatal(err)
+	}
+	if retryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", retryCount)
+	}
+	if !availableAt.After(time.Now().Add(100 * time.Millisecond)) {
+		t.Fatalf("available_at = %s, want future backoff", availableAt)
+	}
+	if takenAt.Valid {
+		t.Fatal("taken_at should be cleared after atomic finalize with retry")
+	}
+}
+
+// TestOutboxFinalizeAtomicMixedTerminalAndRetry checks that a single finalize
+// transaction leaves DLQ, remaining handlers, and retry fields consistent.
+func TestOutboxFinalizeAtomicMixedTerminalAndRetry(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db, WithRetryBackoff("FIXED:2:300ms"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	fatalHandler := mocks.NewEventHandler("atomic_fatal_handler")
+	fatalHandler.Err = fatalOutboxError{err: errors.New("fatal")}
+	retryHandler := mocks.NewEventHandler("atomic_retry_handler")
+	retryHandler.Err = errors.New("retryable")
+	successHandler := mocks.NewEventHandler("atomic_success_handler")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, fatalHandler); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, retryHandler); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, successHandler); err != nil {
+		t.Fatal(err)
+	}
+
+	outboxID := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute)
+	seedOutboxEventWithID(t, db, o, outboxID, newTestEvent("atomic-mixed"), []string{
+		fatalHandler.Type, retryHandler.Type, successHandler.Type,
+	}, createdAt, createdAt, sql.NullTime{})
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	// Atomic outcome: exactly one DLQ for the fatal handler, retryable remains,
+	// successful removed, retry scheduled.
+	if got := deadLetterRowCount(t, db); got != 1 {
+		t.Fatalf("dead letter rows = %d, want 1", got)
+	}
+	assertDeadLetterHandlers(t, db, []string{fatalHandler.Type})
+	assertOutboxHandlers(t, db, outboxID, []string{retryHandler.Type})
+	var retryCount int
+	var availableAt time.Time
+	var takenAt sql.NullTime
+	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox WHERE id = ?`, outboxID).Scan(&retryCount, &availableAt, &takenAt); err != nil {
+		t.Fatal(err)
+	}
+	if retryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", retryCount)
+	}
+	if !availableAt.After(time.Now().Add(100 * time.Millisecond)) {
+		t.Fatalf("available_at = %s, want future backoff", availableAt)
+	}
+	if takenAt.Valid {
+		t.Fatal("taken_at should be cleared")
+	}
+	record := deadLetterRecordByHandler(t, db, fatalHandler.Type)
+	if record.OutboxID != outboxID {
+		t.Fatalf("outbox_id = %s, want %s", record.OutboxID, outboxID)
+	}
+	if record.RemainingHandlers != fmt.Sprintf(`["%s"]`, retryHandler.Type) {
+		t.Fatalf("remaining_handlers = %s, want only retry handler", record.RemainingHandlers)
+	}
+}
+
+// TestOutboxFinalizeAtomicAllTerminalDeletesOutbox ensures multi-handler permanent
+// failure writes all DLQ rows and deletes the outbox row together.
+func TestOutboxFinalizeAtomicAllTerminalDeletesOutbox(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	exporter := &recordingDeadLetterExporter{}
+	o, err := NewOutbox(db, WithMaxRetries(0), WithDeadLetterExporter(exporter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	first := mocks.NewEventHandler("all_terminal_a")
+	first.Err = errors.New("a failed")
+	second := mocks.NewEventHandler("all_terminal_b")
+	second.Err = errors.New("b failed")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, second); err != nil {
+		t.Fatal(err)
+	}
+
+	outboxID := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute)
+	seedOutboxEventWithID(t, db, o, outboxID, newTestEvent("all-terminal"), []string{first.Type, second.Type}, createdAt, createdAt, sql.NullTime{})
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	if got := outboxRowCount(t, db); got != 0 {
+		t.Fatalf("outbox rows = %d, want 0", got)
+	}
+	if got := deadLetterRowCount(t, db); got != 2 {
+		t.Fatalf("dead letter rows = %d, want 2", got)
+	}
+	if got := len(exporter.Records()); got != 2 {
+		t.Fatalf("exported records = %d, want 2 (after commit)", got)
+	}
+	if got := exportedDeadLetterCount(t, db); got != 2 {
+		t.Fatalf("exported_at set = %d, want 2", got)
+	}
+}
+
+// TestOutboxFinalizeRollbackOnHandlersUpdateAbort proves the finalize transaction
+// rolls back when a later step fails: DLQ INSERT runs first, then UPDATE handlers
+// is aborted by a SQLite trigger. No partial DLQ, handlers/retry fields, or export.
+func TestOutboxFinalizeRollbackOnHandlersUpdateAbort(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	exporter := &recordingDeadLetterExporter{}
+	o, err := NewOutbox(db, WithRetryBackoff("FIXED:2:500ms"), WithDeadLetterExporter(exporter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	// Abort the handlers list update after any preceding DLQ insert in the same TX.
+	if _, err := db.Exec(`
+		CREATE TRIGGER abort_finalize_handlers
+		BEFORE UPDATE OF handlers ON outbox
+		BEGIN
+			SELECT RAISE(ABORT, 'forced finalize abort');
+		END
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	fatalHandler := mocks.NewEventHandler("rollback_fatal_handler")
+	fatalHandler.Err = fatalOutboxError{err: errors.New("fatal during finalize")}
+	retryHandler := mocks.NewEventHandler("rollback_retry_handler")
+	retryHandler.Err = errors.New("retryable during finalize")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, fatalHandler); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, retryHandler); err != nil {
+		t.Fatal(err)
+	}
+
+	outboxID := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Millisecond)
+	availableAt := createdAt
+	originalHandlers := []string{fatalHandler.Type, retryHandler.Type}
+	seedOutboxEventWithID(t, db, o, outboxID, newTestEvent("finalize-rollback"), originalHandlers, createdAt, availableAt, sql.NullTime{})
+
+	// Drain any residual errors, then process.
+	drainOutboxErrors(o)
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	if got := deadLetterRowCount(t, db); got != 0 {
+		t.Fatalf("dead letter rows = %d, want 0 after finalize rollback", got)
+	}
+	if got := len(exporter.Records()); got != 0 {
+		t.Fatalf("exporter calls = %d, want 0 after finalize rollback", got)
+	}
+	assertOutboxHandlers(t, db, outboxID, originalHandlers)
+
+	var retryCount int
+	var gotAvailableAt time.Time
+	var takenAt sql.NullTime
+	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox WHERE id = ?`, outboxID).Scan(&retryCount, &gotAvailableAt, &takenAt); err != nil {
+		t.Fatal(err)
+	}
+	if retryCount != 0 {
+		t.Fatalf("retry_count = %d, want 0 (retry fields rolled back)", retryCount)
+	}
+	if !gotAvailableAt.Equal(availableAt) {
+		t.Fatalf("available_at = %s, want original %s", gotAvailableAt, availableAt)
+	}
+	// Claim (taken_at) commits in a separate transaction before finalize; after a
+	// finalize rollback the claim must remain so the row is not double-dispatched
+	// until PeriodicSweepAge releases it.
+	if !takenAt.Valid {
+		t.Fatal("taken_at should remain set after claim; finalize rollback must not clear it")
+	}
+
+	finalizeErrs := drainOutboxErrors(o)
+	if !containsErrorSubstring(finalizeErrs, "forced finalize abort") && !containsErrorSubstring(finalizeErrs, "could not update remaining handlers") {
+		t.Fatalf("expected finalize abort on Errors(), got: %v", finalizeErrs)
+	}
+}
+
+// TestOutboxExportUsesDurableDeadLetterOnReplay ensures that after ON CONFLICT the
+// exporter receives the durable dead_letters row (blob/error/id), not a freshly
+// synthesized candidate, and marks exported_at on that row's id.
+func TestOutboxExportUsesDurableDeadLetterOnReplay(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	exporter := &recordingDeadLetterExporter{}
+	o, err := NewOutbox(db, WithMaxRetries(0), WithDeadLetterExporter(exporter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	handler := mocks.NewEventHandler("export_durable_handler")
+	handler.Err = errors.New("new terminal failure from this attempt")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
+		t.Fatal(err)
+	}
+
+	outboxID := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute)
+	event := newTestEvent("export-durable")
+	seedOutboxEventWithID(t, db, o, outboxID, event, []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+
+	existingID := uuid.New().String()
+	existingBlob := `{"durable":"previous-blob-not-from-this-attempt"}`
+	existingError := "previous durable dead letter error"
+	existingRemaining := `[]`
+	existingCreatedAt := createdAt.Add(-time.Hour)
+	existingDeadAt := createdAt.Add(-30 * time.Minute)
+	if _, err := db.Exec(`
+		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
+		VALUES (?, 'outbox', ?, ?, ?, ?, ?, ?, ?, 3, ?, ?)
+	`, existingID, event.EventType().String(), event.AggregateID().String(), handler.Type, outboxID, existingRemaining, existingBlob, existingError, existingCreatedAt, existingDeadAt); err != nil {
+		t.Fatal(err)
+	}
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	if got := deadLetterRowCount(t, db); got != 1 {
+		t.Fatalf("dead letter rows = %d, want 1", got)
+	}
+	records := exporter.Records()
+	if len(records) != 1 {
+		t.Fatalf("exported records = %d, want 1", len(records))
+	}
+	got := records[0]
+	if got.ID != existingID {
+		t.Fatalf("exported id = %s, want durable id %s", got.ID, existingID)
+	}
+	if got.Blob != existingBlob {
+		t.Fatalf("exported blob = %q, want durable blob %q", got.Blob, existingBlob)
+	}
+	if got.Error != existingError {
+		t.Fatalf("exported error = %q, want durable error %q", got.Error, existingError)
+	}
+	if got.RetryCount != 3 {
+		t.Fatalf("exported retry_count = %d, want 3 from durable row", got.RetryCount)
+	}
+	if got.RemainingHandlers != existingRemaining {
+		t.Fatalf("exported remaining_handlers = %q, want %q", got.RemainingHandlers, existingRemaining)
+	}
+
+	var exportedID string
+	var exportedAt sql.NullTime
+	if err := db.QueryRow(`SELECT id, exported_at FROM dead_letters WHERE source = 'outbox' AND outbox_id = ? AND handler_type = ?`, outboxID, handler.Type).Scan(&exportedID, &exportedAt); err != nil {
+		t.Fatal(err)
+	}
+	if exportedID != existingID {
+		t.Fatalf("stored id = %s, want %s", exportedID, existingID)
+	}
+	if !exportedAt.Valid {
+		t.Fatal("exported_at should be set on the durable row id")
+	}
+}
+
+// TestOutboxSuccessPathFinalizeDeletesWithoutDeadLetter covers pure success.
+func TestOutboxSuccessPathFinalizeDeletesWithoutDeadLetter(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	handler := mocks.NewEventHandler("success_only_handler")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
+		t.Fatal(err)
+	}
+
+	outboxID := uuid.New().String()
+	createdAt := time.Now().Add(-time.Minute)
+	seedOutboxEventWithID(t, db, o, outboxID, newTestEvent("success-only"), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+	if got := outboxRowCount(t, db); got != 0 {
+		t.Fatalf("outbox rows = %d, want 0", got)
+	}
+	if got := deadLetterRowCount(t, db); got != 0 {
+		t.Fatalf("dead letter rows = %d, want 0", got)
 	}
 }
 
@@ -1337,6 +2123,29 @@ func deadLetterRowCount(t testing.TB, db *sql.DB) int {
 		t.Fatal(err)
 	}
 	return count
+}
+
+func drainOutboxErrors(o *Outbox) []error {
+	var errs []error
+	for {
+		select {
+		case err := <-o.Errors():
+			if err != nil {
+				errs = append(errs, err)
+			}
+		default:
+			return errs
+		}
+	}
+}
+
+func containsErrorSubstring(errs []error, substr string) bool {
+	for _, err := range errs {
+		if err != nil && strings.Contains(err.Error(), substr) {
+			return true
+		}
+	}
+	return false
 }
 
 func exportedDeadLetterCount(t testing.TB, db *sql.DB) int {

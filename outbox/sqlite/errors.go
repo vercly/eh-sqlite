@@ -8,6 +8,10 @@ import (
 // ErrOutboxNotStarted is returned when publishing is attempted before Start.
 var ErrOutboxNotStarted = errors.New("outbox not started")
 
+// ErrOutboxAlreadyStarted is returned when AddHandler is called after Start has
+// closed handler registration. Register all handlers, then call Start once.
+var ErrOutboxAlreadyStarted = errors.New("outbox already started")
+
 // ErrorSeverity defines how an outbox error should be treated
 type ErrorSeverity int
 
@@ -41,9 +45,13 @@ var (
 var (
 	errUnknownDispatchMode            = errors.New("unknown dispatch mode")
 	errInvalidPartitionShards         = errors.New("partition shards must be >= 1")
+	errInvalidQueueDepth              = errors.New("queue depth must be >= 1")
 	errUnsupportedAvailableAtType     = errors.New("unsupported available_at value type")
 	errEventHandlerMovedToDeadLetters = errors.New("event handler moved to dead letters")
 )
+
+// ErrInvalidQueueDepth is returned by WithQueueDepth when depth < 1.
+var ErrInvalidQueueDepth = errInvalidQueueDepth
 
 // GetSeverity unpacks the error chain to check if a specific ErrorSeverity
 // has been assigned, returning SeverityUnknown if no compliant error is found.

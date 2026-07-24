@@ -20,6 +20,8 @@ type Record struct {
 	CreatedAt         time.Time  `json:"created_at"`
 	DeadAt            time.Time  `json:"dead_at"`
 	ExportedAt        *time.Time `json:"exported_at,omitempty"`
+	ReplayedAt        *time.Time `json:"replayed_at,omitempty"`
+	ReplayedBy        string     `json:"replayed_by,omitempty"`
 }
 
 // Exporter is called after a dead-letter row has been inserted successfully.

@@ -16,7 +16,6 @@ import (
 	"github.com/vercly/eh-sqlite/context/sqlite"
 	dl "github.com/vercly/eh-sqlite/deadletter"
 	"github.com/vercly/eh-sqlite/internal/deadletter"
-	"golang.org/x/sync/errgroup"
 
 	jsoniter "github.com/json-iterator/go"
 	// Register the sqlite3 database/sql driver used by this package.
@@ -80,26 +79,45 @@ func WithAvailableAt(ctx context.Context, availableAt time.Time) context.Context
 	return context.WithValue(ctx, availableAtContextKey{}, availableAt)
 }
 
+// maxFetchBatch is the upper bound on rows considered in one claim transaction.
+// Effective claim size is min(maxFetchBatch, admission free slots).
+const maxFetchBatch = 50
+
 // Outbox implements an eventhorizon.Outbox for SQLite.
 type Outbox struct {
-	db               *sql.DB
-	outboxTable      string
-	deadLetterTable  string
-	handlers         []*matcherHandler
-	handlersByType   map[eh.EventHandlerType]*matcherHandler
-	handlersMu       sync.RWMutex
-	watchCh          chan struct{}
-	scheduleCh       chan struct{}
-	errCh            chan error
-	done             <-chan struct{}
-	cancel           context.CancelFunc
-	wg               sync.WaitGroup
-	started          atomic.Bool
+	db              *sql.DB
+	outboxTable     string
+	deadLetterTable string
+	handlers        []*matcherHandler
+	handlersByType  map[eh.EventHandlerType]*matcherHandler
+	handlersMu      sync.RWMutex
+	watchCh         chan struct{}
+	scheduleCh      chan struct{}
+	errCh           chan error
+	done            <-chan struct{}
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	// registrationClosed is set on the first Start/StartChecked attempt and
+	// never reopened. AddHandler fails once this is true.
+	registrationClosed atomic.Bool
+	// processorRunning is true only after a successful reset and fetcher launch.
+	// HandleEvent (publish) requires this flag so fail-closed Start does not
+	// accept traffic before the processor is up. Retry StartChecked may set it.
+	processorRunning atomic.Bool
+	// shuttingDown is set in Close; fetcher stops admitting and workers stop
+	// starting new HandleEvent work.
+	shuttingDown     atomic.Bool
 	codec            eh.EventCodec
 	maxRetries       int
 	maxGoroutines    int
+	queueDepth       int
 	retryBackoff     backoff.Config
 	deadLetterExport dl.Exporter
+	admission        *recordAdmission
+	dispatch         *dispatchRegistry
+	dispatchStats    DispatchStats
+	// handleSem bounds concurrent HandleEvent calls (FIFO fair across keys).
+	handleSem *fairSem
 
 	insertEventStmt      *sql.Stmt
 	selectEventsStmt     *sql.Stmt
@@ -109,6 +127,7 @@ type Outbox struct {
 	scheduleRetryStmt    *sql.Stmt
 	insertDeadLetterStmt *sql.Stmt
 	nextAvailableAtStmt  *sql.Stmt
+	resetTakenAtStmt     *sql.Stmt
 }
 
 type matcherHandler struct {
@@ -187,8 +206,12 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 		cancel:          cancel,
 		codec:           &ehcodec.EventCodec{},
 		maxRetries:      10, // Default to 10
-		maxGoroutines:   10, // Default to 10 concurrent HTTP handlers
+		maxGoroutines:   10, // Global concurrent HandleEvent permits
+		queueDepth:      defaultQueueDepth,
 		retryBackoff:    backoff.FixedConfig(10, PeriodicSweepAge),
+		// Default admission capacity matches the fetch batch upper bound:
+		// bounds concurrent record coordinators (not channel depth).
+		admission: newRecordAdmission(maxFetchBatch),
 	}
 
 	for _, option := range options {
@@ -196,6 +219,9 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 			return nil, fmt.Errorf("error while applying option: %w", err)
 		}
 	}
+
+	o.handleSem = newFairSem(max(o.maxGoroutines, 1))
+	o.dispatch = newDispatchRegistry(o, o.queueDepth, o.dispatchStats)
 
 	// Create the outbox table if it doesn't exist.
 	if _, err := o.db.Exec(fmt.Sprintf(`
@@ -246,13 +272,12 @@ func WithTableName(outbox string) Option {
 }
 
 func (o *Outbox) ensureSchema() error {
-	for _, stmt := range []string{
-		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN retry_count INTEGER DEFAULT 0;`, o.outboxTable),
-		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN available_at TIMESTAMP;`, o.outboxTable),
-	} {
-		if _, err := o.db.Exec(stmt); err != nil && !isDuplicateColumnError(err) {
-			return fmt.Errorf("could not migrate outbox table: %w", err)
-		}
+	// Migrate older outbox shapes via PRAGMA table_info (never error-text match).
+	if err := deadletter.AddColumnIfAbsent(o.db, o.outboxTable, "retry_count", "INTEGER DEFAULT 0"); err != nil {
+		return fmt.Errorf("could not migrate outbox retry_count: %w", err)
+	}
+	if err := deadletter.AddColumnIfAbsent(o.db, o.outboxTable, "available_at", "TIMESTAMP"); err != nil {
+		return fmt.Errorf("could not migrate outbox available_at: %w", err)
 	}
 
 	if _, err := o.db.Exec(fmt.Sprintf(`UPDATE %s SET available_at = created_at WHERE available_at IS NULL;`, o.outboxTable)); err != nil {
@@ -267,10 +292,6 @@ func (o *Outbox) ensureSchema() error {
 	}
 
 	return nil
-}
-
-func isDuplicateColumnError(err error) bool {
-	return strings.Contains(strings.ToLower(err.Error()), "duplicate column")
 }
 
 // WithMaxRetries sets the maximum number of error retries before an event is dropped.
@@ -294,16 +315,58 @@ func WithRetryBackoff(pattern string) Option {
 	}
 }
 
-// WithMaxGoroutines limits the number of concurrent handlers spawned during a single outbox sweep.
+// WithMaxGoroutines sets the global concurrent HandleEvent limit for the whole
+// processor (not per sweep). Fairness is per dispatch key: each key runs one
+// worker that holds at most one permit while inside HandleEvent.
 func WithMaxGoroutines(limit int) Option {
 	return func(o *Outbox) error {
+		if limit < 1 {
+			limit = 1
+		}
 		o.maxGoroutines = limit
 		return nil
 	}
 }
 
-// WithDeadLetterExporter registers a best-effort exporter called after a
-// dead_letters row is inserted. Export failures do not roll back the DB write.
+// WithQueueDepth sets the bounded depth of each long-lived per-dispatch-key
+// queue (enqueued + reserved). Values below 1 are rejected with
+// ErrInvalidQueueDepth (no silent clamping). Default is DefaultQueueDepth (32).
+func WithQueueDepth(depth int) Option {
+	return func(o *Outbox) error {
+		if depth < 1 {
+			return fmt.Errorf("%w: %d", ErrInvalidQueueDepth, depth)
+		}
+		o.queueDepth = depth
+		return nil
+	}
+}
+
+// WithDispatchStats registers a transport-neutral observer for per-key queue
+// depth and HandleEvent in-flight gauges. Nil is ignored. Callbacks run outside
+// queue locks and must not block delivery.
+func WithDispatchStats(collector DispatchStats) Option {
+	return func(o *Outbox) error {
+		o.dispatchStats = collector
+		return nil
+	}
+}
+
+// WithAdmissionLimit sets how many outbox records may be admitted (claimed and
+// in-flight) at once in this process. Admission is process-local and is not a
+// multi-process lock. Values below 1 are treated as 1. Default is maxFetchBatch.
+func WithAdmissionLimit(limit int) Option {
+	return func(o *Outbox) error {
+		if o.admission != nil {
+			o.admission.setLimit(limit)
+		} else {
+			o.admission = newRecordAdmission(limit)
+		}
+		return nil
+	}
+}
+
+// WithDeadLetterExporter registers a best-effort exporter called after the
+// atomic finalize transaction commits. Export failures do not roll back the DB write.
 func WithDeadLetterExporter(exporter dl.Exporter) Option {
 	return func(o *Outbox) error {
 		o.deadLetterExport = exporter
@@ -320,11 +383,15 @@ func (o *Outbox) prepareStatements() error {
 		return fmt.Errorf("could not prepare insert event statement: %w", err)
 	}
 
+	// available_at first so delayed/retry rows re-enter FIFO by eligibility time
+	// (retry loses its original position among first attempts).
+	// OFFSET pages within one claim TX so a full dispatch-key backlog larger than
+	// one page cannot hide later idle-key rows (bounded page size, not one big LIMIT).
 	if o.selectEventsStmt, err = o.db.Prepare(fmt.Sprintf(`
 		SELECT id, event_type, aggregate_id, created_at, available_at, taken_at, handlers, event_blob, retry_count
 		FROM %s
 		WHERE (taken_at IS NULL OR taken_at < ?) AND available_at <= ?
-		ORDER BY created_at ASC, id ASC LIMIT 50
+		ORDER BY available_at ASC, created_at ASC, id ASC LIMIT ? OFFSET ?
 	`, o.outboxTable)); err != nil {
 		return fmt.Errorf("could not prepare select events statement: %w", err)
 	}
@@ -346,9 +413,13 @@ func (o *Outbox) prepareStatements() error {
 		UPDATE %s SET retry_count = retry_count + 1, available_at = ?, taken_at = NULL WHERE id = ?`, o.outboxTable)); err != nil {
 		return fmt.Errorf("could not prepare schedule retry statement: %w", err)
 	}
+	// ON CONFLICT makes terminal DLQ inserts idempotent under the unique key
+	// (source, outbox_id, handler_type). NULL outbox_id rows (no-match) never
+	// conflict with each other in SQLite.
 	if o.insertDeadLetterStmt, err = o.db.Prepare(fmt.Sprintf(`
 		INSERT INTO %s (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(source, outbox_id, handler_type) DO NOTHING
 	`, o.deadLetterTable)); err != nil {
 		return fmt.Errorf("could not prepare insert dead letter statement: %w", err)
 	}
@@ -359,6 +430,11 @@ func (o *Outbox) prepareStatements() error {
 		ORDER BY available_at ASC, id ASC LIMIT 1
 	`, o.outboxTable)); err != nil {
 		return fmt.Errorf("could not prepare next available statement: %w", err)
+	}
+	if o.resetTakenAtStmt, err = o.db.Prepare(fmt.Sprintf(`
+		UPDATE %s SET taken_at = NULL WHERE taken_at IS NOT NULL
+	`, o.outboxTable)); err != nil {
+		return fmt.Errorf("could not prepare reset taken_at statement: %w", err)
 	}
 	return nil
 }
@@ -374,7 +450,8 @@ func (o *Outbox) AddHandler(ctx context.Context, m eh.EventMatcher, h eh.EventHa
 }
 
 // AddHandlerWithOptions registers an event handler with explicit dispatch
-// options. The default AddHandler path uses Serial dispatch.
+// options. The default AddHandler path uses Serial dispatch. Registration is
+// only allowed before Start; after Start this returns ErrOutboxAlreadyStarted.
 func (o *Outbox) AddHandlerWithOptions(_ context.Context, m eh.EventMatcher, h eh.EventHandler, options ...HandlerOption) error {
 	if m == nil {
 		return eh.ErrMissingMatcher
@@ -382,9 +459,18 @@ func (o *Outbox) AddHandlerWithOptions(_ context.Context, m eh.EventMatcher, h e
 	if h == nil {
 		return eh.ErrMissingHandler
 	}
+	if o.registrationClosed.Load() {
+		return ErrOutboxAlreadyStarted
+	}
 
 	o.handlersMu.Lock()
 	defer o.handlersMu.Unlock()
+
+	// Re-check under the handlers lock so a concurrent Start cannot race a late
+	// registration into an already running processor.
+	if o.registrationClosed.Load() {
+		return ErrOutboxAlreadyStarted
+	}
 
 	if _, ok := o.handlersByType[h.HandlerType()]; ok {
 		return eh.ErrHandlerAlreadyAdded
@@ -421,9 +507,11 @@ type outboxDoc struct {
 }
 
 // HandleEvent implements the HandleEvent method of the eventhorizon.EventHandler interface.
-// Start must be called before publishing.
+// Publishing requires a successful Start/StartChecked (processor running). A
+// fail-closed Start that closed registration but did not start the fetcher still
+// returns ErrOutboxNotStarted.
 func (o *Outbox) HandleEvent(ctx context.Context, event eh.Event) error {
-	if !o.started.Load() {
+	if !o.processorRunning.Load() {
 		return ErrOutboxNotStarted
 	}
 
@@ -634,20 +722,87 @@ func (o *Outbox) notifySchedule() {
 	}
 }
 
-// Start launches one unified processor. Calling Start more than once is safe.
+// Start implements eh.Outbox. It is a fail-closed wrapper around StartChecked:
+// startup errors are sent on Errors() and the fetcher is not started until a
+// later successful Start/StartChecked. Prefer StartChecked when the caller can
+// propagate the error (EhInfra boot path).
 func (o *Outbox) Start() {
-	if !o.started.CompareAndSwap(false, true) {
-		return
+	if err := o.StartChecked(); err != nil {
+		o.sendError(context.Background(), err, nil)
 	}
-	o.wg.Add(1) // Only one worker goroutine.
-	go o.runUnifiedProcessor()
 }
 
-// Close stops the outbox processor and closes prepared statements.
+// StartChecked closes handler registration, resets taken_at in one transaction,
+// then starts the fetcher only after a successful reset. On reset failure the
+// fetcher is not started and publish stays blocked (ErrOutboxNotStarted);
+// registration stays closed and a later StartChecked may retry the reset.
+// After a successful start, further calls are no-ops.
+// Scope is one process per DB file; multi-process locking is not provided.
+func (o *Outbox) StartChecked() error {
+	o.handlersMu.Lock()
+	// Close registration before reset so late AddHandler cannot race in.
+	o.registrationClosed.Store(true)
+	if o.processorRunning.Load() {
+		o.handlersMu.Unlock()
+		return nil
+	}
+	o.handlersMu.Unlock()
+
+	if err := o.resetTakenAtClaims(context.Background()); err != nil {
+		return fmt.Errorf("could not reset outbox taken_at on start: %w", err)
+	}
+
+	o.handlersMu.Lock()
+	if o.processorRunning.Load() {
+		o.handlersMu.Unlock()
+		return nil
+	}
+	o.processorRunning.Store(true)
+	o.handlersMu.Unlock()
+
+	o.wg.Add(1)
+	go o.runUnifiedProcessor()
+	return nil
+}
+
+// resetTakenAtClaims clears durable claims left by a previous process so the
+// new process can redispatch at-least-once after crash or stop-first restart.
+func (o *Outbox) resetTakenAtClaims(ctx context.Context) error {
+	tx, err := o.db.Begin()
+	if err != nil {
+		return fmt.Errorf("could not begin taken_at reset transaction: %w", err)
+	}
+	defer rollbackTx(tx)
+
+	stmt := tx.StmtContext(ctx, o.resetTakenAtStmt)
+	defer func() {
+		if err := stmt.Close(); err != nil {
+			log.Printf("eventhorizon: could not close SQLite outbox reset taken_at statement: %s", err)
+		}
+	}()
+	if _, err := stmt.ExecContext(ctx); err != nil {
+		return fmt.Errorf("could not reset outbox taken_at: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("could not commit taken_at reset: %w", err)
+	}
+	return nil
+}
+
+// Close stops accepting new work, lets in-flight HandleEvent calls finish and
+// finalize, abandons queued deliveries (not marked done; redelivered after
+// startup taken_at reset), then closes prepared statements.
 // The caller owns the shared *sql.DB and is responsible for closing it.
 func (o *Outbox) Close() error {
+	o.shuttingDown.Store(true)
 	o.cancel()
 	o.wg.Wait()
+	if o.dispatch != nil {
+		// Wake idle workers so they observe stop; in-flight HandleEvent must
+		// return on their own (handlers should not block forever in production).
+		o.dispatch.wakeAll()
+		o.dispatch.waitWorkers()
+	}
 
 	var closeErr error
 	for _, stmt := range []*sql.Stmt{
@@ -659,6 +814,7 @@ func (o *Outbox) Close() error {
 		o.scheduleRetryStmt,
 		o.insertDeadLetterStmt,
 		o.nextAvailableAtStmt,
+		o.resetTakenAtStmt,
 	} {
 		if stmt == nil {
 			continue
@@ -692,6 +848,10 @@ func (o *Outbox) runUnifiedProcessor() {
 	}
 	var timerCh <-chan time.Time
 	defer stopProcessorTimer(timer)
+
+	// Initial sweep immediately after startup reset so pending rows are claimed
+	// without waiting for watchCh, scheduleCh, or the periodic ticker.
+	o.processUntilEmpty(context.Background())
 	o.resetProcessorTimer(timer, &timerCh)
 
 	for {
@@ -704,7 +864,10 @@ func (o *Outbox) runUnifiedProcessor() {
 			return
 		}
 		stopProcessorTimer(timer)
-		o.processUntilEmpty(o.runContext())
+		// Non-canceled context for in-flight work so Close can wait for the
+		// current batch (including finalize) without aborting SQL mid-flight.
+		// The loop still exits on o.done between batches.
+		o.processUntilEmpty(context.Background())
 		o.resetProcessorTimer(timer, &timerCh)
 	}
 }
@@ -749,32 +912,30 @@ func (o *Outbox) nextAvailableAt(ctx context.Context) (time.Time, bool, error) {
 	return next.Time, true, nil
 }
 
-// Add this new method to the Outbox.
 func (o *Outbox) processUntilEmpty(ctx context.Context) {
-	// Before starting, quickly drain the channel of any other pending signals
-	// to prevent this loop from being triggered multiple times unnecessarily.
 	o.drainWatchChannel()
 
 	for {
-		// processBatch is the same transactional function as before,
-		// but we will modify it to return the number of events it processed.
-		processedCount, err := o.processBatch(ctx)
+		select {
+		case <-o.done:
+			return
+		default:
+		}
+		if o.shuttingDown.Load() {
+			return
+		}
+
+		// Fetch is decoupled from completion: do not wait for handlers here.
+		// Coordinators notify() when they free admission slots.
+		claimed, err := o.fetchAndDispatch(ctx, false)
 		if err != nil {
 			o.sendError(ctx, err, nil)
-			// On error, we stop processing this batch to avoid hammering a failing system.
-			// The ticker will try again later.
+			return
+		}
+		if claimed == 0 {
 			return
 		}
 
-		// If the last batch processed zero events, the outbox is now empty.
-		// We can exit our work loop and go back to sleep.
-		if processedCount == 0 {
-			return
-		}
-
-		// Optional: If we are in a tight loop processing many batches,
-		// it's good practice to yield to the Go scheduler briefly to
-		// prevent this single goroutine from starving others.
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -868,93 +1029,11 @@ type dispatchItem struct {
 	handler *matcherHandler
 }
 
-type dispatchQueue struct {
-	items []dispatchItem
-}
-
 type handlerDispatchResult struct {
 	eventID     uuid.UUID
 	handlerType string
 	err         error
 	fatal       bool
-}
-
-// processBatch - main procesing batch
-func (o *Outbox) processBatch(ctx context.Context) (int, error) {
-	eventsToProcess, eventContexts, err := o.fetchAndLockEvents(ctx)
-	if err != nil {
-		return 0, err
-	}
-	if len(eventsToProcess) == 0 {
-		return 0, nil
-	}
-
-	results := make(map[string]*processedResult, len(eventsToProcess))
-	for _, event := range eventsToProcess {
-		results[event.ID.String()] = &processedResult{
-			r:              event,
-			failedHandlers: map[string]handlerFailure{},
-		}
-	}
-
-	if err := o.dispatchEvents(ctx, eventsToProcess, eventContexts, results); err != nil {
-		return 0, err
-	}
-
-	resultsCh := make(chan processedResult, len(eventsToProcess))
-	for _, event := range eventsToProcess {
-		res := results[event.ID.String()]
-		resultsCh <- *res
-	}
-	close(resultsCh)
-
-	o.updateEventsDB(ctx, resultsCh)
-
-	return len(eventsToProcess), nil
-}
-
-func (o *Outbox) dispatchEvents(ctx context.Context, eventsToProcess []*outboxDoc, eventContexts map[string]map[string]any, results map[string]*processedResult) error {
-	queues, itemCount := o.buildDispatchQueues(eventsToProcess)
-	if itemCount == 0 {
-		return nil
-	}
-
-	handlerResultsCh := make(chan handlerDispatchResult, itemCount)
-	waitErrCh := make(chan error, 1)
-	g, _ := errgroup.WithContext(ctx)
-	g.SetLimit(max(o.maxGoroutines, 1))
-
-	for _, queue := range queues {
-		g.Go(func() error {
-			for _, item := range queue.items {
-				eventCtx := eh.UnmarshalContext(ctx, eventContexts[item.event.ID.String()])
-				handlerResultsCh <- o.dispatchHandler(eventCtx, item)
-			}
-			return nil
-		})
-	}
-
-	go func() {
-		waitErrCh <- g.Wait()
-		close(handlerResultsCh)
-	}()
-
-	o.collectHandlerResults(handlerResultsCh, results)
-	return <-waitErrCh
-}
-
-func (o *Outbox) collectHandlerResults(handlerResultsCh <-chan handlerDispatchResult, results map[string]*processedResult) {
-	for handlerResult := range handlerResultsCh {
-		res := results[handlerResult.eventID.String()]
-		if res == nil {
-			continue
-		}
-		if handlerResult.err != nil {
-			recordHandlerFailure(res, handlerResult)
-			continue
-		}
-		res.successfulHandlers = append(res.successfulHandlers, handlerResult.handlerType)
-	}
 }
 
 func recordHandlerFailure(res *processedResult, handlerResult handlerDispatchResult) {
@@ -967,34 +1046,62 @@ func recordHandlerFailure(res *processedResult, handlerResult handlerDispatchRes
 	}
 }
 
-func (o *Outbox) buildDispatchQueues(eventsToProcess []*outboxDoc) ([]*dispatchQueue, int) {
-	handlersByType := o.snapshotHandlersByType()
-	queuesByKey := make(map[string]*dispatchQueue)
-	queues := make([]*dispatchQueue, 0)
-	itemCount := 0
+// processBatch claims and dispatches a wave of records, then waits for those
+// records' coordinators to finalize. Used by unit tests for synchronous
+// progress. The live processor uses fetchAndDispatch without waiting.
+func (o *Outbox) processBatch(ctx context.Context) (int, error) {
+	return o.fetchAndDispatch(ctx, true)
+}
 
-	for _, event := range eventsToProcess {
-		for _, handlerType := range event.Handlers {
-			handler := handlersByType[handlerType]
-			if handler == nil || !handler.Match(event.Event) {
-				continue
-			}
-			key := dispatchQueueKey(handler, event.Event)
-			queue := queuesByKey[key]
-			if queue == nil {
-				queue = &dispatchQueue{}
-				queues = append(queues, queue)
-				queuesByKey[key] = queue
-			}
-			queue.items = append(queue.items, dispatchItem{
-				event:   event,
-				handler: handler,
-			})
-			itemCount++
-		}
+// fetchAndDispatch admits records only when every delivery queue for the record
+// can reserve a slot, claims taken_at, then enqueues non-blocking. Partial
+// admission is per record in the fetch wave, never a partial handler set.
+// If wait is true, blocks until claimed records finalize (test helper path).
+func (o *Outbox) fetchAndDispatch(ctx context.Context, wait bool) (int, error) {
+	if o.shuttingDown.Load() {
+		return 0, nil
 	}
 
-	return queues, itemCount
+	planned, err := o.planAndClaim(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(planned) == 0 {
+		return 0, nil
+	}
+
+	coords := make([]*recordCoordinator, 0, len(planned))
+	for _, p := range planned {
+		// planAndClaim only admits records with at least one delivery (including
+		// rematch of empty-handlers rows). Never claim-and-delete unmatched work.
+		if len(p.deliveries) == 0 {
+			o.admission.release(p.record.ID.String())
+			continue
+		}
+		coord := newRecordCoordinator(o, p.record, p.eventCtx, len(p.deliveries))
+		for _, d := range p.deliveries {
+			d.coord = coord
+			o.dispatch.enqueue(d)
+		}
+		coords = append(coords, coord)
+	}
+
+	if wait {
+		for _, c := range coords {
+			c.wait()
+		}
+	}
+	return len(planned), nil
+}
+
+type plannedRecord struct {
+	record     *outboxDoc
+	eventCtx   map[string]any
+	deliveries []*delivery
+	keys       []string
+	// persistHandlers is set for rematch claims so the matched handler list is
+	// written in the claim transaction before dispatch/finalize.
+	persistHandlers bool
 }
 
 func (o *Outbox) snapshotHandlersByType() map[string]*matcherHandler {
@@ -1008,22 +1115,28 @@ func (o *Outbox) snapshotHandlersByType() map[string]*matcherHandler {
 	return handlers
 }
 
-func dispatchQueueKey(handler *matcherHandler, event eh.Event) string {
-	handlerType := handler.HandlerType().String()
+// dispatchQueueIdentity returns the internal queue key plus stable stats labels.
+// shardLabel is "none" for Serial; for partitions it is the numeric shard index
+// (never a correlation/aggregate id).
+func dispatchQueueIdentity(handler *matcherHandler, event eh.Event) (queueKey, handlerLabel, shardLabel string) {
+	handlerLabel = handler.HandlerType().String()
 	if handler.dispatchMode != PartitionByAggregate {
-		return handlerType
+		return handlerLabel, handlerLabel, serialShardLabel
 	}
 
-	key := eventPartitionKey(event)
-	if key == "" {
-		return handlerType
+	partKey := eventPartitionKey(event)
+	if partKey == "" {
+		return handlerLabel, handlerLabel, serialShardLabel
 	}
 
 	shards := handler.partitionShards
 	if shards < 1 {
 		shards = defaultPartitionShards
 	}
-	return fmt.Sprintf("%s:%d", handlerType, hashPartition(key, shards))
+	shard := hashPartition(partKey, shards)
+	shardLabel = fmt.Sprintf("%d", shard)
+	queueKey = fmt.Sprintf("%s:%s", handlerLabel, shardLabel)
+	return queueKey, handlerLabel, shardLabel
 }
 
 func eventPartitionKey(event eh.Event) string {
@@ -1080,64 +1193,176 @@ func (o *Outbox) dispatchHandler(ctx context.Context, item dispatchItem) handler
 	}
 }
 
-func (o *Outbox) fetchAndLockEvents(ctx context.Context) ([]*outboxDoc, map[string]map[string]any, error) {
+// planAndClaim pages due rows (ORDER BY available_at, created_at, id) with a
+// bounded OFFSET/LIMIT within one claim transaction until admission is full or
+// due candidates are exhausted. A full dispatch-key backlog larger than one page
+// cannot hide later idle-key rows. Never claims a record that cannot fully
+// reserve its delivery queues, and never claims a record whose stored handlers
+// cannot all be resolved.
+func (o *Outbox) planAndClaim(ctx context.Context) ([]plannedRecord, error) {
+	free := o.admission.freeSlots()
+	if free == 0 {
+		return nil, nil
+	}
+	admitCap := free
+	if admitCap > maxFetchBatch {
+		admitCap = maxFetchBatch
+	}
+	pageSize := maxFetchBatch
+	if pageSize < 1 {
+		pageSize = 1
+	}
+
 	tx, err := o.db.Begin()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer rollbackTx(tx)
 
 	now := time.Now()
-	eventsToProcess, eventContexts, err := o.selectEventsForProcessing(ctx, tx, now)
-	if err != nil {
-		return nil, nil, err
+	planned := make([]plannedRecord, 0, admitCap)
+	offset := 0
+
+	for len(planned) < admitCap {
+		candidates, eventContexts, err := o.selectEventsForProcessing(ctx, tx, now, pageSize, offset)
+		if err != nil {
+			return nil, err
+		}
+		if len(candidates) == 0 {
+			break
+		}
+		offset += len(candidates)
+
+		for _, r := range candidates {
+			if len(planned) >= admitCap {
+				break
+			}
+			id := r.ID.String()
+			if o.admission.contains(id) {
+				continue
+			}
+			var (
+				keys       []string
+				deliveries []*delivery
+				missing    []string
+			)
+			persistHandlers := false
+			if len(r.Handlers) == 0 {
+				// Rematch contract: empty handlers means re-match against the
+				// current registration at claim time (replay of no_match DLQ).
+				keys, deliveries = o.planRematchDeliveries(r, eventContexts[id])
+				if len(deliveries) == 0 {
+					o.sendError(ctx, fmt.Errorf(
+						"outbox record %s rematch found no handlers (leaving unclaimed)",
+						id,
+					), r.Event)
+					continue
+				}
+				// Invariant: finalize remainingHandlers(r.Handlers, …) and
+				// per-handler retry/DLQ require the matched set on the record.
+				// Leaving Handlers=[] would treat any outcome as fully done and
+				// silently delete the row (including retryable failures).
+				matched := make([]string, 0, len(deliveries))
+				for _, d := range deliveries {
+					matched = append(matched, d.handler.HandlerType().String())
+				}
+				r.Handlers = matched
+				persistHandlers = true
+			} else {
+				keys, deliveries, missing = o.planDeliveries(r, eventContexts[id])
+				if len(missing) > 0 {
+					// No silent loss: leave unclaimed for operator/restart visibility.
+					o.sendError(ctx, fmt.Errorf(
+						"outbox record %s has unresolvable handlers %v (leaving unclaimed)",
+						id, missing,
+					), r.Event)
+					continue
+				}
+			}
+			// Atomic whole-record reservation: all delivery queues + coordinator.
+			if !o.dispatch.tryReserveKeys(keys, deliveries) {
+				continue
+			}
+			if !o.admission.tryAdmit(id) {
+				o.dispatch.releaseKeys(keys)
+				continue
+			}
+			planned = append(planned, plannedRecord{
+				record:          r,
+				eventCtx:        eventContexts[id],
+				deliveries:      deliveries,
+				keys:            keys,
+				persistHandlers: persistHandlers,
+			})
+		}
+
+		if len(candidates) < pageSize {
+			break // exhausted due set
+		}
 	}
 
-	if len(eventsToProcess) == 0 {
+	if len(planned) == 0 {
 		if err := tx.Commit(); err != nil {
-			return nil, nil, fmt.Errorf("could not commit empty event lock transaction: %w", err)
+			return nil, fmt.Errorf("could not commit empty admission transaction: %w", err)
 		}
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	updateStmt := tx.StmtContext(ctx, o.updateTakenAtStmt)
-	defer func() {
-		if err := updateStmt.Close(); err != nil {
-			log.Printf("eventhorizon: could not close SQLite outbox update statement: %s", err)
-		}
-	}()
+	defer func() { _ = updateStmt.Close() }()
+	handlersStmt := tx.StmtContext(ctx, o.updateHandlersStmt)
+	defer func() { _ = handlersStmt.Close() }()
 
-	for _, r := range eventsToProcess {
-		if _, err := updateStmt.ExecContext(ctx, now, r.ID.String()); err != nil {
-			return nil, nil, err
+	for _, p := range planned {
+		// Persist rematched handler list in the same claim TX as taken_at so a
+		// crash after claim still has correct remaining semantics on restart.
+		if p.persistHandlers {
+			handlersBlob, err := jsoniter.Marshal(p.record.Handlers)
+			if err != nil {
+				o.rollbackPlanned(planned)
+				return nil, fmt.Errorf("could not marshal rematched handlers: %w", err)
+			}
+			if _, err := handlersStmt.ExecContext(ctx, string(handlersBlob), p.record.ID.String()); err != nil {
+				o.rollbackPlanned(planned)
+				return nil, fmt.Errorf("could not persist rematched handlers: %w", err)
+			}
+		}
+		if _, err := updateStmt.ExecContext(ctx, now, p.record.ID.String()); err != nil {
+			o.rollbackPlanned(planned)
+			return nil, err
 		}
 	}
 
-	// End the transaction that locks the rows.
 	if err := tx.Commit(); err != nil {
-		return nil, nil, fmt.Errorf("could not commit transaction locking events: %w", err)
+		o.rollbackPlanned(planned)
+		return nil, fmt.Errorf("could not commit transaction locking events: %w", err)
 	}
 
-	return eventsToProcess, eventContexts, nil
+	return planned, nil
 }
 
-func (o *Outbox) selectEventsForProcessing(ctx context.Context, tx *sql.Tx, now time.Time) ([]*outboxDoc, map[string]map[string]any, error) {
-	selectStmt := tx.StmtContext(ctx, o.selectEventsStmt)
-	defer func() {
-		if err := selectStmt.Close(); err != nil {
-			log.Printf("eventhorizon: could not close SQLite outbox select statement: %s", err)
-		}
-	}()
+func (o *Outbox) rollbackPlanned(planned []plannedRecord) {
+	for _, p := range planned {
+		o.dispatch.releaseKeys(p.keys)
+		o.admission.release(p.record.ID.String())
+	}
+}
 
-	rows, err := selectStmt.QueryContext(ctx, now.Add(-PeriodicSweepAge), now)
+func (o *Outbox) selectEventsForProcessing(ctx context.Context, tx *sql.Tx, now time.Time, limit, offset int) ([]*outboxDoc, map[string]map[string]any, error) {
+	if limit < 1 {
+		limit = 1
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	stmt := tx.StmtContext(ctx, o.selectEventsStmt)
+	defer func() { _ = stmt.Close() }()
+
+	rows, err := stmt.QueryContext(ctx, now.Add(-PeriodicSweepAge), now, limit, offset)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer func() {
-		if err := rows.Close(); err != nil {
-			log.Printf("eventhorizon: could not close SQLite outbox rows: %s", err)
-		}
-	}()
+	defer func() { _ = rows.Close() }()
 
 	eventsToProcess := make([]*outboxDoc, 0)
 	eventContexts := make(map[string]map[string]any)
@@ -1155,25 +1380,30 @@ func (o *Outbox) selectEventsForProcessing(ctx context.Context, tx *sql.Tx, now 
 	return eventsToProcess, eventContexts, nil
 }
 
-func (o *Outbox) updateEventsDB(ctx context.Context, resultsCh <-chan processedResult) {
-	for res := range resultsCh {
-		o.updateEventDB(ctx, res)
-	}
-}
-
 func (o *Outbox) updateEventDB(ctx context.Context, res processedResult) {
 	r := res.r
+	// Admission is released by the record coordinator after finalize (or abandon).
+
 	successful := stringSet(res.successfulHandlers)
 	terminalFailures, retryableFailures := o.classifyFailures(r, res.failedHandlers)
-	intendedRemainingHandlers := remainingHandlers(r.Handlers, successful, stringSetFromMap(terminalFailures))
-	terminalRemoved := o.moveTerminalFailures(ctx, r, terminalFailures, intendedRemainingHandlers)
-	remaining := remainingHandlers(r.Handlers, successful, terminalRemoved)
+	// Terminal handlers are always removed on successful finalize; partial DLQ
+	// success is no longer possible because inserts share the same transaction.
+	remaining := remainingHandlers(r.Handlers, successful, stringSetFromMap(terminalFailures))
+	intendedRemainingForDLQ := remaining
 
-	if len(remaining) == 0 {
-		o.deleteProcessedEvent(ctx, r)
+	pending, err := o.finalizeEvent(ctx, r, terminalFailures, intendedRemainingForDLQ, remaining, len(retryableFailures) > 0)
+	if err != nil {
+		o.sendError(ctx, err, r.Event)
 		return
 	}
-	o.updateRemainingEventHandlers(ctx, r, remaining, retryableFailures)
+	if len(terminalFailures) > 0 {
+		o.sendError(ctx, errEventHandlerMovedToDeadLetters, r.Event)
+	}
+	o.exportDeadLetters(ctx, r.Event, pending)
+	if len(retryableFailures) > 0 {
+		// Wake the delayed-dispatch timer after a committed retry schedule.
+		o.notifySchedule()
+	}
 }
 
 func (o *Outbox) classifyFailures(r *outboxDoc, failures map[string]handlerFailure) (map[string]handlerFailure, map[string]handlerFailure) {
@@ -1189,51 +1419,142 @@ func (o *Outbox) classifyFailures(r *outboxDoc, failures map[string]handlerFailu
 	return terminalFailures, retryableFailures
 }
 
-func (o *Outbox) moveTerminalFailures(ctx context.Context, r *outboxDoc, terminalFailures map[string]handlerFailure, intendedRemainingHandlers []string) map[string]bool {
-	terminalRemoved := make(map[string]bool, len(terminalFailures))
-	if len(terminalFailures) == 0 {
-		return terminalRemoved
-	}
-
-	o.sendError(ctx, errEventHandlerMovedToDeadLetters, r.Event)
-	for handlerType, failure := range terminalFailures {
-		if err := o.insertOutboxDeadLetter(ctx, r, handlerType, intendedRemainingHandlers, failure.err); err != nil {
-			o.sendError(ctx, err, r.Event)
-			continue
-		}
-		terminalRemoved[handlerType] = true
-	}
-	return terminalRemoved
-}
-
-func (o *Outbox) deleteProcessedEvent(ctx context.Context, r *outboxDoc) {
-	if _, err := o.deleteEventStmt.ExecContext(ctx, r.ID.String()); err != nil {
-		o.sendError(ctx, fmt.Errorf("could not delete fully processed event: %w", err), r.Event)
-	}
-}
-
-func (o *Outbox) updateRemainingEventHandlers(ctx context.Context, r *outboxDoc, remainingHandlers []string, retryableFailures map[string]handlerFailure) {
-	if len(retryableFailures) > 0 {
-		o.scheduleRetry(ctx, r)
-	}
-
-	newHandlersBlob, err := jsoniter.Marshal(remainingHandlers)
+// finalizeEvent commits DLQ rows, handler list updates (or delete), and retry
+// fields in a single transaction. File export is intentionally deferred to the
+// caller so it only runs after a successful commit.
+func (o *Outbox) finalizeEvent(
+	ctx context.Context,
+	r *outboxDoc,
+	terminalFailures map[string]handlerFailure,
+	intendedRemainingHandlers []string,
+	remaining []string,
+	scheduleRetry bool,
+) ([]dl.Record, error) {
+	tx, err := o.db.Begin()
 	if err != nil {
-		o.sendError(ctx, fmt.Errorf("could not marshal remaining handlers: %w", err), r.Event)
+		return nil, fmt.Errorf("could not begin finalize transaction: %w", err)
+	}
+	defer rollbackTx(tx)
+
+	pending := make([]dl.Record, 0, len(terminalFailures))
+	for handlerType, failure := range terminalFailures {
+		record, err := o.insertOutboxDeadLetterTx(ctx, tx, r, handlerType, intendedRemainingHandlers, failure.err)
+		if err != nil {
+			return nil, err
+		}
+		pending = append(pending, record)
+	}
+
+	if len(remaining) == 0 {
+		deleteStmt := tx.StmtContext(ctx, o.deleteEventStmt)
+		defer func() {
+			if err := deleteStmt.Close(); err != nil {
+				log.Printf("eventhorizon: could not close SQLite outbox delete statement: %s", err)
+			}
+		}()
+		if _, err := deleteStmt.ExecContext(ctx, r.ID.String()); err != nil {
+			return nil, fmt.Errorf("could not delete fully processed event: %w", err)
+		}
+	} else {
+		newHandlersBlob, err := jsoniter.Marshal(remaining)
+		if err != nil {
+			return nil, fmt.Errorf("could not marshal remaining handlers: %w", err)
+		}
+		updateStmt := tx.StmtContext(ctx, o.updateHandlersStmt)
+		defer func() {
+			if err := updateStmt.Close(); err != nil {
+				log.Printf("eventhorizon: could not close SQLite outbox update handlers statement: %s", err)
+			}
+		}()
+		if _, err := updateStmt.ExecContext(ctx, string(newHandlersBlob), r.ID.String()); err != nil {
+			return nil, fmt.Errorf("could not update remaining handlers: %w", err)
+		}
+		if scheduleRetry {
+			nextRetryCount := r.RetryCount + 1
+			availableAt := time.Now().Add(o.retryBackoff.DelayFunc(int64(nextRetryCount)))
+			retryStmt := tx.StmtContext(ctx, o.scheduleRetryStmt)
+			defer func() {
+				if err := retryStmt.Close(); err != nil {
+					log.Printf("eventhorizon: could not close SQLite outbox schedule retry statement: %s", err)
+				}
+			}()
+			if _, err := retryStmt.ExecContext(ctx, availableAt, r.ID.String()); err != nil {
+				return nil, fmt.Errorf("could not schedule event retry: %w", err)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("could not commit finalize transaction: %w", err)
+	}
+	return pending, nil
+}
+
+func (o *Outbox) exportDeadLetters(ctx context.Context, event eh.Event, pending []dl.Record) {
+	if o.deadLetterExport == nil || len(pending) == 0 {
 		return
 	}
-	if _, err := o.updateHandlersStmt.ExecContext(ctx, string(newHandlersBlob), r.ID.String()); err != nil {
-		o.sendError(ctx, fmt.Errorf("could not update remaining handlers: %w", err), r.Event)
+	for _, key := range pending {
+		// After ON CONFLICT the durable row may predate this attempt. Always
+		// export the exact DB record, never the in-memory insert candidate.
+		resolved, ok, err := o.loadDeadLetter(ctx, key.Source, key.OutboxID, key.HandlerType)
+		if err != nil {
+			o.sendError(ctx, fmt.Errorf("could not resolve outbox dead letter for export: %w", err), event)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if resolved.ExportedAt != nil {
+			continue
+		}
+		if err := o.deadLetterExport.ExportDeadLetter(ctx, resolved); err != nil {
+			o.sendError(ctx, fmt.Errorf("could not export outbox dead letter: %w", err), event)
+			continue
+		}
+		if err := o.markDeadLetterExported(ctx, resolved.ID, time.Now()); err != nil {
+			o.sendError(ctx, fmt.Errorf("could not mark outbox dead letter exported: %w", err), event)
+		}
 	}
 }
 
-func (o *Outbox) scheduleRetry(ctx context.Context, r *outboxDoc) {
-	nextRetryCount := r.RetryCount + 1
-	availableAt := time.Now().Add(o.retryBackoff.DelayFunc(int64(nextRetryCount)))
-	if _, err := o.scheduleRetryStmt.ExecContext(ctx, availableAt, r.ID.String()); err != nil {
-		o.sendError(ctx, fmt.Errorf("could not schedule event retry: %w", err), r.Event)
+// loadDeadLetter loads the durable dead_letters row for the unique key
+// (source, outbox_id, handler_type). Export must use this row so body/error/
+// timestamps match what is stored after an idempotent ON CONFLICT insert.
+func (o *Outbox) loadDeadLetter(ctx context.Context, source, outboxID, handlerType string) (dl.Record, bool, error) {
+	var record dl.Record
+	var exportedAt sql.NullTime
+	err := o.db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT id, source, event_type, aggregate_id, handler_type, outbox_id,
+		       remaining_handlers, blob, error, retry_count, created_at, dead_at, exported_at
+		FROM %s
+		WHERE source = ? AND outbox_id = ? AND handler_type = ?
+	`, o.deadLetterTable), source, outboxID, handlerType).Scan(
+		&record.ID,
+		&record.Source,
+		&record.EventType,
+		&record.AggregateID,
+		&record.HandlerType,
+		&record.OutboxID,
+		&record.RemainingHandlers,
+		&record.Blob,
+		&record.Error,
+		&record.RetryCount,
+		&record.CreatedAt,
+		&record.DeadAt,
+		&exportedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return dl.Record{}, false, nil
 	}
-	o.notifySchedule()
+	if err != nil {
+		return dl.Record{}, false, err
+	}
+	if exportedAt.Valid {
+		t := exportedAt.Time
+		record.ExportedAt = &t
+	}
+	return record, true, nil
 }
 
 func stringSet(values []string) map[string]bool {
@@ -1263,14 +1584,14 @@ func remainingHandlers(requiredHandlers []string, successful, removed map[string
 	return remaining
 }
 
-func (o *Outbox) insertOutboxDeadLetter(ctx context.Context, r *outboxDoc, handlerType string, remainingHandlers []string, reason string) error {
+func (o *Outbox) insertOutboxDeadLetterTx(ctx context.Context, tx *sql.Tx, r *outboxDoc, handlerType string, remainingHandlers []string, reason string) (dl.Record, error) {
 	eventBlob, err := o.codec.MarshalEvent(ctx, r.Event)
 	if err != nil {
-		return fmt.Errorf("could not marshal dead letter event: %w", err)
+		return dl.Record{}, fmt.Errorf("could not marshal dead letter event: %w", err)
 	}
 	remainingHandlersBlob, err := jsoniter.Marshal(remainingHandlers)
 	if err != nil {
-		return fmt.Errorf("could not marshal dead letter handlers: %w", err)
+		return dl.Record{}, fmt.Errorf("could not marshal dead letter handlers: %w", err)
 	}
 	if reason == "" {
 		reason = "max retries reached or fatal handler error"
@@ -1290,7 +1611,13 @@ func (o *Outbox) insertOutboxDeadLetter(ctx context.Context, r *outboxDoc, handl
 		CreatedAt:         r.CreatedAt,
 		DeadAt:            now,
 	}
-	if _, err := o.insertDeadLetterStmt.ExecContext(ctx,
+	insertStmt := tx.StmtContext(ctx, o.insertDeadLetterStmt)
+	defer func() {
+		if err := insertStmt.Close(); err != nil {
+			log.Printf("eventhorizon: could not close SQLite outbox dead letter statement: %s", err)
+		}
+	}()
+	if _, err := insertStmt.ExecContext(ctx,
 		record.ID,
 		record.Source,
 		record.EventType,
@@ -1304,16 +1631,9 @@ func (o *Outbox) insertOutboxDeadLetter(ctx context.Context, r *outboxDoc, handl
 		record.CreatedAt,
 		record.DeadAt,
 	); err != nil {
-		return fmt.Errorf("could not insert outbox dead letter: %w", err)
+		return dl.Record{}, fmt.Errorf("could not insert outbox dead letter: %w", err)
 	}
-	if o.deadLetterExport != nil {
-		if err := o.deadLetterExport.ExportDeadLetter(ctx, record); err != nil {
-			o.sendError(ctx, fmt.Errorf("could not export outbox dead letter: %w", err), r.Event)
-		} else if err := o.markDeadLetterExported(ctx, record.ID, time.Now()); err != nil {
-			o.sendError(ctx, fmt.Errorf("could not mark outbox dead letter exported: %w", err), r.Event)
-		}
-	}
-	return nil
+	return record, nil
 }
 
 func (o *Outbox) markDeadLetterExported(ctx context.Context, id string, exportedAt time.Time) error {
