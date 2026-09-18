@@ -9,6 +9,7 @@ import (
 
 	"github.com/vercly/eh-sqlite/internal/deadletter"
 	outboxsqlite "github.com/vercly/eh-sqlite/outbox/sqlite"
+	"github.com/vercly/eh-sqlite/schema"
 )
 
 const (
@@ -24,6 +25,7 @@ type Result struct {
 	AsyncCompletedDeleted       int64
 	AsyncFailedPermanentDeleted int64
 	DeadLettersDeleted          int64
+	OrphanPublicationsDeleted   int64
 }
 
 // CleanupRun is emitted by StartCleanup after each cleanup pass.
@@ -120,7 +122,7 @@ func Cleanup(ctx context.Context, db *sql.DB, opts ...Option) (Result, error) {
 		deleted, err := deleteRows(ctx, db, `
 			DELETE FROM async_tasks
 			WHERE status = 'completed' AND updated_at < ?
-		`, now.Add(-cfg.asyncCompletedRetention))
+		`, schema.UTC(now.Add(-cfg.asyncCompletedRetention)))
 		if err != nil {
 			return result, fmt.Errorf("cleanup completed async_tasks: %w", err)
 		}
@@ -129,7 +131,7 @@ func Cleanup(ctx context.Context, db *sql.DB, opts ...Option) (Result, error) {
 		deleted, err = deleteRows(ctx, db, `
 			DELETE FROM async_tasks
 			WHERE status = 'failed_permanent' AND updated_at < ?
-		`, now.Add(-cfg.failedRetention))
+		`, schema.UTC(now.Add(-cfg.failedRetention)))
 		if err != nil {
 			return result, fmt.Errorf("cleanup failed async_tasks: %w", err)
 		}
@@ -142,11 +144,36 @@ func Cleanup(ctx context.Context, db *sql.DB, opts ...Option) (Result, error) {
 	deleted, err := deleteRows(ctx, db, `
 		DELETE FROM dead_letters
 		WHERE exported_at IS NOT NULL AND exported_at < ?
-	`, now.Add(-cfg.deadLetterRetention))
+	`, schema.UTC(now.Add(-cfg.deadLetterRetention)))
 	if err != nil {
 		return result, fmt.Errorf("cleanup dead_letters: %w", err)
 	}
 	result.DeadLettersDeleted = deleted
+
+	publicationsExist, err := tableExists(ctx, db, "outbox_publications")
+	if err != nil {
+		return result, err
+	}
+	deliveriesExist, err := tableExists(ctx, db, "outbox_deliveries")
+	if err != nil {
+		return result, err
+	}
+	if publicationsExist != deliveriesExist {
+		return result, fmt.Errorf("cleanup outbox v2: publications and deliveries tables must both exist")
+	}
+	if publicationsExist {
+		deleted, err = deleteRows(ctx, db, `
+			DELETE FROM outbox_publications
+			WHERE NOT EXISTS (
+				SELECT 1 FROM outbox_deliveries
+				WHERE outbox_deliveries.publication_id = outbox_publications.publication_id
+			)
+		`)
+		if err != nil {
+			return result, fmt.Errorf("cleanup orphan outbox publications: %w", err)
+		}
+		result.OrphanPublicationsDeleted = deleted
+	}
 
 	return result, nil
 }
@@ -197,13 +224,19 @@ type Snapshot struct {
 
 // OutboxSnapshot contains queue depth and delay information.
 type OutboxSnapshot struct {
-	PendingRows        int64
-	AvailableRows      int64
-	RetryRows          int64
-	RetryCountTotal    int64
-	OldestPendingAge   time.Duration
-	OldestAvailableAge time.Duration
-	DueLag             time.Duration
+	PendingRows           int64
+	AvailableRows         int64
+	RetryRows             int64
+	RetryCountTotal       int64
+	OldestPendingAge      time.Duration
+	OldestAvailableAge    time.Duration
+	DueLag                time.Duration
+	DeliveryRows          int64
+	DeliveryAvailableRows int64
+	DeliveryInFlightRows  int64
+	DeliveryUnresolved    int64
+	DeliveryRematch       int64
+	AdmissionWaitAge      time.Duration
 }
 
 // DeadLetterSnapshot contains dead-letter counts.
@@ -226,9 +259,41 @@ func Stats(ctx context.Context, db *sql.DB, opts ...Option) (Snapshot, error) {
 		},
 	}
 
-	if exists, err := tableExists(ctx, db, "outbox"); err != nil {
+	publicationsExist, err := tableExists(ctx, db, "outbox_publications")
+	if err != nil {
 		return snapshot, err
-	} else if exists {
+	}
+	deliveriesExist, err := tableExists(ctx, db, "outbox_deliveries")
+	if err != nil {
+		return snapshot, err
+	}
+	if publicationsExist != deliveriesExist {
+		return snapshot, fmt.Errorf("outbox v2 publications and deliveries tables must both exist")
+	}
+	v1Exists, err := tableExists(ctx, db, "outbox")
+	if err != nil {
+		return snapshot, err
+	}
+	v2Applied, err := schema.IsApplied(ctx, db, "outbox", "v2_deliveries")
+	if err != nil {
+		return snapshot, err
+	}
+	// NewOutbox creates empty v2 tables before StartChecked performs the
+	// migration. Keep reporting the durable v1 backlog until the transactional
+	// migration marker proves that v2 owns the data.
+	if v1Exists && !v2Applied {
+		outbox, err := outboxStats(ctx, db, now)
+		if err != nil {
+			return snapshot, err
+		}
+		snapshot.Outbox = outbox
+	} else if publicationsExist {
+		outbox, err := outboxV2Stats(ctx, db, now)
+		if err != nil {
+			return snapshot, err
+		}
+		snapshot.Outbox = outbox
+	} else if v1Exists {
 		outbox, err := outboxStats(ctx, db, now)
 		if err != nil {
 			return snapshot, err
@@ -256,6 +321,71 @@ func Stats(ctx context.Context, db *sql.DB, opts ...Option) (Snapshot, error) {
 		snapshot.DeadLetters = deadLetters
 	}
 
+	return snapshot, nil
+}
+
+func outboxV2Stats(ctx context.Context, db *sql.DB, now time.Time) (OutboxSnapshot, error) {
+	var snapshot OutboxSnapshot
+	utcNow := schema.UTC(now)
+	err := db.QueryRowContext(ctx, `
+		SELECT
+			COUNT(DISTINCT p.publication_id),
+			COUNT(DISTINCT CASE WHEN d.taken_at IS NULL AND d.available_at <= ? THEN p.publication_id END),
+			COUNT(DISTINCT CASE WHEN d.retry_count > 0 THEN p.publication_id END),
+			COALESCE(SUM(d.retry_count), 0),
+			COUNT(d.id),
+			COALESCE(SUM(CASE WHEN d.taken_at IS NULL AND d.unresolved_at IS NULL AND d.dispatch_key IS NOT NULL AND d.available_at <= ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN d.taken_at IS NOT NULL THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN d.unresolved_at IS NOT NULL THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN d.handler_type IS NULL THEN 1 ELSE 0 END), 0)
+		FROM outbox_publications p
+		JOIN outbox_deliveries d ON d.publication_id = p.publication_id
+	`, utcNow, utcNow).Scan(
+		&snapshot.PendingRows,
+		&snapshot.AvailableRows,
+		&snapshot.RetryRows,
+		&snapshot.RetryCountTotal,
+		&snapshot.DeliveryRows,
+		&snapshot.DeliveryAvailableRows,
+		&snapshot.DeliveryInFlightRows,
+		&snapshot.DeliveryUnresolved,
+		&snapshot.DeliveryRematch,
+	)
+	if err != nil {
+		return snapshot, fmt.Errorf("query outbox v2 counts: %w", err)
+	}
+
+	oldestPending, err := queryMinTime(ctx, db, `SELECT MIN(created_at) FROM outbox_publications`)
+	if err != nil {
+		return snapshot, fmt.Errorf("query oldest pending outbox publication: %w", err)
+	}
+	oldestAvailable, err := queryMinTime(ctx, db, `
+		SELECT MIN(p.created_at)
+		FROM outbox_publications p
+		JOIN outbox_deliveries d ON d.publication_id = p.publication_id
+		WHERE d.taken_at IS NULL AND d.available_at <= ?
+	`, utcNow)
+	if err != nil {
+		return snapshot, fmt.Errorf("query oldest available outbox publication: %w", err)
+	}
+	oldestDue, err := queryMinTime(ctx, db, `
+		SELECT MIN(available_at) FROM outbox_deliveries
+		WHERE taken_at IS NULL AND available_at <= ?
+	`, utcNow)
+	if err != nil {
+		return snapshot, fmt.Errorf("query oldest due outbox delivery: %w", err)
+	}
+	oldestAdmissionWait, err := queryMinTime(ctx, db, `
+		SELECT MIN(available_at) FROM outbox_deliveries
+		WHERE taken_at IS NULL AND unresolved_at IS NULL AND dispatch_key IS NOT NULL AND available_at <= ?
+	`, utcNow)
+	if err != nil {
+		return snapshot, fmt.Errorf("query oldest delivery waiting for admission: %w", err)
+	}
+	snapshot.OldestPendingAge = positiveDuration(now, oldestPending)
+	snapshot.OldestAvailableAge = positiveDuration(now, oldestAvailable)
+	snapshot.DueLag = positiveDuration(now, oldestDue)
+	snapshot.AdmissionWaitAge = positiveDuration(now, oldestAdmissionWait)
 	return snapshot, nil
 }
 
@@ -336,6 +466,9 @@ func deleteRows(ctx context.Context, db *sql.DB, query string, args ...any) (int
 
 func outboxStats(ctx context.Context, db *sql.DB, now time.Time) (OutboxSnapshot, error) {
 	var snapshot OutboxSnapshot
+	// Every SQL comparison parameter is UTC: stored text is canonical UTC, so
+	// text comparison is only monotone against a UTC-bound parameter.
+	utcNow := schema.UTC(now)
 	err := db.QueryRowContext(ctx, `
 		SELECT
 			COUNT(*),
@@ -343,7 +476,7 @@ func outboxStats(ctx context.Context, db *sql.DB, now time.Time) (OutboxSnapshot
 			COALESCE(SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(retry_count), 0)
 		FROM outbox
-	`, now).Scan(&snapshot.PendingRows, &snapshot.AvailableRows, &snapshot.RetryRows, &snapshot.RetryCountTotal)
+	`, utcNow).Scan(&snapshot.PendingRows, &snapshot.AvailableRows, &snapshot.RetryRows, &snapshot.RetryCountTotal)
 	if err != nil {
 		return snapshot, fmt.Errorf("query outbox counts: %w", err)
 	}
@@ -352,11 +485,11 @@ func outboxStats(ctx context.Context, db *sql.DB, now time.Time) (OutboxSnapshot
 	if err != nil {
 		return snapshot, fmt.Errorf("query oldest pending outbox row: %w", err)
 	}
-	oldestAvailable, err := queryMinTime(ctx, db, `SELECT MIN(created_at) FROM outbox WHERE available_at <= ?`, now)
+	oldestAvailable, err := queryMinTime(ctx, db, `SELECT MIN(created_at) FROM outbox WHERE available_at <= ?`, utcNow)
 	if err != nil {
 		return snapshot, fmt.Errorf("query oldest available outbox row: %w", err)
 	}
-	oldestDue, err := queryMinTime(ctx, db, `SELECT MIN(available_at) FROM outbox WHERE available_at <= ?`, now)
+	oldestDue, err := queryMinTime(ctx, db, `SELECT MIN(available_at) FROM outbox WHERE available_at <= ?`, utcNow)
 	if err != nil {
 		return snapshot, fmt.Errorf("query oldest due outbox row: %w", err)
 	}
@@ -434,26 +567,18 @@ func nullTimeFromSQLite(raw any) (sql.NullTime, error) {
 	}
 }
 
+// parseSQLiteTime parses a stored timestamp through the shared schema
+// contract so the accepted layout list lives in exactly one place.
 func parseSQLiteTime(value string) (sql.NullTime, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return sql.NullTime{}, nil
 	}
-	for _, layout := range []string{
-		time.RFC3339Nano,
-		"2006-01-02 15:04:05.999999999-07:00",
-		"2006-01-02 15:04:05.999999999Z07:00",
-		"2006-01-02 15:04:05-07:00",
-		"2006-01-02 15:04:05Z07:00",
-		"2006-01-02 15:04:05.999999999",
-		"2006-01-02 15:04:05",
-	} {
-		parsed, err := time.Parse(layout, value)
-		if err == nil {
-			return sql.NullTime{Time: parsed, Valid: true}, nil
-		}
+	parsed, err := schema.ParseStored(value)
+	if err != nil {
+		return sql.NullTime{}, fmt.Errorf("parse SQLite time %q: %w", value, err)
 	}
-	return sql.NullTime{}, fmt.Errorf("parse SQLite time %q", value)
+	return sql.NullTime{Time: parsed, Valid: true}, nil
 }
 
 func positiveDuration(now time.Time, value sql.NullTime) time.Duration {

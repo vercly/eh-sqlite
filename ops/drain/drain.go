@@ -103,14 +103,22 @@ type Result struct {
 // ValidateRequiredTables is a read-only check that outbox exists. Dry-run uses
 // this only — never CREATE/ALTER.
 func ValidateRequiredTables(db *sql.DB) error {
+	v2, err := hasV2Deliveries(db)
+	if err != nil {
+		return err
+	}
+	name := "outbox"
+	if v2 {
+		name = "outbox_publications"
+	}
 	var n int
 	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='outbox'`,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name,
 	).Scan(&n); err != nil {
 		return fmt.Errorf("drain: check outbox table: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("drain: required table \"outbox\" is missing (refusing to create schema stubs; use a real event-store database)")
+		return fmt.Errorf("drain: required table %q is missing (refusing to create schema stubs; use a real event-store database)", name)
 	}
 	return nil
 }
@@ -348,6 +356,7 @@ type outboxRow struct {
 	EventType   string
 	AggregateID string
 	EventBlob   string
+	V2          bool
 }
 
 type preparedRow struct {
@@ -357,6 +366,38 @@ type preparedRow struct {
 }
 
 func selectOutbox(ctx context.Context, db *sql.DB, ids []string) ([]outboxRow, error) {
+	v2, err := hasV2Deliveries(db)
+	if err != nil {
+		return nil, err
+	}
+	if v2 {
+		q := `SELECT p.publication_id, p.event_type, p.aggregate_id, p.event_blob FROM outbox_publications p JOIN outbox_deliveries d ON d.publication_id=p.publication_id`
+		var args []any
+		if len(ids) > 0 {
+			ph := make([]string, len(ids))
+			for i, id := range ids {
+				ph[i] = "?"
+				args = append(args, id)
+			}
+			q += ` WHERE p.publication_id IN (` + strings.Join(ph, ",") + `)`
+		}
+		q += ` GROUP BY p.publication_id, p.event_type, p.aggregate_id, p.event_blob ORDER BY MIN(d.available_at), MIN(d.seq)`
+		rs, err := db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, fmt.Errorf("drain: query publications: %w", err)
+		}
+		defer rs.Close()
+		var out []outboxRow
+		for rs.Next() {
+			var r outboxRow
+			if err := rs.Scan(&r.ID, &r.EventType, &r.AggregateID, &r.EventBlob); err != nil {
+				return nil, err
+			}
+			r.V2 = true
+			out = append(out, r)
+		}
+		return out, rs.Err()
+	}
 	q := `SELECT id, event_type, aggregate_id, event_blob FROM outbox`
 	var args []any
 	if len(ids) > 0 {
@@ -388,9 +429,18 @@ func selectOutbox(ctx context.Context, db *sql.DB, ids []string) ([]outboxRow, e
 
 func loadOutbox(ctx context.Context, db *sql.DB, id string) (outboxRow, bool, error) {
 	var r outboxRow
-	err := db.QueryRowContext(ctx,
-		`SELECT id, event_type, aggregate_id, event_blob FROM outbox WHERE id = ?`, id,
-	).Scan(&r.ID, &r.EventType, &r.AggregateID, &r.EventBlob)
+	v2, err := hasV2Deliveries(db)
+	if err != nil {
+		return r, false, err
+	}
+	if v2 {
+		err = db.QueryRowContext(ctx, `SELECT p.publication_id,p.event_type,p.aggregate_id,p.event_blob FROM outbox_publications p WHERE p.publication_id=? AND EXISTS (SELECT 1 FROM outbox_deliveries d WHERE d.publication_id=p.publication_id)`, id).Scan(&r.ID, &r.EventType, &r.AggregateID, &r.EventBlob)
+		r.V2 = true
+	} else {
+		err = db.QueryRowContext(ctx,
+			`SELECT id, event_type, aggregate_id, event_blob FROM outbox WHERE id = ?`, id,
+		).Scan(&r.ID, &r.EventType, &r.AggregateID, &r.EventBlob)
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return outboxRow{}, false, nil
 	}
@@ -531,10 +581,36 @@ func commitDrain(ctx context.Context, db *sql.DB, actor string, msg Message) err
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM outbox WHERE id = ?`, msg.OutboxID); err != nil {
+	v2, err := hasV2DeliveriesTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if v2 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM outbox_deliveries WHERE publication_id=?`, msg.OutboxID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM outbox_publications WHERE publication_id=?`, msg.OutboxID); err != nil {
+			return err
+		}
+	} else if _, err := tx.ExecContext(ctx, `DELETE FROM outbox WHERE id = ?`, msg.OutboxID); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+func hasV2Deliveries(db *sql.DB) (bool, error) {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='outbox_deliveries'`).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+func hasV2DeliveriesTx(ctx context.Context, tx *sql.Tx) (bool, error) {
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='outbox_deliveries'`).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // isSQLiteConstraintConflict reports concurrent audit insert races only:

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/vercly/eh-sqlite/context/sqlite"
+	"github.com/vercly/eh-sqlite/schema"
 
 	json "github.com/json-iterator/go"
 	eh "github.com/vercly/eventhorizon"
@@ -100,7 +101,7 @@ func NewEventStore(db *sql.DB, options ...Option) (*EventStore, error) {
 
 	// Create the $all stream if it doesn't exist.
 	if _, err := s.db.Exec(fmt.Sprintf(`INSERT OR IGNORE INTO %s (aggregate_id, position, aggregate_type, version, updated_at) VALUES (?, ?, ?, ?, ?)`, s.streamsTable),
-		"$all", 0, "", 0, time.Now()); err != nil {
+		"$all", 0, "", 0, schema.UTC(time.Now())); err != nil {
 		return nil, fmt.Errorf("could not create $all stream: %w", err)
 	}
 
@@ -197,6 +198,17 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 	}
 	defer tx.Rollback() // Rollback on any error.
 
+	// Take the write lock before the first read (BEGIN IMMEDIATE semantics
+	// regardless of the DSN): a deferred transaction that reads the stream
+	// position and then inserts gets SQLITE_BUSY without the busy handler when
+	// another connection (e.g. the outbox processor) committed in between.
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET version = version WHERE 0`, s.streamsTable)); err != nil {
+		return &eh.EventStoreError{
+			Err: fmt.Errorf("could not acquire write lock: %w", err),
+			Op:  eh.EventStoreOpSave,
+		}
+	}
+
 	// Fetch and increment global version in the all-stream.
 	row := tx.Stmt(s.stmtSelectStream).QueryRow("$all")
 	var allStreamPosition int
@@ -256,14 +268,14 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 
 	// Update the aggregate stream.
 	if originalVersion == 0 {
-		if _, err := tx.Stmt(s.stmtInsertStream).Exec(id, lastPosition, at, len(dbEvents), time.Now()); err != nil {
+		if _, err := tx.Stmt(s.stmtInsertStream).Exec(id, lastPosition, at, len(dbEvents), schema.UTC(time.Now())); err != nil {
 			return &eh.EventStoreError{
 				Err: fmt.Errorf("could not insert stream: %w", err),
 				Op:  eh.EventStoreOpSave,
 			}
 		}
 	} else {
-		res, err := tx.Stmt(s.stmtUpdateStream).Exec(lastPosition, len(dbEvents), time.Now(), id, originalVersion)
+		res, err := tx.Stmt(s.stmtUpdateStream).Exec(lastPosition, len(dbEvents), schema.UTC(time.Now()), id, originalVersion)
 		if err != nil {
 			return &eh.EventStoreError{
 				Err: fmt.Errorf("could not update stream: %w", err),
@@ -424,7 +436,7 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, id uuid.UUID, snapshot eh
 		}
 	}
 
-	_, err = s.stmtInsertSnapshot.Exec(id.String(), snapshot.Version, string(marshaledData), time.Now(), snapshot.AggregateType)
+	_, err = s.stmtInsertSnapshot.Exec(id.String(), snapshot.Version, string(marshaledData), schema.UTC(time.Now()), snapshot.AggregateType)
 	if err != nil {
 		return &eh.EventStoreError{
 			Err: fmt.Errorf("could not insert snapshot: %w", err),
@@ -490,7 +502,7 @@ func newEvt(ctx context.Context, event eh.Event) (*evt, error) {
 
 	return &evt{
 		EventType:     event.EventType(),
-		Timestamp:     event.Timestamp(),
+		Timestamp:     schema.UTC(event.Timestamp()),
 		AggregateType: event.AggregateType(),
 		AggregateID:   event.AggregateID(),
 		Version:       event.Version(),

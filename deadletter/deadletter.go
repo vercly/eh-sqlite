@@ -13,6 +13,8 @@ type Record struct {
 	AggregateID       string     `json:"aggregate_id"`
 	HandlerType       string     `json:"handler_type"`
 	OutboxID          string     `json:"outbox_id,omitempty"`
+	PublicationID     string     `json:"publication_id,omitempty"`
+	LegacyOutboxID    string     `json:"legacy_outbox_id,omitempty"`
 	RemainingHandlers string     `json:"remaining_handlers"`
 	Blob              string     `json:"blob"`
 	Error             string     `json:"error"`

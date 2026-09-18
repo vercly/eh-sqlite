@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/vercly/eh-sqlite/internal/deadletter"
+	outboxsqlite "github.com/vercly/eh-sqlite/outbox/sqlite"
+	"github.com/vercly/eh-sqlite/schema"
+	"github.com/vercly/eventhorizon/uuid"
 )
 
 const (
@@ -72,7 +75,7 @@ type Result struct {
 // ValidateRequiredTables is a read-only check that a real event-store schema is
 // present. It never CREATE/ALTER. Dry-run uses this only.
 func ValidateRequiredTables(db *sql.DB) error {
-	for _, name := range []string{"dead_letters", "outbox", "async_tasks"} {
+	for _, name := range []string{"dead_letters", "async_tasks"} {
 		ok, err := deadletter.TableExists(db, name)
 		if err != nil {
 			return fmt.Errorf("replay: check table %s: %w", name, err)
@@ -80,6 +83,29 @@ func ValidateRequiredTables(db *sql.DB) error {
 		if !ok {
 			return fmt.Errorf("replay: required table %q is missing (refusing to create schema stubs; use a real event-store database)", name)
 		}
+	}
+	v2, err := isV2(db)
+	if err != nil {
+		return err
+	}
+	if v2 {
+		for _, name := range []string{"outbox_publications", "outbox_deliveries"} {
+			ok, err := deadletter.TableExists(db, name)
+			if err != nil {
+				return fmt.Errorf("replay: check table %s: %w", name, err)
+			}
+			if !ok {
+				return fmt.Errorf("replay: required table %q is missing", name)
+			}
+		}
+		return nil
+	}
+	ok, err := deadletter.TableExists(db, "outbox")
+	if err != nil {
+		return fmt.Errorf("replay: check table outbox: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("replay: required legacy table \"outbox\" is missing")
 	}
 	return nil
 }
@@ -207,17 +233,19 @@ func ReplayDeadLetters(ctx context.Context, db *sql.DB, opts Options) (Result, e
 }
 
 type dlqRow struct {
-	ID          string
-	Source      string
-	EventType   string
-	AggregateID string
-	HandlerType string
-	OutboxID    sql.NullString
-	Blob        string
-	RetryCount  int
-	CreatedAt   time.Time
-	ReplayedAt  sql.NullTime
-	ReplayedBy  sql.NullString
+	ID             string
+	Source         string
+	EventType      string
+	AggregateID    string
+	HandlerType    string
+	OutboxID       sql.NullString
+	Blob           string
+	RetryCount     int
+	CreatedAt      time.Time
+	ReplayedAt     sql.NullTime
+	ReplayedBy     sql.NullString
+	PublicationID  sql.NullString
+	LegacyOutboxID sql.NullString
 }
 
 func hasReplayAuditColumns(db *sql.DB) (bool, error) {
@@ -238,10 +266,22 @@ func selectDeadLetters(ctx context.Context, db *sql.DB, opts Options, hasReplayC
 	if hasReplayCols {
 		replaySelect = `replayed_at, replayed_by`
 	}
+	provenanceSelect := `NULL AS publication_id, NULL AS legacy_outbox_id`
+	hasPublicationID, err := deadletter.ColumnExists(db, "dead_letters", "publication_id")
+	if err != nil {
+		return nil, err
+	}
+	hasLegacyOutboxID, err := deadletter.ColumnExists(db, "dead_letters", "legacy_outbox_id")
+	if err != nil {
+		return nil, err
+	}
+	if hasPublicationID && hasLegacyOutboxID {
+		provenanceSelect = `publication_id, legacy_outbox_id`
+	}
 	q := fmt.Sprintf(`
 		SELECT id, source, event_type, aggregate_id, handler_type, outbox_id, blob,
-		       retry_count, created_at, %s
-		FROM dead_letters WHERE 1=1`, replaySelect)
+		       retry_count, created_at, %s, %s
+		FROM dead_letters WHERE 1=1`, replaySelect, provenanceSelect)
 	var args []any
 	if opts.Source != "" {
 		q += ` AND source = ?`
@@ -267,7 +307,7 @@ func selectDeadLetters(ctx context.Context, db *sql.DB, opts Options, hasReplayC
 	for rs.Next() {
 		var r dlqRow
 		if err := rs.Scan(&r.ID, &r.Source, &r.EventType, &r.AggregateID, &r.HandlerType, &r.OutboxID,
-			&r.Blob, &r.RetryCount, &r.CreatedAt, &r.ReplayedAt, &r.ReplayedBy); err != nil {
+			&r.Blob, &r.RetryCount, &r.CreatedAt, &r.ReplayedAt, &r.ReplayedBy, &r.PublicationID, &r.LegacyOutboxID); err != nil {
 			return nil, fmt.Errorf("replay: scan: %w", err)
 		}
 		out = append(out, r)
@@ -307,6 +347,16 @@ func replayOne(ctx context.Context, db *sql.DB, opts Options, row dlqRow) (PlanI
 		item.Action = "unsupported"
 		item.Detail = fmt.Sprintf("unsupported source %q", row.Source)
 		return item, nil
+	}
+	// v2 replay must decode the stored routing envelope to retain partition
+	// semantics. Do this during dry-run too, so its plan is actionable and an
+	// apply does not discover malformed payloads after the operator approves it.
+	if v2, err := isV2(db); err != nil {
+		return item, err
+	} else if v2 && row.Source == SourceOutbox {
+		if _, err := replayPartitionKey(row.Blob); err != nil {
+			return item, fmt.Errorf("decode replay partition key: %w", err)
+		}
 	}
 
 	if !opts.Apply {
@@ -352,7 +402,7 @@ func replayOne(ctx context.Context, db *sql.DB, opts Options, row dlqRow) (PlanI
 		}
 	}
 
-	now := time.Now()
+	now := schema.UTC(time.Now())
 	res, err := tx.ExecContext(ctx, `
 		UPDATE dead_letters SET replayed_at = ?, replayed_by = ? WHERE id = ? AND replayed_at IS NULL
 	`, now, opts.Actor, row.ID)
@@ -373,13 +423,20 @@ func replayOne(ctx context.Context, db *sql.DB, opts Options, row dlqRow) (PlanI
 }
 
 func restoreNoMatch(ctx context.Context, tx *sql.Tx, row dlqRow) error {
+	v2, err := isV2Tx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if v2 {
+		return restoreV2(ctx, tx, row, "")
+	}
 	// Empty handlers list is the rematch sentinel (see outbox planAndClaim).
 	outboxID := row.ID
 	if row.OutboxID.Valid && row.OutboxID.String != "" {
 		outboxID = row.OutboxID.String
 	}
-	now := time.Now()
-	_, err := tx.ExecContext(ctx, `
+	now := schema.UTC(time.Now())
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO outbox (id, event_type, aggregate_id, created_at, available_at, taken_at, handlers, event_blob, retry_count)
 		VALUES (?, ?, ?, ?, ?, NULL, '[]', ?, 0)
 		ON CONFLICT(id) DO UPDATE SET
@@ -393,15 +450,22 @@ func restoreNoMatch(ctx context.Context, tx *sql.Tx, row dlqRow) error {
 }
 
 func restoreTerminalHandler(ctx context.Context, tx *sql.Tx, row dlqRow) error {
+	v2, err := isV2Tx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if v2 {
+		return restoreV2(ctx, tx, row, row.HandlerType)
+	}
 	if !row.OutboxID.Valid || row.OutboxID.String == "" {
 		return errors.New("terminal outbox dead letter missing outbox_id")
 	}
 	outboxID := row.OutboxID.String
 	handler := row.HandlerType
-	now := time.Now()
+	now := schema.UTC(time.Now())
 
 	var handlersBlob string
-	err := tx.QueryRowContext(ctx, `SELECT handlers FROM outbox WHERE id = ?`, outboxID).Scan(&handlersBlob)
+	err = tx.QueryRowContext(ctx, `SELECT handlers FROM outbox WHERE id = ?`, outboxID).Scan(&handlersBlob)
 	if errors.Is(err, sql.ErrNoRows) {
 		// Recreate row with only the failed handler. Always start a fresh
 		// attempt: retry_count=0 and available_at=now (never carry the DLQ's
@@ -445,10 +509,71 @@ func restoreTerminalHandler(ctx context.Context, tx *sql.Tx, row dlqRow) error {
 	return err
 }
 
+// restoreV2 recreates one publication plus either a terminal recipient or a
+// NULL rematch sentinel. DLQ payloads are self-contained, so no legacy row is
+// consulted. New IDs avoid conflating repeated publications of one EH event.
+func restoreV2(ctx context.Context, tx *sql.Tx, row dlqRow, handler string) error {
+	publicationID := uuid.New().String()
+	deliveryID := uuid.New().String()
+	now := schema.UTC(time.Now())
+	partitionKey, err := replayPartitionKey(row.Blob)
+	if err != nil {
+		return fmt.Errorf("decode replay partition key: %w", err)
+	}
+	legacyOutboxID := any(nil)
+	if row.LegacyOutboxID.Valid && row.LegacyOutboxID.String != "" {
+		legacyOutboxID = row.LegacyOutboxID.String
+	} else if !row.PublicationID.Valid && row.OutboxID.Valid && row.OutboxID.String != "" {
+		legacyOutboxID = row.OutboxID.String
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO outbox_publications (publication_id, event_type, aggregate_id, partition_key, event_blob, created_at, origin, origin_ref)
+		VALUES (?, ?, ?, ?, ?, ?, 'replay', ?)`, publicationID, row.EventType, row.AggregateID, partitionKey, row.Blob, now, row.ID); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO outbox_deliveries (id, publication_id, handler_type, dispatch_key, dispatch_config, event_type, aggregate_id, created_at, available_at, taken_at, retry_count, unresolved_at, legacy_outbox_id)
+		VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, NULL, 0, NULL, ?)`, deliveryID, publicationID, nullableHandler(handler), row.EventType, row.AggregateID, now, now, legacyOutboxID)
+	return err
+}
+
+func replayPartitionKey(blob string) (string, error) {
+	return outboxsqlite.StoredEventPartitionKey([]byte(blob))
+}
+
+func nullableHandler(handler string) any {
+	if handler == "" {
+		return nil
+	}
+	return handler
+}
+
+func isV2(db *sql.DB) (bool, error) {
+	ok, err := deadletter.TableExists(db, "eh_sqlite_migrations")
+	if err != nil || !ok {
+		return false, err
+	}
+	var n int
+	err = db.QueryRow(`SELECT COUNT(*) FROM eh_sqlite_migrations WHERE component = 'outbox' AND name = 'v2_deliveries'`).Scan(&n)
+	return n > 0, err
+}
+func isV2Tx(ctx context.Context, tx *sql.Tx) (bool, error) {
+	var tableCount int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'eh_sqlite_migrations'`).Scan(&tableCount); err != nil {
+		return false, err
+	}
+	if tableCount == 0 {
+		return false, nil
+	}
+	var n int
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM eh_sqlite_migrations WHERE component = 'outbox' AND name = 'v2_deliveries'`).Scan(&n)
+	return n > 0, err
+}
+
 func restoreCommandTask(ctx context.Context, tx *sql.Tx, row dlqRow) error {
 	// Deterministic task_uuid from dead letter id for idempotent re-insert.
 	taskUUID := "dlq-replay-" + row.ID
-	now := time.Now()
+	now := schema.UTC(time.Now())
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO async_tasks (task_uuid, command_type, command_blob, status, retry_count, max_retries, created_at, updated_at)
 		VALUES (?, ?, ?, 'new', 0, 5, ?, ?)

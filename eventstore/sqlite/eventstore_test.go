@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	outboxsqlite "github.com/vercly/eh-sqlite/outbox/sqlite"
+	"github.com/vercly/eh-sqlite/schema"
 	eh "github.com/vercly/eventhorizon"
 	"github.com/vercly/eventhorizon/eventstore"
 	"github.com/vercly/eventhorizon/mocks"
@@ -244,5 +246,83 @@ func setOutboxSweepInterval(t testing.TB, interval time.Duration) func() {
 	outboxsqlite.PeriodicSweepInterval = interval
 	return func() {
 		outboxsqlite.PeriodicSweepInterval = previous
+	}
+}
+
+func TestEventStoreWritesCanonicalUTCTimestamps(t *testing.T) {
+	store, err := newTestEventStore(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// Event timestamp carries a non-UTC offset; the same instant must come back
+	// from Load and be stored as canonical UTC text.
+	at := time.Date(2025, 3, 4, 12, 30, 0, 500000000, time.FixedZone("plus2", 2*3600))
+	id := uuid.New()
+	event := eh.NewEvent(mocks.EventOtherType, &mocks.EventData{Content: "utc"}, at,
+		eh.ForAggregate(mocks.AggregateType, id, 1))
+
+	if err := store.Save(ctx, []eh.Event{event}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := store.Load(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("loaded events = %d, want 1", len(loaded))
+	}
+	if !loaded[0].Timestamp().Equal(at) {
+		t.Fatalf("loaded timestamp = %v, want the same instant as %v", loaded[0].Timestamp(), at)
+	}
+
+	want := schema.FormatStored(at)
+	var raw string
+	if err := store.db.QueryRow(`SELECT CAST(timestamp AS TEXT) FROM events WHERE aggregate_id = ?`, id.String()).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw != want {
+		t.Fatalf("events.timestamp = %q, want canonical UTC %q", raw, want)
+	}
+
+	for _, streamID := range []string{"$all", id.String()} {
+		var text string
+		if err := store.db.QueryRow(`SELECT CAST(updated_at AS TEXT) FROM streams WHERE aggregate_id = ?`, streamID).Scan(&text); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasSuffix(text, "+00:00") {
+			t.Fatalf("streams.updated_at for %s = %q, want canonical UTC text", streamID, text)
+		}
+	}
+}
+
+func TestEventStoreSnapshotTimestampIsCanonicalUTC(t *testing.T) {
+	store, err := newTestEventStore(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	id := uuid.New()
+
+	if err := store.SaveSnapshot(ctx, id, eh.Snapshot{
+		Version:       1,
+		AggregateType: mocks.AggregateType,
+		State:         &SnapshotData{Content: "snap"},
+		Timestamp:     time.Date(2025, 3, 4, 12, 30, 0, 0, time.FixedZone("plus2", 2*3600)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var raw string
+	if err := store.db.QueryRow(`SELECT CAST(timestamp AS TEXT) FROM snapshots WHERE aggregate_id = ?`, id.String()).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(raw, "+00:00") {
+		t.Fatalf("snapshots.timestamp = %q, want canonical UTC text", raw)
+	}
+	if _, err := schema.ParseStored(raw); err != nil {
+		t.Fatalf("snapshots.timestamp = %q is not a stored timestamp: %v", raw, err)
 	}
 }

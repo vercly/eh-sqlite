@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	dl "github.com/vercly/eh-sqlite/deadletter"
 	"github.com/vercly/eh-sqlite/middleware/commandhandler/durable"
+	"github.com/vercly/eh-sqlite/schema"
 	"github.com/vercly/eh-sqlite/tracing"
 	eh "github.com/vercly/eventhorizon"
 	"github.com/vercly/eventhorizon/codec/json"
@@ -263,10 +265,16 @@ func seedTask(t testing.TB, db *sql.DB, status string, nextRetryAt time.Time, lo
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().Add(-time.Minute)
+	// Library writes are always UTC (schema.UTC), and stored text comparison is
+	// only monotone when every row shares that spelling; the fixture follows the
+	// same contract. Legacy local-offset text is covered by the migration test.
+	now := schema.UTC(time.Now().Add(-time.Minute))
 	var nextRetry sql.NullTime
 	if !nextRetryAt.IsZero() {
-		nextRetry = sql.NullTime{Time: nextRetryAt, Valid: true}
+		nextRetry = sql.NullTime{Time: schema.UTC(nextRetryAt), Valid: true}
+	}
+	if lockedAt.Valid {
+		lockedAt.Time = schema.UTC(lockedAt.Time)
 	}
 	res, err := db.Exec(`
 		INSERT INTO async_tasks (task_uuid, command_type, command_blob, status, retry_count, max_retries, created_at, updated_at, locked_by, locked_at, next_retry_at)
@@ -379,4 +387,121 @@ func (e *recordingDeadLetterExporter) Records() []dl.Record {
 	defer e.mu.Unlock()
 
 	return append([]dl.Record(nil), e.records...)
+}
+
+// seedLegacyTask writes an async_tasks row the way a pre-UTC build did: raw
+// text carrying the writer's local offset. It bypasses ensureSchema so the
+// migration has something to normalize.
+func seedLegacyTask(t testing.TB, db *sql.DB, status, lockedAt, nextRetryAt string) {
+	t.Helper()
+
+	cmd := testCommand{ID: uuid.New()}
+	blob, err := (json.CommandCodec{}).MarshalCommand(context.Background(), cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS async_tasks (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			task_uuid TEXT NOT NULL UNIQUE,
+			command_type TEXT NOT NULL,
+			command_blob TEXT NOT NULL,
+			status TEXT NOT NULL CHECK(status IN ('new', 'processing', 'completed', 'failed_retriable', 'failed_permanent')),
+			retry_count INTEGER NOT NULL DEFAULT 0,
+			max_retries INTEGER NOT NULL DEFAULT 5,
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL,
+			last_error TEXT,
+			locked_by TEXT,
+			locked_at TIMESTAMP,
+			next_retry_at TIMESTAMP
+		);`); err != nil {
+		t.Fatal(err)
+	}
+	var locked, next any
+	if lockedAt != "" {
+		locked = lockedAt
+	}
+	if nextRetryAt != "" {
+		next = nextRetryAt
+	}
+	if _, err := db.Exec(`
+		INSERT INTO async_tasks (task_uuid, command_type, command_blob, status, retry_count, max_retries, created_at, updated_at, locked_by, locked_at, next_retry_at)
+		VALUES (?, ?, ?, ?, 1, 2, '2020-01-01 00:00:00+00:00', '2020-01-01 00:00:00+00:00', 'test', ?, ?)
+	`, uuid.New().String(), cmd.CommandType().String(), string(blob), status, locked, next); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func rawTaskText(t testing.TB, db *sql.DB, column string) string {
+	t.Helper()
+	var raw sql.NullString
+	if err := db.QueryRow(`SELECT CAST(` + column + ` AS TEXT) FROM async_tasks ORDER BY id LIMIT 1`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	return raw.String
+}
+
+func TestDurableSweepPicksUpLegacyLocalOffsetRetryAfterMigration(t *testing.T) {
+	db := newDurableTestDB(t)
+	// Due one hour ago in UTC terms, but spelled with a +05:00 offset so the
+	// raw text sorts *after* a canonical UTC "now" until the migration runs.
+	due := time.Now().UTC().Add(-time.Hour).In(time.FixedZone("plus5", 5*3600))
+	seedLegacyTask(t, db, "failed_retriable", "", due.Format("2006-01-02 15:04:05.999999999-07:00"))
+
+	handler := &recordingCommandHandler{}
+	wrapped := newWrappedHandler(t, db, handler, durable.WithMaxRetries(2), durable.WithRetryBackoff("FIXED:2:1ms"))
+
+	if got := rawTaskText(t, db, "next_retry_at"); got != schema.FormatStored(due) {
+		t.Fatalf("next_retry_at = %q, want canonical UTC %q", got, schema.FormatStored(due))
+	}
+
+	assertSweepProcessed(t, db, wrapped, 1, durable.WithMaxRetries(2), durable.WithRetryBackoff("FIXED:2:1ms"))
+	if handler.Attempts() != 1 {
+		t.Fatalf("handler attempts = %d, want 1", handler.Attempts())
+	}
+	assertTaskState(t, db, "completed", 1)
+}
+
+func TestDurableSweepStuckDetectionUsesLegacyLocalOffsetLock(t *testing.T) {
+	db := newDurableTestDB(t)
+	locked := time.Now().UTC().Add(-time.Hour).In(time.FixedZone("minus7", -7*3600))
+	seedLegacyTask(t, db, "processing", locked.Format("2006-01-02T15:04:05.999999999Z07:00"), "")
+
+	handler := &recordingCommandHandler{}
+	wrapped := newWrappedHandler(t, db, handler, durable.WithMaxRetries(2), durable.WithRetryBackoff("FIXED:2:1ms"))
+
+	if got := rawTaskText(t, db, "locked_at"); got != schema.FormatStored(locked) {
+		t.Fatalf("locked_at = %q, want canonical UTC %q", got, schema.FormatStored(locked))
+	}
+
+	assertSweepProcessed(t, db, wrapped, 1,
+		durable.WithMaxRetries(2),
+		durable.WithRetryBackoff("FIXED:2:1ms"),
+		durable.WithStuckTimeout(time.Minute),
+	)
+	if handler.Attempts() != 1 {
+		t.Fatalf("handler attempts = %d, want 1", handler.Attempts())
+	}
+	assertTaskState(t, db, "completed", 1)
+}
+
+func TestDurableWritesCanonicalUTCText(t *testing.T) {
+	db := newDurableTestDB(t)
+	handler := &recordingCommandHandler{}
+	wrapped := newWrappedHandler(t, db, handler)
+
+	if err := wrapped.HandleCommand(context.Background(), testCommand{ID: uuid.New()}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, col := range []string{"created_at", "updated_at"} {
+		got := rawTaskText(t, db, col)
+		if _, err := schema.ParseStored(got); err != nil {
+			t.Fatalf("%s = %q is not a stored timestamp: %v", col, got, err)
+		}
+		if !strings.HasSuffix(got, "+00:00") {
+			t.Fatalf("%s = %q, want canonical UTC text ending in +00:00", col, got)
+		}
+	}
 }

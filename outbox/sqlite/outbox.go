@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 	"github.com/vercly/eh-sqlite/context/sqlite"
 	dl "github.com/vercly/eh-sqlite/deadletter"
 	"github.com/vercly/eh-sqlite/internal/deadletter"
+	"github.com/vercly/eh-sqlite/schema"
 
 	jsoniter "github.com/json-iterator/go"
 	// Register the sqlite3 database/sql driver used by this package.
@@ -29,12 +31,24 @@ var (
 	// PeriodicSweepInterval Interval in which to do a sweep of various unprocessed events.
 	PeriodicSweepInterval = 15 * time.Second
 
-	// PeriodicSweepAge Settings for how old different kind of unprocessed events needs to be
-	// to be processed by the periodic sweep.
+	// PeriodicSweepAge is the taken_at timeout: a claimed delivery older than
+	// this and not admitted in this process is treated as stale and re-claimed.
 	PeriodicSweepAge = 15 * time.Second
 )
 
 const metadataAvailableAtKey = "outbox.available_at"
+
+// claimQuantum bounds how many deliveries one dispatch key may claim per
+// round-robin turn. Internal constant by agreement (no ENV).
+const claimQuantum = 8
+
+// maxFetchBatch is the historical upper bound of deliveries claimed per pass
+// and the default admission limit (in-flight deliveries).
+const maxFetchBatch = 50
+
+// finalizeRetryDelays is the bounded backoff for finalize SQL retries with the
+// saved handler outcome (the handler is never re-run to retry finalization).
+var finalizeRetryDelays = []time.Duration{50 * time.Millisecond, 200 * time.Millisecond, time.Second}
 
 type availableAtContextKey struct{}
 
@@ -79,30 +93,29 @@ func WithAvailableAt(ctx context.Context, availableAt time.Time) context.Context
 	return context.WithValue(ctx, availableAtContextKey{}, availableAt)
 }
 
-// maxFetchBatch is the upper bound on rows considered in one claim transaction.
-// Effective claim size is min(maxFetchBatch, admission free slots).
-const maxFetchBatch = 50
-
-// Outbox implements an eventhorizon.Outbox for SQLite.
+// Outbox implements an eventhorizon.Outbox for SQLite (v2: one delivery row
+// per recipient sharing one publication payload).
 type Outbox struct {
-	db              *sql.DB
-	outboxTable     string
-	deadLetterTable string
-	handlers        []*matcherHandler
-	handlersByType  map[eh.EventHandlerType]*matcherHandler
-	handlersMu      sync.RWMutex
-	watchCh         chan struct{}
-	scheduleCh      chan struct{}
-	errCh           chan error
-	done            <-chan struct{}
-	cancel          context.CancelFunc
-	wg              sync.WaitGroup
+	db *sql.DB
+	// outboxTable is the table prefix (and the v1 table name before migration).
+	outboxTable       string
+	publicationsTable string
+	deliveriesTable   string
+	deadLetterTable   string
+	handlers          []*matcherHandler
+	handlersByType    map[eh.EventHandlerType]*matcherHandler
+	handlersMu        sync.RWMutex
+	watchCh           chan struct{}
+	scheduleCh        chan struct{}
+	errCh             chan error
+	done              <-chan struct{}
+	cancel            context.CancelFunc
+	wg                sync.WaitGroup
 	// registrationClosed is set on the first Start/StartChecked attempt and
 	// never reopened. AddHandler fails once this is true.
 	registrationClosed atomic.Bool
-	// processorRunning is true only after a successful reset and fetcher launch.
-	// HandleEvent (publish) requires this flag so fail-closed Start does not
-	// accept traffic before the processor is up. Retry StartChecked may set it.
+	// processorRunning is true only after a successful startup and fetcher
+	// launch. HandleEvent (publish) requires this flag.
 	processorRunning atomic.Bool
 	// shuttingDown is set in Close; fetcher stops admitting and workers stop
 	// starting new HandleEvent work.
@@ -116,18 +129,48 @@ type Outbox struct {
 	admission        *recordAdmission
 	dispatch         *dispatchRegistry
 	dispatchStats    DispatchStats
+	admissionStats   AdmissionStats
 	// handleSem bounds concurrent HandleEvent calls (FIFO fair across keys).
 	handleSem *fairSem
+	// claimMu serializes claim passes (fetcher goroutine and test helpers) and
+	// protects claimCursor.
+	claimMu     sync.Mutex
+	claimCursor string
+	// startMu serializes StartChecked so two concurrent starts cannot run the
+	// startup reset after the first start already launched the fetcher.
+	startMu sync.Mutex
+	// claimKeys is the sorted set of every dispatch key the registration can
+	// produce (handler, or handler plus each shard). Computed at start; the
+	// claim pass probes each key with one indexed SELECT instead of scanning
+	// the whole due set.
+	claimKeys []string
 
-	insertEventStmt      *sql.Stmt
-	selectEventsStmt     *sql.Stmt
-	updateTakenAtStmt    *sql.Stmt
-	deleteEventStmt      *sql.Stmt
-	updateHandlersStmt   *sql.Stmt
-	scheduleRetryStmt    *sql.Stmt
-	insertDeadLetterStmt *sql.Stmt
-	nextAvailableAtStmt  *sql.Stmt
-	resetTakenAtStmt     *sql.Stmt
+	// beforeFinalizeCommit is a test hook invoked before each finalize commit
+	// attempt (attempt is 1-based); a non-nil error aborts that attempt.
+	beforeFinalizeCommit func(deliveryID string, attempt int) error
+	// beforeReleaseClaim is a test hook invoked before the safe claim release.
+	beforeReleaseClaim func(deliveryID string) error
+	// beforeClaimCommit is a test hook invoked before a claim pass commits
+	// (after reservations/admissions were taken); a non-nil error aborts the
+	// pass, which must release every reservation it took.
+	beforeClaimCommit func(reserved int) error
+	// finalizeSleep lets tests shorten the finalize retry backoff.
+	finalizeSleep func(time.Duration)
+
+	insertPublicationStmt *sql.Stmt
+	insertDeliveryStmt    *sql.Stmt
+	insertDeadLetterStmt  *sql.Stmt
+	claimKeyStmt          *sql.Stmt
+	staleClaimsStmt       *sql.Stmt
+	resetStaleStmt        *sql.Stmt
+	sentinelsStmt         *sql.Stmt
+	updateTakenAtStmt     *sql.Stmt
+	deleteDeliveryStmt    *sql.Stmt
+	gcPublicationStmt     *sql.Stmt
+	scheduleRetryStmt     *sql.Stmt
+	releaseClaimStmt      *sql.Stmt
+	markUnresolvedStmt    *sql.Stmt
+	nextAvailableAtStmt   *sql.Stmt
 }
 
 type matcherHandler struct {
@@ -190,7 +233,9 @@ func WithPartitionShards(shards int) HandlerOption {
 	}
 }
 
-// NewOutbox creates a new Outbox.
+// NewOutbox creates a new Outbox. It creates the v2 tables (publications,
+// deliveries, migration bookkeeping, dead letters) but does not migrate a v1
+// table nor start the processor; StartChecked does both.
 func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -209,53 +254,38 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 		maxGoroutines:   10, // Global concurrent HandleEvent permits
 		queueDepth:      defaultQueueDepth,
 		retryBackoff:    backoff.FixedConfig(10, PeriodicSweepAge),
-		// Default admission capacity matches the fetch batch upper bound:
-		// bounds concurrent record coordinators (not channel depth).
-		admission: newRecordAdmission(maxFetchBatch),
+		// Default admission capacity: in-flight deliveries in this process.
+		admission:     newRecordAdmission(maxFetchBatch),
+		finalizeSleep: time.Sleep,
 	}
 
 	for _, option := range options {
 		if err := option(o); err != nil {
+			cancel()
 			return nil, fmt.Errorf("error while applying option: %w", err)
+		}
+	}
+	o.publicationsTable = publicationsTableFor(o.outboxTable)
+	o.deliveriesTable = deliveriesTableFor(o.outboxTable)
+	if o.dispatchStats != nil {
+		if as, ok := o.dispatchStats.(AdmissionStats); ok {
+			o.admissionStats = as
 		}
 	}
 
 	o.handleSem = newFairSem(max(o.maxGoroutines, 1))
 	o.dispatch = newDispatchRegistry(o, o.queueDepth, o.dispatchStats)
 
-	// Create the outbox table if it doesn't exist.
-	if _, err := o.db.Exec(fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %[1]s (
-				id TEXT PRIMARY KEY,
-
-				-- --- Promoted, Indexed Columns for Querying ---
-				event_type TEXT NOT NULL,
-				aggregate_id TEXT NOT NULL,
-				created_at TIMESTAMP NOT NULL,
-				available_at TIMESTAMP,
-				taken_at TIMESTAMP,
-
-				handlers TEXT NOT NULL, 
-
-				-- --- Blob Column for the rest of the event data ---
-				-- This will store a JSON object containing the full event,
-				-- including data, metadata, version, etc.
-				event_blob TEXT NOT NULL,
-				retry_count INTEGER DEFAULT 0
-		);
-
-		-- Index the columns you will query.
-		CREATE INDEX IF NOT EXISTS idx_%[1]s_created_at ON %[1]s (created_at);
-		CREATE INDEX IF NOT EXISTS idx_%[1]s_taken_at ON %[1]s (taken_at);
-	`, o.outboxTable)); err != nil {
-		return nil, fmt.Errorf("could not create outbox table: %w", err)
-	}
-
-	if err := o.ensureSchema(); err != nil {
+	if err := ensureV2Tables(context.Background(), db, o.outboxTable); err != nil {
+		cancel()
 		return nil, err
 	}
-
+	if err := deadletter.EnsureSchema(o.db, o.deadLetterTable); err != nil {
+		cancel()
+		return nil, err
+	}
 	if err := o.prepareStatements(); err != nil {
+		cancel()
 		return nil, fmt.Errorf("could not prepare statements: %w", err)
 	}
 
@@ -264,37 +294,19 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 
 type Option func(*Outbox) error
 
+// WithTableName sets the table prefix: <prefix>_publications, <prefix>_deliveries
+// and the v1 source table <prefix>. Default "outbox".
 func WithTableName(outbox string) Option {
 	return func(o *Outbox) error {
+		if err := schema.ValidateIdent(outbox); err != nil {
+			return err
+		}
 		o.outboxTable = outbox
 		return nil
 	}
 }
 
-func (o *Outbox) ensureSchema() error {
-	// Migrate older outbox shapes via PRAGMA table_info (never error-text match).
-	if err := deadletter.AddColumnIfAbsent(o.db, o.outboxTable, "retry_count", "INTEGER DEFAULT 0"); err != nil {
-		return fmt.Errorf("could not migrate outbox retry_count: %w", err)
-	}
-	if err := deadletter.AddColumnIfAbsent(o.db, o.outboxTable, "available_at", "TIMESTAMP"); err != nil {
-		return fmt.Errorf("could not migrate outbox available_at: %w", err)
-	}
-
-	if _, err := o.db.Exec(fmt.Sprintf(`UPDATE %s SET available_at = created_at WHERE available_at IS NULL;`, o.outboxTable)); err != nil {
-		return fmt.Errorf("could not backfill outbox available_at: %w", err)
-	}
-	if _, err := o.db.Exec(fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%s_taken_available ON %s (taken_at, available_at);`, o.outboxTable, o.outboxTable)); err != nil {
-		return fmt.Errorf("could not create outbox availability index: %w", err)
-	}
-
-	if err := deadletter.EnsureSchema(o.db, o.deadLetterTable); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// WithMaxRetries sets the maximum number of error retries before an event is dropped.
+// WithMaxRetries sets the maximum number of error retries before a delivery is dead-lettered.
 func WithMaxRetries(retries int) Option {
 	return func(o *Outbox) error {
 		o.maxRetries = retries
@@ -343,7 +355,8 @@ func WithQueueDepth(depth int) Option {
 
 // WithDispatchStats registers a transport-neutral observer for per-key queue
 // depth and HandleEvent in-flight gauges. Nil is ignored. Callbacks run outside
-// queue locks and must not block delivery.
+// queue locks and must not block delivery. A collector that also implements
+// AdmissionStats receives admission, claim-skip and finalize observations.
 func WithDispatchStats(collector DispatchStats) Option {
 	return func(o *Outbox) error {
 		o.dispatchStats = collector
@@ -351,9 +364,10 @@ func WithDispatchStats(collector DispatchStats) Option {
 	}
 }
 
-// WithAdmissionLimit sets how many outbox records may be admitted (claimed and
-// in-flight) at once in this process. Admission is process-local and is not a
-// multi-process lock. Values below 1 are treated as 1. Default is maxFetchBatch.
+// WithAdmissionLimit sets how many deliveries may be admitted (claimed and
+// in-flight: queued or executing, not yet finalized) at once in this process.
+// Admission is process-local and is not a multi-process lock. Values below 1
+// are treated as 1. Default is 50.
 func WithAdmissionLimit(limit int) Option {
 	return func(o *Outbox) error {
 		if o.admission != nil {
@@ -376,67 +390,91 @@ func WithDeadLetterExporter(exporter dl.Exporter) Option {
 
 func (o *Outbox) prepareStatements() error {
 	var err error
-	if o.insertEventStmt, err = o.db.Prepare(fmt.Sprintf(`
-		INSERT INTO %s (id, event_type, aggregate_id, created_at, available_at, taken_at, handlers, event_blob)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, o.outboxTable)); err != nil {
-		return fmt.Errorf("could not prepare insert event statement: %w", err)
+	pubs, dels := o.publicationsTable, o.deliveriesTable
+	prepare := func(dst **sql.Stmt, what, query string) bool {
+		if err != nil {
+			return false
+		}
+		*dst, err = o.db.Prepare(query)
+		if err != nil {
+			err = fmt.Errorf("could not prepare %s statement: %w", what, err)
+			return false
+		}
+		return true
 	}
 
-	// available_at first so delayed/retry rows re-enter FIFO by eligibility time
-	// (retry loses its original position among first attempts).
-	// OFFSET pages within one claim TX so a full dispatch-key backlog larger than
-	// one page cannot hide later idle-key rows (bounded page size, not one big LIMIT).
-	if o.selectEventsStmt, err = o.db.Prepare(fmt.Sprintf(`
-		SELECT id, event_type, aggregate_id, created_at, available_at, taken_at, handlers, event_blob, retry_count
-		FROM %s
-		WHERE (taken_at IS NULL OR taken_at < ?) AND available_at <= ?
-		ORDER BY available_at ASC, created_at ASC, id ASC LIMIT ? OFFSET ?
-	`, o.outboxTable)); err != nil {
-		return fmt.Errorf("could not prepare select events statement: %w", err)
-	}
-
-	if o.updateTakenAtStmt, err = o.db.Prepare(fmt.Sprintf(`
-		UPDATE %s SET taken_at = ? WHERE id = ?`, o.outboxTable)); err != nil {
-		return fmt.Errorf("could not prepare update taken_at statement: %w", err)
-	}
-
-	if o.deleteEventStmt, err = o.db.Prepare(fmt.Sprintf(`DELETE FROM %s WHERE id = ?`, o.outboxTable)); err != nil {
-		return fmt.Errorf("could not prepare delete event statement: %w", err)
-	}
-
-	if o.updateHandlersStmt, err = o.db.Prepare(fmt.Sprintf(`UPDATE %s SET handlers = ? WHERE id = ?`, o.outboxTable)); err != nil {
-		return fmt.Errorf("could not prepare update handlers statement: %w", err)
-	}
-
-	if o.scheduleRetryStmt, err = o.db.Prepare(fmt.Sprintf(`
-		UPDATE %s SET retry_count = retry_count + 1, available_at = ?, taken_at = NULL WHERE id = ?`, o.outboxTable)); err != nil {
-		return fmt.Errorf("could not prepare schedule retry statement: %w", err)
-	}
+	prepare(&o.insertPublicationStmt, "insert publication", fmt.Sprintf(`
+		INSERT INTO %s (publication_id, event_type, aggregate_id, partition_key, event_blob, created_at, origin, origin_ref)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, pubs))
+	prepare(&o.insertDeliveryStmt, "insert delivery", fmt.Sprintf(`
+		INSERT INTO %s (id, publication_id, handler_type, dispatch_key, dispatch_config, event_type, aggregate_id,
+		                created_at, available_at, taken_at, retry_count, unresolved_at, legacy_outbox_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?)`, dels))
 	// ON CONFLICT makes terminal DLQ inserts idempotent under the unique key
 	// (source, outbox_id, handler_type). NULL outbox_id rows (no-match) never
 	// conflict with each other in SQLite.
-	if o.insertDeadLetterStmt, err = o.db.Prepare(fmt.Sprintf(`
-		INSERT INTO %s (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(source, outbox_id, handler_type) DO NOTHING
-	`, o.deadLetterTable)); err != nil {
-		return fmt.Errorf("could not prepare insert dead letter statement: %w", err)
-	}
-	if o.nextAvailableAtStmt, err = o.db.Prepare(fmt.Sprintf(`
+	prepare(&o.insertDeadLetterStmt, "insert dead letter", fmt.Sprintf(`
+		INSERT INTO %s (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error,
+		                retry_count, created_at, dead_at, publication_id, legacy_outbox_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(source, outbox_id, handler_type) DO NOTHING`, o.deadLetterTable))
+	// Per-key FIFO: available_at first so delayed/retry rows re-enter by
+	// eligibility time, then the stable sequence. Served entirely by
+	// idx_<dels>_claim (dispatch_key =, taken_at IS NULL, available_at range,
+	// seq order): no sort, no scan of other keys. Stale claims are reset by
+	// reclaimStale before this runs, so only taken_at IS NULL is selected.
+	// Active ids are appended as an extra NOT IN clause at call time.
+	prepare(&o.claimKeyStmt, "claim key", o.claimKeyQuery(0))
+	// Stale claims: rows claimed longer than PeriodicSweepAge ago. Range on
+	// idx_<dels>_taken_available (IS NOT NULL lower bound, < stale upper bound).
+	prepare(&o.staleClaimsStmt, "stale claims", fmt.Sprintf(`
+		SELECT id FROM %s WHERE taken_at IS NOT NULL AND taken_at < ?`, dels))
+	prepare(&o.resetStaleStmt, "reset stale claim", fmt.Sprintf(`
+		UPDATE %s SET taken_at = NULL WHERE id = ? AND taken_at IS NOT NULL AND taken_at < ?`, dels))
+	prepare(&o.sentinelsStmt, "rematch sentinels", fmt.Sprintf(`
+		SELECT d.seq, d.id, d.publication_id, '', d.event_type, d.aggregate_id, d.created_at, d.available_at, d.taken_at,
+		       d.retry_count, d.legacy_outbox_id, p.event_blob, p.partition_key
+		FROM %[1]s d INDEXED BY idx_%[1]s_sentinel JOIN %[2]s p ON p.publication_id = d.publication_id
+		WHERE d.handler_type IS NULL AND d.unresolved_at IS NULL AND d.taken_at IS NULL AND d.available_at <= ?
+		ORDER BY d.available_at ASC, d.seq ASC LIMIT ?`, dels, pubs))
+	prepare(&o.updateTakenAtStmt, "update taken_at", fmt.Sprintf(`UPDATE %s SET taken_at = ? WHERE id = ?`, dels))
+	prepare(&o.deleteDeliveryStmt, "delete delivery", fmt.Sprintf(`DELETE FROM %s WHERE id = ?`, dels))
+	prepare(&o.gcPublicationStmt, "gc publication", fmt.Sprintf(`
+		DELETE FROM %s WHERE publication_id = ? AND NOT EXISTS (SELECT 1 FROM %s WHERE publication_id = ?)`, pubs, dels))
+	// Absolute retry_count (saved outcome) so a retried finalize after an
+	// uncertain commit cannot double-increment.
+	prepare(&o.scheduleRetryStmt, "schedule retry", fmt.Sprintf(`
+		UPDATE %s SET retry_count = ?, available_at = ?, taken_at = NULL WHERE id = ?`, dels))
+	prepare(&o.releaseClaimStmt, "release claim", fmt.Sprintf(`
+		UPDATE %s SET taken_at = NULL, available_at = ? WHERE id = ?`, dels))
+	prepare(&o.markUnresolvedStmt, "mark unresolved", fmt.Sprintf(`
+		UPDATE %s SET unresolved_at = COALESCE(unresolved_at, ?), dispatch_key = NULL, taken_at = NULL WHERE id = ?`, dels))
+	// Walks idx_<dels>_available from the first row after now; due rows are
+	// skipped by the index range, not by a scan.
+	prepare(&o.nextAvailableAtStmt, "next available", fmt.Sprintf(`
 		SELECT available_at
-		FROM %s
-		WHERE (taken_at IS NULL OR taken_at < ?) AND available_at > ?
-		ORDER BY available_at ASC, id ASC LIMIT 1
-	`, o.outboxTable)); err != nil {
-		return fmt.Errorf("could not prepare next available statement: %w", err)
+		FROM %s INDEXED BY idx_%s_available
+		WHERE available_at > ?
+		  AND unresolved_at IS NULL AND (dispatch_key IS NOT NULL OR handler_type IS NULL)
+		  AND (taken_at IS NULL OR taken_at < ?)
+		ORDER BY available_at ASC, seq ASC LIMIT 1`, dels, dels))
+	return err
+}
+
+// claimKeyQuery builds the per-key claim SELECT with n placeholders for active
+// delivery ids to exclude (n == 0 → no exclusion clause).
+func (o *Outbox) claimKeyQuery(n int) string {
+	exclude := ""
+	if n > 0 {
+		exclude = " AND d.id NOT IN (?" + strings.Repeat(",?", n-1) + ")"
 	}
-	if o.resetTakenAtStmt, err = o.db.Prepare(fmt.Sprintf(`
-		UPDATE %s SET taken_at = NULL WHERE taken_at IS NOT NULL
-	`, o.outboxTable)); err != nil {
-		return fmt.Errorf("could not prepare reset taken_at statement: %w", err)
-	}
-	return nil
+	return fmt.Sprintf(`
+		SELECT d.seq, d.id, d.publication_id, d.handler_type, d.event_type, d.aggregate_id, d.created_at, d.available_at, d.taken_at,
+		       d.retry_count, d.legacy_outbox_id, p.event_blob, p.partition_key
+		FROM %s d JOIN %s p ON p.publication_id = d.publication_id
+		WHERE d.dispatch_key = ? AND d.taken_at IS NULL AND d.unresolved_at IS NULL
+		  AND d.available_at <= ?%s
+		ORDER BY d.available_at ASC, d.seq ASC LIMIT ?`, o.deliveriesTable, o.publicationsTable, exclude)
 }
 
 // HandlerType implements the HandlerType method of the eventhorizon.EventHandler interface.
@@ -495,21 +533,28 @@ func (o *Outbox) AddHandlerWithOptions(_ context.Context, m eh.EventMatcher, h e
 	return nil
 }
 
-// outboxDoc is the DB representation of an outbox entry.
-type outboxDoc struct {
-	ID          uuid.UUID
-	Event       eh.Event
-	Handlers    []string
-	CreatedAt   time.Time
-	AvailableAt time.Time
-	TakenAt     sql.NullTime
-	RetryCount  int
+// deliveryDoc is the in-memory representation of a claimed delivery row plus
+// its decoded publication payload.
+type deliveryDoc struct {
+	Seq            int64
+	ID             string
+	PublicationID  string
+	HandlerType    string // "" for a rematch sentinel
+	EventType      string
+	AggregateID    string
+	CreatedAt      time.Time
+	AvailableAt    time.Time
+	TakenAt        sql.NullTime
+	RetryCount     int
+	LegacyOutboxID sql.NullString
+	PartitionKey   string
+	EventBlob      string
+	Event          eh.Event
+	EventCtx       map[string]any
 }
 
 // HandleEvent implements the HandleEvent method of the eventhorizon.EventHandler interface.
-// Publishing requires a successful Start/StartChecked (processor running). A
-// fail-closed Start that closed registration but did not start the fetcher still
-// returns ErrOutboxNotStarted.
+// Publishing requires a successful Start/StartChecked (processor running).
 func (o *Outbox) HandleEvent(ctx context.Context, event eh.Event) error {
 	if !o.processorRunning.Load() {
 		return ErrOutboxNotStarted
@@ -519,30 +564,30 @@ func (o *Outbox) HandleEvent(ctx context.Context, event eh.Event) error {
 	if err != nil {
 		return fmt.Errorf("could not marshal event: %w", err)
 	}
-	now := time.Now()
+	now := schema.UTC(time.Now())
 	availableAt, err := availableAtFor(ctx, event, now)
 	if err != nil {
 		return err
 	}
 
-	matchingHandlers := o.matchingHandlers(event)
-	return o.storeEvent(ctx, event, eventBlob, now, availableAt, matchingHandlers)
+	matching := o.matchingHandlers(event)
+	return o.storeEvent(ctx, event, eventBlob, now, availableAt, matching)
 }
 
-func (o *Outbox) matchingHandlers(event eh.Event) []string {
+func (o *Outbox) matchingHandlers(event eh.Event) []*matcherHandler {
 	o.handlersMu.RLock()
 	defer o.handlersMu.RUnlock()
 
-	matchingHandlers := make([]string, 0)
+	matching := make([]*matcherHandler, 0)
 	for _, mh := range o.handlers {
 		if mh.Match(event) {
-			matchingHandlers = append(matchingHandlers, mh.EventHandler.HandlerType().String())
+			matching = append(matching, mh)
 		}
 	}
-	return matchingHandlers
+	return matching
 }
 
-func (o *Outbox) storeEvent(ctx context.Context, event eh.Event, eventBlob []byte, now, availableAt time.Time, matchingHandlers []string) error {
+func (o *Outbox) storeEvent(ctx context.Context, event eh.Event, eventBlob []byte, now, availableAt time.Time, matching []*matcherHandler) error {
 	tx, txOk, err := o.txForEvent(ctx)
 	if err != nil {
 		return err
@@ -551,63 +596,47 @@ func (o *Outbox) storeEvent(ctx context.Context, event eh.Event, eventBlob []byt
 		defer rollbackTx(tx)
 	}
 
-	if len(matchingHandlers) == 0 {
-		return o.storeNoMatchEvent(ctx, tx, txOk, event, eventBlob, now)
-	}
-	return o.storeMatchedEvent(ctx, tx, txOk, event, eventBlob, now, availableAt, matchingHandlers)
-}
-
-func (o *Outbox) storeNoMatchEvent(ctx context.Context, tx *sql.Tx, txOk bool, event eh.Event, eventBlob []byte, now time.Time) error {
-	if err := o.insertNoMatchDeadLetter(ctx, tx, event, eventBlob, now); err != nil {
-		return err
-	}
-	return commitOwnedTx(tx, txOk)
-}
-
-func (o *Outbox) storeMatchedEvent(ctx context.Context, tx *sql.Tx, txOk bool, event eh.Event, eventBlob []byte, now, availableAt time.Time, matchingHandlers []string) error {
-	handlersBlob, err := jsoniter.Marshal(matchingHandlers)
-	if err != nil {
-		return fmt.Errorf("could not marshal handlers: %w", err)
+	if len(matching) == 0 {
+		if err := o.insertNoMatchDeadLetter(ctx, tx, event, eventBlob, now); err != nil {
+			return err
+		}
+		return commitOwnedTx(tx, txOk)
 	}
 
-	outboxID := uuid.New()
-	if err := o.insertOutboxEvent(ctx, tx, outboxID, event, eventBlob, handlersBlob, now, availableAt); err != nil {
-		return err
+	publicationID := uuid.New().String()
+	partitionKey := eventPartitionKey(event)
+	pubStmt := tx.StmtContext(ctx, o.insertPublicationStmt)
+	defer closeStmt(pubStmt, "insert publication")
+	if _, err := pubStmt.ExecContext(ctx,
+		publicationID, event.EventType().String(), event.AggregateID().String(), partitionKey,
+		string(eventBlob), now, originPublish, sql.NullString{}); err != nil {
+		return fmt.Errorf("could not insert publication into outbox: %w", err)
+	}
+	delStmt := tx.StmtContext(ctx, o.insertDeliveryStmt)
+	defer closeStmt(delStmt, "insert delivery")
+	for _, mh := range matching {
+		key, _, _ := dispatchKeyFor(mh, partitionKey)
+		if _, err := delStmt.ExecContext(ctx,
+			uuid.New().String(), publicationID, mh.HandlerType().String(), key, dispatchConfigFor(mh),
+			event.EventType().String(), event.AggregateID().String(),
+			now, availableAt, 0, sql.NullString{}); err != nil {
+			return fmt.Errorf("could not insert delivery into outbox: %w", err)
+		}
 	}
 
 	if err := commitOwnedTx(tx, txOk); err != nil {
 		return err
 	}
-
 	if !txOk {
 		o.notify()
 	}
-
 	return nil
 }
 
-func (o *Outbox) insertOutboxEvent(ctx context.Context, tx *sql.Tx, outboxID uuid.UUID, event eh.Event, eventBlob, handlersBlob []byte, now, availableAt time.Time) error {
-	insertStmt := tx.StmtContext(ctx, o.insertEventStmt)
-	defer func() {
-		if err := insertStmt.Close(); err != nil {
-			log.Printf("eventhorizon: could not close SQLite outbox insert statement: %s", err)
-		}
-	}()
-
-	if _, err := insertStmt.ExecContext(
-		ctx,
-		outboxID.String(),
-		event.EventType().String(),
-		event.AggregateID().String(),
-		now,
-		availableAt,
-		sql.NullTime{},
-		string(handlersBlob),
-		string(eventBlob),
-	); err != nil {
-		return fmt.Errorf("could not insert event into outbox: %w", err)
+func closeStmt(stmt *sql.Stmt, what string) {
+	if err := stmt.Close(); err != nil {
+		log.Printf("eventhorizon: could not close SQLite outbox %s statement: %s", what, err)
 	}
-	return nil
 }
 
 func commitOwnedTx(tx *sql.Tx, txOk bool) error {
@@ -632,6 +661,8 @@ func (o *Outbox) txForEvent(ctx context.Context) (*sql.Tx, bool, error) {
 	return tx, false, nil
 }
 
+// availableAtFor resolves the delivery eligibility time (UTC). Metadata key
+// "outbox.available_at" wins over the context value; past values clamp to now.
 func availableAtFor(ctx context.Context, event eh.Event, now time.Time) (time.Time, error) {
 	if metadata := event.Metadata(); metadata != nil {
 		if raw, ok := metadata[metadataAvailableAtKey]; ok {
@@ -642,7 +673,7 @@ func availableAtFor(ctx context.Context, event eh.Event, now time.Time) (time.Ti
 			if availableAt.Before(now) {
 				return now, nil
 			}
-			return availableAt, nil
+			return schema.UTC(availableAt), nil
 		}
 	}
 
@@ -650,7 +681,7 @@ func availableAtFor(ctx context.Context, event eh.Event, now time.Time) (time.Ti
 		if raw.Before(now) {
 			return now, nil
 		}
-		return raw, nil
+		return schema.UTC(raw), nil
 	}
 
 	return now, nil
@@ -672,11 +703,7 @@ func parseAvailableAt(raw any) (time.Time, error) {
 
 func (o *Outbox) insertNoMatchDeadLetter(ctx context.Context, tx *sql.Tx, event eh.Event, eventBlob []byte, now time.Time) error {
 	insertStmt := tx.StmtContext(ctx, o.insertDeadLetterStmt)
-	defer func() {
-		if err := insertStmt.Close(); err != nil {
-			log.Printf("eventhorizon: could not close SQLite outbox dead letter statement: %s", err)
-		}
-	}()
+	defer closeStmt(insertStmt, "dead letter")
 
 	if _, err := insertStmt.ExecContext(
 		ctx,
@@ -692,6 +719,8 @@ func (o *Outbox) insertNoMatchDeadLetter(ctx context.Context, tx *sql.Tx, event 
 		0,
 		now,
 		now,
+		sql.NullString{},
+		sql.NullString{},
 	); err != nil {
 		return fmt.Errorf("could not insert no-match dead letter: %w", err)
 	}
@@ -732,15 +761,20 @@ func (o *Outbox) Start() {
 	}
 }
 
-// StartChecked closes handler registration, resets taken_at in one transaction,
-// then starts the fetcher only after a successful reset. On reset failure the
-// fetcher is not started and publish stays blocked (ErrOutboxNotStarted);
-// registration stays closed and a later StartChecked may retry the reset.
-// After a successful start, further calls are no-ops.
+// StartChecked closes handler registration, migrates a v1 table if present,
+// then in one startup transaction resets every taken_at, clears sentinel
+// unresolved markers and recomputes dispatch keys / unresolved state for every
+// delivery row against the current registration, and only then starts the
+// fetcher. On any failure the fetcher is not started and publish stays blocked
+// (ErrOutboxNotStarted); registration stays closed and a later StartChecked
+// may retry. After a successful start, further calls are no-ops.
 // Scope is one process per DB file; multi-process locking is not provided.
 func (o *Outbox) StartChecked() error {
+	o.startMu.Lock()
+	defer o.startMu.Unlock()
+
 	o.handlersMu.Lock()
-	// Close registration before reset so late AddHandler cannot race in.
+	// Close registration before startup work so late AddHandler cannot race in.
 	o.registrationClosed.Store(true)
 	if o.processorRunning.Load() {
 		o.handlersMu.Unlock()
@@ -748,8 +782,19 @@ func (o *Outbox) StartChecked() error {
 	}
 	o.handlersMu.Unlock()
 
-	if err := o.resetTakenAtClaims(context.Background()); err != nil {
-		return fmt.Errorf("could not reset outbox taken_at on start: %w", err)
+	ctx := context.Background()
+	if _, err := Migrate(ctx, o.db, o.outboxTable); err != nil {
+		return fmt.Errorf("could not migrate outbox schema on start: %w", err)
+	}
+	if err := verifyMigrated(ctx, o.db, o.outboxTable); err != nil {
+		return err
+	}
+	unresolved, err := o.startupReconcile(ctx)
+	if err != nil {
+		return fmt.Errorf("could not reconcile outbox deliveries on start: %w", err)
+	}
+	for handlerType, count := range unresolved {
+		o.sendError(ctx, fmt.Errorf("%w: handler %q has %d pending deliveries (left unclaimed)", ErrUnresolvedHandler, handlerType, count), nil)
 	}
 
 	o.handlersMu.Lock()
@@ -765,28 +810,119 @@ func (o *Outbox) StartChecked() error {
 	return nil
 }
 
-// resetTakenAtClaims clears durable claims left by a previous process so the
-// new process can redispatch at-least-once after crash or stop-first restart.
-func (o *Outbox) resetTakenAtClaims(ctx context.Context) error {
-	tx, err := o.db.Begin()
+// registeredDispatchKeys enumerates every key the registration can produce.
+// Caller holds handlersMu.
+func (o *Outbox) registeredDispatchKeys() []string {
+	keys := make([]string, 0, len(o.handlers))
+	for _, mh := range o.handlers {
+		handler := mh.HandlerType().String()
+		keys = append(keys, handler) // Serial, or partition fallback for an empty partition key
+		if mh.dispatchMode == PartitionByAggregate {
+			shards := mh.partitionShards
+			if shards < 1 {
+				shards = defaultPartitionShards
+			}
+			for i := range shards {
+				keys = append(keys, fmt.Sprintf("%s:%d", handler, i))
+			}
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// startupReconcile is the single fail-closed startup transaction:
+//  1. reset ALL taken_at (previous process claims are void);
+//  2. clear unresolved_at on rematch sentinels (new registration may match);
+//  3. for every delivery with a handler type: recompute dispatch_key when the
+//     registered handler's dispatch config changed or the key is NULL, mark
+//     unresolved when the handler is not registered.
+//
+// Returns unresolved delivery counts per handler type.
+func (o *Outbox) startupReconcile(ctx context.Context) (map[string]int64, error) {
+	tx, err := o.beginWriteTx(ctx)
 	if err != nil {
-		return fmt.Errorf("could not begin taken_at reset transaction: %w", err)
+		return nil, fmt.Errorf("could not begin startup transaction: %w", err)
 	}
 	defer rollbackTx(tx)
 
-	stmt := tx.StmtContext(ctx, o.resetTakenAtStmt)
-	defer func() {
-		if err := stmt.Close(); err != nil {
-			log.Printf("eventhorizon: could not close SQLite outbox reset taken_at statement: %s", err)
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET taken_at = NULL WHERE taken_at IS NOT NULL`, o.deliveriesTable)); err != nil {
+		return nil, fmt.Errorf("could not reset outbox taken_at: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET unresolved_at = NULL WHERE handler_type IS NULL AND unresolved_at IS NOT NULL`, o.deliveriesTable)); err != nil {
+		return nil, fmt.Errorf("could not reset sentinel unresolved markers: %w", err)
+	}
+
+	handlers := o.snapshotHandlersByType()
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT d.id, d.handler_type, d.dispatch_key, d.dispatch_config, d.unresolved_at, p.partition_key
+		FROM %s d JOIN %s p ON p.publication_id = d.publication_id
+		WHERE d.handler_type IS NOT NULL`, o.deliveriesTable, o.publicationsTable))
+	if err != nil {
+		return nil, fmt.Errorf("could not read deliveries for reconcile: %w", err)
+	}
+	type fix struct {
+		id, key, config string
+		unresolved      bool
+	}
+	var fixes []fix
+	unresolvedCounts := map[string]int64{}
+	for rows.Next() {
+		var (
+			id, handlerType, partitionKey string
+			key, config                   sql.NullString
+			unresolvedAt                  sql.NullTime
+		)
+		if err := rows.Scan(&id, &handlerType, &key, &config, &unresolvedAt, &partitionKey); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("could not scan delivery for reconcile: %w", err)
 		}
-	}()
-	if _, err := stmt.ExecContext(ctx); err != nil {
-		return fmt.Errorf("could not reset outbox taken_at: %w", err)
+		mh := handlers[handlerType]
+		if mh == nil {
+			unresolvedCounts[handlerType]++
+			if !unresolvedAt.Valid || key.Valid {
+				fixes = append(fixes, fix{id: id, unresolved: true})
+			}
+			continue
+		}
+		wantKey, _, _ := dispatchKeyFor(mh, partitionKey)
+		wantConfig := dispatchConfigFor(mh)
+		if !key.Valid || key.String != wantKey || !config.Valid || config.String != wantConfig || unresolvedAt.Valid {
+			fixes = append(fixes, fix{id: id, key: wantKey, config: wantConfig})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	now := schema.UTC(time.Now())
+	for _, f := range fixes {
+		if f.unresolved {
+			if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+				`UPDATE %s SET unresolved_at = COALESCE(unresolved_at, ?), dispatch_key = NULL WHERE id = ?`, o.deliveriesTable),
+				now, f.id); err != nil {
+				return nil, fmt.Errorf("could not mark delivery %s unresolved: %w", f.id, err)
+			}
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(
+			`UPDATE %s SET dispatch_key = ?, dispatch_config = ?, unresolved_at = NULL WHERE id = ?`, o.deliveriesTable),
+			f.key, f.config, f.id); err != nil {
+			return nil, fmt.Errorf("could not recompute dispatch key for delivery %s: %w", f.id, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("could not commit taken_at reset: %w", err)
+		return nil, fmt.Errorf("could not commit startup transaction: %w", err)
 	}
-	return nil
+	// The dispatch-key ring follows the registration reconciled here.
+	o.handlersMu.Lock()
+	o.claimKeys = o.registeredDispatchKeys()
+	o.handlersMu.Unlock()
+	return unresolvedCounts, nil
 }
 
 // Close stops accepting new work, lets in-flight HandleEvent calls finish and
@@ -806,15 +942,20 @@ func (o *Outbox) Close() error {
 
 	var closeErr error
 	for _, stmt := range []*sql.Stmt{
-		o.insertEventStmt,
-		o.selectEventsStmt,
-		o.updateTakenAtStmt,
-		o.deleteEventStmt,
-		o.updateHandlersStmt,
-		o.scheduleRetryStmt,
+		o.insertPublicationStmt,
+		o.insertDeliveryStmt,
 		o.insertDeadLetterStmt,
+		o.claimKeyStmt,
+		o.staleClaimsStmt,
+		o.resetStaleStmt,
+		o.sentinelsStmt,
+		o.updateTakenAtStmt,
+		o.deleteDeliveryStmt,
+		o.gcPublicationStmt,
+		o.scheduleRetryStmt,
+		o.releaseClaimStmt,
+		o.markUnresolvedStmt,
 		o.nextAvailableAtStmt,
-		o.resetTakenAtStmt,
 	} {
 		if stmt == nil {
 			continue
@@ -827,8 +968,32 @@ func (o *Outbox) Close() error {
 	return closeErr
 }
 
+// AdmissionSnapshot returns the number of admitted (in-flight) deliveries and
+// the admission limit.
+func (o *Outbox) AdmissionSnapshot() (used, limit int) {
+	return o.admission.snapshot()
+}
+
 func (o *Outbox) runContext() context.Context {
 	return doneContext{done: o.done}
+}
+
+// beginWriteTx starts a transaction and immediately takes the write lock with
+// a no-op write, before any read. A deferred transaction that reads first and
+// upgrades to a write later gets SQLITE_BUSY without the busy handler when
+// another connection committed in between; taking the lock first routes the
+// wait through _busy_timeout instead. Equivalent to BEGIN IMMEDIATE without
+// depending on the DSN's _txlock setting.
+func (o *Outbox) beginWriteTx(ctx context.Context) (*sql.Tx, error) {
+	tx, err := o.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET seq = seq WHERE seq < 0`, o.deliveriesTable)); err != nil {
+		rollbackTx(tx)
+		return nil, fmt.Errorf("could not acquire write lock: %w", err)
+	}
+	return tx, nil
 }
 
 func rollbackTx(tx *sql.Tx) {
@@ -849,7 +1014,7 @@ func (o *Outbox) runUnifiedProcessor() {
 	var timerCh <-chan time.Time
 	defer stopProcessorTimer(timer)
 
-	// Initial sweep immediately after startup reset so pending rows are claimed
+	// Initial sweep immediately after startup so pending rows are claimed
 	// without waiting for watchCh, scheduleCh, or the periodic ticker.
 	o.processUntilEmpty(context.Background())
 	o.resetProcessorTimer(timer, &timerCh)
@@ -865,8 +1030,7 @@ func (o *Outbox) runUnifiedProcessor() {
 		}
 		stopProcessorTimer(timer)
 		// Non-canceled context for in-flight work so Close can wait for the
-		// current batch (including finalize) without aborting SQL mid-flight.
-		// The loop still exits on o.done between batches.
+		// current pass without aborting SQL mid-flight.
 		o.processUntilEmpty(context.Background())
 		o.resetProcessorTimer(timer, &timerCh)
 	}
@@ -899,12 +1063,12 @@ func stopProcessorTimer(timer *time.Timer) {
 
 func (o *Outbox) nextAvailableAt(ctx context.Context) (time.Time, bool, error) {
 	var next sql.NullTime
-	now := time.Now()
-	if err := o.nextAvailableAtStmt.QueryRowContext(ctx, now.Add(-PeriodicSweepAge), now).Scan(&next); err != nil {
+	now := schema.UTC(time.Now())
+	if err := o.nextAvailableAtStmt.QueryRowContext(ctx, now, now.Add(-PeriodicSweepAge)).Scan(&next); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return time.Time{}, false, nil
 		}
-		return time.Time{}, false, fmt.Errorf("could not query next available outbox event: %w", err)
+		return time.Time{}, false, fmt.Errorf("could not query next available outbox delivery: %w", err)
 	}
 	if !next.Valid {
 		return time.Time{}, false, nil
@@ -926,7 +1090,7 @@ func (o *Outbox) processUntilEmpty(ctx context.Context) {
 		}
 
 		// Fetch is decoupled from completion: do not wait for handlers here.
-		// Coordinators notify() when they free admission slots.
+		// Deliveries notify() when they free admission slots.
 		claimed, err := o.fetchAndDispatch(ctx, false)
 		if err != nil {
 			o.sendError(ctx, err, nil)
@@ -935,8 +1099,8 @@ func (o *Outbox) processUntilEmpty(ctx context.Context) {
 		if claimed == 0 {
 			return
 		}
-
-		time.Sleep(10 * time.Millisecond)
+		// No pacing sleep: each pass does real work and stops on its own when
+		// admission is full or nothing is due; completions wake the loop.
 	}
 }
 
@@ -967,40 +1131,64 @@ func (o *Outbox) Errors() <-chan error {
 	return o.errCh
 }
 
-func (o *Outbox) scanOutboxDoc(rows *sql.Rows) (*outboxDoc, map[string]any, error) {
-	var id, eventType, aggregateID, handlersBlob, eventBlob string
-	var createdAt, availableAt, takenAt sql.NullTime
-	var retryCount int
-
-	// Fallback to not failing if the schema is old and retryCount hasn't been added yet in a result set
-	// Note: We're selecting specific columns, so we must add retry_count to the select statement.
-	if err := rows.Scan(&id, &eventType, &aggregateID, &createdAt, &availableAt, &takenAt, &handlersBlob, &eventBlob, &retryCount); err != nil {
-		return nil, nil, fmt.Errorf("could not scan row: %w", err)
+func (o *Outbox) observeAdmission() {
+	if o.admissionStats == nil {
+		return
 	}
+	used, limit := o.admission.snapshot()
+	safeDispatchObserve(func() { o.admissionStats.ObserveAdmission(used, limit) })
+}
 
-	event, _, err := o.codec.UnmarshalEvent(o.runContext(), []byte(eventBlob))
+func (o *Outbox) observeSkip(reason ClaimSkipReason, n int) {
+	if o.admissionStats == nil || n <= 0 {
+		return
+	}
+	safeDispatchObserve(func() {
+		for range n {
+			o.admissionStats.ObserveClaimSkip(reason)
+		}
+	})
+}
+
+func (o *Outbox) observeFinalize(outcome FinalizeOutcome, d time.Duration, retried bool, err error) {
+	if o.admissionStats == nil {
+		return
+	}
+	safeDispatchObserve(func() { o.admissionStats.ObserveFinalize(outcome, d, retried, err) })
+}
+
+// scanDeliveryRow scans one row of claimKeyQuery / sentinelsStmt shape and
+// decodes the payload.
+func (o *Outbox) scanDeliveryRow(rows *sql.Rows) (*deliveryDoc, error) {
+	var (
+		d           deliveryDoc
+		handlerType sql.NullString
+		createdAt   sql.NullTime
+		availableAt sql.NullTime
+	)
+	if err := rows.Scan(&d.Seq, &d.ID, &d.PublicationID, &handlerType, &d.EventType, &d.AggregateID,
+		&createdAt, &availableAt, &d.TakenAt, &d.RetryCount, &d.LegacyOutboxID, &d.EventBlob, &d.PartitionKey); err != nil {
+		return nil, fmt.Errorf("could not scan delivery row: %w", err)
+	}
+	d.HandlerType = handlerType.String
+	d.CreatedAt = createdAt.Time
+	d.AvailableAt = availableAt.Time
+	return &d, nil
+}
+
+// decodeDelivery unmarshals the payload into d.Event / d.EventCtx.
+func (o *Outbox) decodeDelivery(d *deliveryDoc) error {
+	event, _, err := o.codec.UnmarshalEvent(o.runContext(), []byte(d.EventBlob))
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not unmarshal event blob: %w", err)
+		return fmt.Errorf("could not unmarshal event blob: %w", err)
 	}
-	eventContext, err := eventContextValues([]byte(eventBlob))
+	eventCtx, err := eventContextValues([]byte(d.EventBlob))
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
-
-	var handlers []string
-	if err := jsoniter.Unmarshal([]byte(handlersBlob), &handlers); err != nil {
-		return nil, nil, fmt.Errorf("could not unmarshal handlers: %w", err)
-	}
-
-	return &outboxDoc{
-		ID:          uuid.MustParse(id),
-		Event:       event,
-		Handlers:    handlers,
-		CreatedAt:   createdAt.Time,
-		AvailableAt: availableAt.Time,
-		TakenAt:     takenAt,
-		RetryCount:  retryCount,
-	}, eventContext, nil
+	d.Event = event
+	d.EventCtx = eventCtx
+	return nil
 }
 
 func eventContextValues(eventBlob []byte) (map[string]any, error) {
@@ -1013,95 +1201,41 @@ func eventContextValues(eventBlob []byte) (map[string]any, error) {
 	return raw.Context, nil
 }
 
-type processedResult struct {
-	r                  *outboxDoc
-	successfulHandlers []string
-	failedHandlers     map[string]handlerFailure
-}
-
-type handlerFailure struct {
-	err   string
+type handlerDispatchResult struct {
+	err   error
 	fatal bool
 }
 
-type dispatchItem struct {
-	event   *outboxDoc
-	handler *matcherHandler
-}
-
-type handlerDispatchResult struct {
-	eventID     uuid.UUID
-	handlerType string
-	err         error
-	fatal       bool
-}
-
-func recordHandlerFailure(res *processedResult, handlerResult handlerDispatchResult) {
-	if _, ok := res.failedHandlers[handlerResult.handlerType]; ok {
-		return
-	}
-	res.failedHandlers[handlerResult.handlerType] = handlerFailure{
-		err:   handlerResult.err.Error(),
-		fatal: handlerResult.fatal,
-	}
-}
-
-// processBatch claims and dispatches a wave of records, then waits for those
-// records' coordinators to finalize. Used by unit tests for synchronous
-// progress. The live processor uses fetchAndDispatch without waiting.
+// processBatch claims one pass and waits for the claimed deliveries to
+// finalize. Used by unit tests for synchronous progress. The live processor
+// uses fetchAndDispatch without waiting.
 func (o *Outbox) processBatch(ctx context.Context) (int, error) {
 	return o.fetchAndDispatch(ctx, true)
 }
 
-// fetchAndDispatch admits records only when every delivery queue for the record
-// can reserve a slot, claims taken_at, then enqueues non-blocking. Partial
-// admission is per record in the fetch wave, never a partial handler set.
-// If wait is true, blocks until claimed records finalize (test helper path).
+// fetchAndDispatch runs one claim pass (round-robin over active dispatch keys
+// plus rematch sentinels) and enqueues the claimed deliveries. Returns the
+// number of deliveries claimed plus sentinels expanded (so callers loop while
+// progress is made). If wait is true, blocks until the claimed deliveries
+// finalize (test helper path).
 func (o *Outbox) fetchAndDispatch(ctx context.Context, wait bool) (int, error) {
 	if o.shuttingDown.Load() {
 		return 0, nil
 	}
 
-	planned, err := o.planAndClaim(ctx)
+	planned, expanded, err := o.claimPass(ctx)
 	if err != nil {
 		return 0, err
 	}
-	if len(planned) == 0 {
-		return 0, nil
+	for _, d := range planned {
+		o.dispatch.enqueue(d)
 	}
-
-	coords := make([]*recordCoordinator, 0, len(planned))
-	for _, p := range planned {
-		// planAndClaim only admits records with at least one delivery (including
-		// rematch of empty-handlers rows). Never claim-and-delete unmatched work.
-		if len(p.deliveries) == 0 {
-			o.admission.release(p.record.ID.String())
-			continue
-		}
-		coord := newRecordCoordinator(o, p.record, p.eventCtx, len(p.deliveries))
-		for _, d := range p.deliveries {
-			d.coord = coord
-			o.dispatch.enqueue(d)
-		}
-		coords = append(coords, coord)
-	}
-
 	if wait {
-		for _, c := range coords {
-			c.wait()
+		for _, d := range planned {
+			d.wait()
 		}
 	}
-	return len(planned), nil
-}
-
-type plannedRecord struct {
-	record     *outboxDoc
-	eventCtx   map[string]any
-	deliveries []*delivery
-	keys       []string
-	// persistHandlers is set for rematch claims so the matched handler list is
-	// written in the claim transaction before dispatch/finalize.
-	persistHandlers bool
+	return len(planned) + expanded, nil
 }
 
 func (o *Outbox) snapshotHandlersByType() map[string]*matcherHandler {
@@ -1115,28 +1249,41 @@ func (o *Outbox) snapshotHandlersByType() map[string]*matcherHandler {
 	return handlers
 }
 
-// dispatchQueueIdentity returns the internal queue key plus stable stats labels.
-// shardLabel is "none" for Serial; for partitions it is the numeric shard index
-// (never a correlation/aggregate id).
-func dispatchQueueIdentity(handler *matcherHandler, event eh.Event) (queueKey, handlerLabel, shardLabel string) {
+// dispatchKeyFor returns the queue key plus stable stats labels for a handler
+// and a publication partition key. shardLabel is "none" for Serial; for
+// partitions it is the numeric shard index (never a correlation/aggregate id).
+func dispatchKeyFor(handler *matcherHandler, partitionKey string) (queueKey, handlerLabel, shardLabel string) {
 	handlerLabel = handler.HandlerType().String()
-	if handler.dispatchMode != PartitionByAggregate {
+	if handler.dispatchMode != PartitionByAggregate || partitionKey == "" {
 		return handlerLabel, handlerLabel, serialShardLabel
 	}
-
-	partKey := eventPartitionKey(event)
-	if partKey == "" {
-		return handlerLabel, handlerLabel, serialShardLabel
-	}
-
 	shards := handler.partitionShards
 	if shards < 1 {
 		shards = defaultPartitionShards
 	}
-	shard := hashPartition(partKey, shards)
+	shard := hashPartition(partitionKey, shards)
 	shardLabel = fmt.Sprintf("%d", shard)
 	queueKey = fmt.Sprintf("%s:%s", handlerLabel, shardLabel)
 	return queueKey, handlerLabel, shardLabel
+}
+
+// dispatchConfigFor is the fingerprint stored with a delivery so a changed
+// mode/shard configuration is detected at startup.
+func dispatchConfigFor(handler *matcherHandler) string {
+	if handler.dispatchMode != PartitionByAggregate {
+		return "mode=serial"
+	}
+	shards := handler.partitionShards
+	if shards < 1 {
+		shards = defaultPartitionShards
+	}
+	return fmt.Sprintf("mode=partition;shards=%d", shards)
+}
+
+// dispatchQueueIdentity is kept for callers holding an event (tests); it is
+// dispatchKeyFor on the event's partition key.
+func dispatchQueueIdentity(handler *matcherHandler, event eh.Event) (queueKey, handlerLabel, shardLabel string) {
+	return dispatchKeyFor(handler, eventPartitionKey(event))
 }
 
 func eventPartitionKey(event eh.Event) string {
@@ -1174,320 +1321,550 @@ func hashPartition(key string, shards int) uint64 {
 	return uint64(h.Sum32()) % uint64(shards)
 }
 
-func (o *Outbox) dispatchHandler(ctx context.Context, item dispatchItem) handlerDispatchResult {
-	handlerType := item.handler.HandlerType().String()
-	if err := item.handler.HandleEvent(ctx, item.event.Event); err != nil {
+func (o *Outbox) dispatchHandler(ctx context.Context, d *delivery) handlerDispatchResult {
+	if err := d.handler.HandleEvent(ctx, d.doc.Event); err != nil {
 		severity := GetSeverity(err)
-		wrappedErr := fmt.Errorf("could not handle event (%s): %w", item.handler.HandlerType(), err)
-		o.sendError(ctx, wrappedErr, item.event.Event)
-		return handlerDispatchResult{
-			eventID:     item.event.ID,
-			handlerType: handlerType,
-			err:         wrappedErr,
-			fatal:       severity == SeverityFatal,
-		}
+		wrappedErr := fmt.Errorf("could not handle event (%s): %w", d.handler.HandlerType(), err)
+		o.sendError(ctx, wrappedErr, d.doc.Event)
+		return handlerDispatchResult{err: wrappedErr, fatal: severity == SeverityFatal}
 	}
-	return handlerDispatchResult{
-		eventID:     item.event.ID,
-		handlerType: handlerType,
-	}
+	return handlerDispatchResult{}
 }
 
-// planAndClaim pages due rows (ORDER BY available_at, created_at, id) with a
-// bounded OFFSET/LIMIT within one claim transaction until admission is full or
-// due candidates are exhausted. A full dispatch-key backlog larger than one page
-// cannot hide later idle-key rows. Never claims a record that cannot fully
-// reserve its delivery queues, and never claims a record whose stored handlers
-// cannot all be resolved.
-func (o *Outbox) planAndClaim(ctx context.Context) ([]plannedRecord, error) {
+// claimPass is one round-robin claim transaction. It never claims a delivery
+// that cannot reserve its queue slot and admission, never claims an
+// unresolved delivery, and marks deliveries whose handler no longer resolves
+// as unresolved (visible, never deleted). Rematch sentinels are expanded into
+// per-handler deliveries in the same transaction. Every reservation taken in
+// a pass is released if the pass fails.
+func (o *Outbox) claimPass(ctx context.Context) (planned []*delivery, expanded int, err error) {
+	o.claimMu.Lock()
+	defer o.claimMu.Unlock()
+
 	free := o.admission.freeSlots()
 	if free == 0 {
-		return nil, nil
-	}
-	admitCap := free
-	if admitCap > maxFetchBatch {
-		admitCap = maxFetchBatch
-	}
-	pageSize := maxFetchBatch
-	if pageSize < 1 {
-		pageSize = 1
+		o.observeSkip(SkipAdmissionFull, 1)
+		return nil, 0, nil
 	}
 
-	tx, err := o.db.Begin()
+	tx, err := o.beginWriteTx(ctx)
 	if err != nil {
-		return nil, err
+		return nil, 0, fmt.Errorf("could not begin claim transaction: %w", err)
 	}
 	defer rollbackTx(tx)
 
-	now := time.Now()
-	planned := make([]plannedRecord, 0, admitCap)
-	offset := 0
-
-	for len(planned) < admitCap {
-		candidates, eventContexts, err := o.selectEventsForProcessing(ctx, tx, now, pageSize, offset)
+	// reserved is the authoritative list of (queue reservation + admission)
+	// pairs taken in this pass. It is a separate local so an early
+	// `return nil, 0, err` (which zeroes the named result) can never hide
+	// reservations from the rollback.
+	var reserved []*delivery
+	defer func() {
 		if err != nil {
-			return nil, err
+			o.rollbackPlanned(reserved)
+			planned = nil
+			expanded = 0
 		}
-		if len(candidates) == 0 {
-			break
-		}
-		offset += len(candidates)
+	}()
 
-		for _, r := range candidates {
-			if len(planned) >= admitCap {
+	now := schema.UTC(time.Now())
+	stale := now.Add(-PeriodicSweepAge)
+	handlers := o.snapshotHandlersByType()
+
+	// Stale claims (taken_at older than PeriodicSweepAge and not admitted in
+	// this process) are reset first so the per-key selection below only needs
+	// taken_at IS NULL (index range, no OR, no sort). Rare path: in steady
+	// state the range holds at most the admitted rows.
+	if err := o.reclaimStale(ctx, tx, stale); err != nil {
+		return nil, 0, err
+	}
+
+	// Rematch sentinels are expanded BEFORE any normal claim in this pass, and
+	// all due sentinels are expanded (in bounded batches inside this
+	// transaction), so an older due sentinel can never be overtaken by a newer
+	// normal delivery on the same key. Expanded rows are claimed by the normal
+	// per-key selection below in the same pass (they are due).
+	expanded, err = o.expandSentinels(ctx, tx, now, handlers)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	keys := rotateAfter(o.claimKeys, o.claimCursor)
+
+	takenStmt := tx.StmtContext(ctx, o.updateTakenAtStmt)
+	defer closeStmt(takenStmt, "update taken_at")
+	unresolvedStmt := tx.StmtContext(ctx, o.markUnresolvedStmt)
+	defer closeStmt(unresolvedStmt, "mark unresolved")
+
+	// Rounds over the ring until admission is full or a full round claims
+	// nothing. Adaptive quantum per round: when free admission is smaller than
+	// the ring, every key gets at most one delivery per round so a lightly
+	// loaded key is served every round instead of waiting for heavy keys'
+	// full quanta; later rounds hand the remaining slots to keys that still
+	// have backlog.
+	for free > 0 {
+		perKey := max(1, min(claimQuantum, free/max(len(keys), 1)))
+		claimedThisRound := 0
+		for _, key := range keys {
+			if free <= 0 {
+				o.observeSkip(SkipAdmissionFull, 1)
 				break
 			}
-			id := r.ID.String()
-			if o.admission.contains(id) {
+			quantum := min(perKey, free, o.dispatch.freeCapacity(key))
+			if quantum <= 0 {
+				o.observeSkip(SkipQueueFull, 1)
 				continue
 			}
-			var (
-				keys       []string
-				deliveries []*delivery
-				missing    []string
-			)
-			persistHandlers := false
-			if len(r.Handlers) == 0 {
-				// Rematch contract: empty handlers means re-match against the
-				// current registration at claim time (replay of no_match DLQ).
-				keys, deliveries = o.planRematchDeliveries(r, eventContexts[id])
-				if len(deliveries) == 0 {
-					o.sendError(ctx, fmt.Errorf(
-						"outbox record %s rematch found no handlers (leaving unclaimed)",
-						id,
-					), r.Event)
-					continue
-				}
-				// Invariant: finalize remainingHandlers(r.Handlers, …) and
-				// per-handler retry/DLQ require the matched set on the record.
-				// Leaving Handlers=[] would treat any outcome as fully done and
-				// silently delete the row (including retryable failures).
-				matched := make([]string, 0, len(deliveries))
-				for _, d := range deliveries {
-					matched = append(matched, d.handler.HandlerType().String())
-				}
-				r.Handlers = matched
-				persistHandlers = true
-			} else {
-				keys, deliveries, missing = o.planDeliveries(r, eventContexts[id])
-				if len(missing) > 0 {
-					// No silent loss: leave unclaimed for operator/restart visibility.
-					o.sendError(ctx, fmt.Errorf(
-						"outbox record %s has unresolvable handlers %v (leaving unclaimed)",
-						id, missing,
-					), r.Event)
-					continue
-				}
-			}
-			// Atomic whole-record reservation: all delivery queues + coordinator.
-			if !o.dispatch.tryReserveKeys(keys, deliveries) {
-				continue
-			}
-			if !o.admission.tryAdmit(id) {
-				o.dispatch.releaseKeys(keys)
-				continue
-			}
-			planned = append(planned, plannedRecord{
-				record:          r,
-				eventCtx:        eventContexts[id],
-				deliveries:      deliveries,
-				keys:            keys,
-				persistHandlers: persistHandlers,
-			})
-		}
-
-		if len(candidates) < pageSize {
-			break // exhausted due set
-		}
-	}
-
-	if len(planned) == 0 {
-		if err := tx.Commit(); err != nil {
-			return nil, fmt.Errorf("could not commit empty admission transaction: %w", err)
-		}
-		return nil, nil
-	}
-
-	updateStmt := tx.StmtContext(ctx, o.updateTakenAtStmt)
-	defer func() { _ = updateStmt.Close() }()
-	handlersStmt := tx.StmtContext(ctx, o.updateHandlersStmt)
-	defer func() { _ = handlersStmt.Close() }()
-
-	for _, p := range planned {
-		// Persist rematched handler list in the same claim TX as taken_at so a
-		// crash after claim still has correct remaining semantics on restart.
-		if p.persistHandlers {
-			handlersBlob, err := jsoniter.Marshal(p.record.Handlers)
+			candidates, err := o.selectKeyCandidates(ctx, tx, key, now, quantum)
 			if err != nil {
-				o.rollbackPlanned(planned)
-				return nil, fmt.Errorf("could not marshal rematched handlers: %w", err)
+				return nil, 0, err
 			}
-			if _, err := handlersStmt.ExecContext(ctx, string(handlersBlob), p.record.ID.String()); err != nil {
-				o.rollbackPlanned(planned)
-				return nil, fmt.Errorf("could not persist rematched handlers: %w", err)
+			for _, doc := range candidates {
+				if free <= 0 {
+					break
+				}
+				if o.admission.contains(doc.ID) {
+					continue
+				}
+				if err := o.decodeDelivery(doc); err != nil {
+					// Visible, never silent: flag as unresolved and report.
+					if _, uerr := unresolvedStmt.ExecContext(ctx, now, doc.ID); uerr != nil {
+						return nil, 0, fmt.Errorf("could not flag undecodable delivery %s: %w", doc.ID, uerr)
+					}
+					o.observeSkip(SkipDecodeFailed, 1)
+					o.sendError(ctx, fmt.Errorf("%w: delivery %s: %v", ErrUnresolvedHandler, doc.ID, err), nil)
+					continue
+				}
+				mh := handlers[doc.HandlerType]
+				if mh == nil || !mh.Match(doc.Event) {
+					if _, uerr := unresolvedStmt.ExecContext(ctx, now, doc.ID); uerr != nil {
+						return nil, 0, fmt.Errorf("could not flag unresolved delivery %s: %w", doc.ID, uerr)
+					}
+					o.observeSkip(SkipUnresolved, 1)
+					o.sendError(ctx, fmt.Errorf("%w: delivery %s handler %q (leaving unclaimed)", ErrUnresolvedHandler, doc.ID, doc.HandlerType), doc.Event)
+					continue
+				}
+				queueKey, handlerLabel, shardLabel := dispatchKeyFor(mh, doc.PartitionKey)
+				d := newDelivery(doc, mh, queueKey, handlerLabel, shardLabel)
+				if !o.dispatch.tryReserve(d) {
+					o.observeSkip(SkipQueueFull, 1)
+					break
+				}
+				if !o.admission.tryAdmitKey(doc.ID, queueKey) {
+					o.dispatch.releaseReserve(queueKey)
+					o.observeSkip(SkipAdmissionFull, 1)
+					break
+				}
+				reserved = append(reserved, d)
+				if _, err := takenStmt.ExecContext(ctx, now, doc.ID); err != nil {
+					return nil, 0, fmt.Errorf("could not claim delivery %s: %w", doc.ID, err)
+				}
+				doc.TakenAt = sql.NullTime{Time: now, Valid: true}
+				planned = append(planned, d)
+				free--
+				claimedThisRound++
 			}
+			o.claimCursor = key
 		}
-		if _, err := updateStmt.ExecContext(ctx, now, p.record.ID.String()); err != nil {
-			o.rollbackPlanned(planned)
-			return nil, err
+		if claimedThisRound == 0 {
+			break
 		}
+		keys = rotateAfter(o.claimKeys, o.claimCursor)
 	}
 
+	if len(planned) == 0 && expanded == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, 0, fmt.Errorf("could not commit empty claim transaction: %w", err)
+		}
+		return nil, 0, nil
+	}
+	if o.beforeClaimCommit != nil {
+		if err := o.beforeClaimCommit(len(reserved)); err != nil {
+			return nil, 0, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
-		o.rollbackPlanned(planned)
-		return nil, fmt.Errorf("could not commit transaction locking events: %w", err)
+		return nil, 0, fmt.Errorf("could not commit claim transaction: %w", err)
 	}
-
-	return planned, nil
+	o.observeAdmission()
+	return planned, expanded, nil
 }
 
-func (o *Outbox) rollbackPlanned(planned []plannedRecord) {
-	for _, p := range planned {
-		o.dispatch.releaseKeys(p.keys)
-		o.admission.release(p.record.ID.String())
+func (o *Outbox) rollbackPlanned(planned []*delivery) {
+	for _, d := range planned {
+		o.dispatch.releaseReserve(d.queueKey)
+		o.admission.release(d.doc.ID)
 	}
+	o.observeAdmission()
 }
 
-func (o *Outbox) selectEventsForProcessing(ctx context.Context, tx *sql.Tx, now time.Time, limit, offset int) ([]*outboxDoc, map[string]map[string]any, error) {
-	if limit < 1 {
-		limit = 1
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	stmt := tx.StmtContext(ctx, o.selectEventsStmt)
-	defer func() { _ = stmt.Close() }()
-
-	rows, err := stmt.QueryContext(ctx, now.Add(-PeriodicSweepAge), now, limit, offset)
+// reclaimStale resets taken_at on deliveries claimed before stale that are
+// not admitted in this process (crash leftovers are already reset at start;
+// this covers FinalizeStuck rows and any future multi-start edge). An
+// actively executing delivery is never reset.
+func (o *Outbox) reclaimStale(ctx context.Context, tx *sql.Tx, stale time.Time) error {
+	stmt := tx.StmtContext(ctx, o.staleClaimsStmt)
+	defer closeStmt(stmt, "stale claims")
+	rows, err := stmt.QueryContext(ctx, stale)
 	if err != nil {
-		return nil, nil, err
+		return fmt.Errorf("could not list stale claims: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	eventsToProcess := make([]*outboxDoc, 0)
-	eventContexts := make(map[string]map[string]any)
+	var ids []string
 	for rows.Next() {
-		r, eventCtx, err := o.scanOutboxDoc(rows)
-		if err != nil {
-			return nil, nil, err
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return err
 		}
-		eventContexts[r.ID.String()] = eventCtx
-		eventsToProcess = append(eventsToProcess, r)
+		if !o.admission.contains(id) {
+			ids = append(ids, id)
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, err
+		_ = rows.Close()
+		return err
 	}
-	return eventsToProcess, eventContexts, nil
+	_ = rows.Close()
+	if len(ids) == 0 {
+		return nil
+	}
+	reset := tx.StmtContext(ctx, o.resetStaleStmt)
+	defer closeStmt(reset, "reset stale claim")
+	for _, id := range ids {
+		if _, err := reset.ExecContext(ctx, id, stale); err != nil {
+			return fmt.Errorf("could not reset stale claim %s: %w", id, err)
+		}
+	}
+	return nil
 }
 
-func (o *Outbox) updateEventDB(ctx context.Context, res processedResult) {
-	r := res.r
-	// Admission is released by the record coordinator after finalize (or abandon).
+// rotateAfter returns keys (sorted) rotated so iteration starts with the first
+// key greater than cursor (round-robin across passes).
+func rotateAfter(keys []string, cursor string) []string {
+	if len(keys) < 2 || cursor == "" {
+		return keys
+	}
+	i := sort.SearchStrings(keys, cursor)
+	if i < len(keys) && keys[i] == cursor {
+		i++
+	}
+	if i >= len(keys) || i == 0 {
+		return keys
+	}
+	rotated := make([]string, 0, len(keys))
+	rotated = append(rotated, keys[i:]...)
+	rotated = append(rotated, keys[:i]...)
+	return rotated
+}
 
-	successful := stringSet(res.successfulHandlers)
-	terminalFailures, retryableFailures := o.classifyFailures(r, res.failedHandlers)
-	// Terminal handlers are always removed on successful finalize; partial DLQ
-	// success is no longer possible because inserts share the same transaction.
-	remaining := remainingHandlers(r.Handlers, successful, stringSetFromMap(terminalFailures))
-	intendedRemainingForDLQ := remaining
+func (o *Outbox) selectKeyCandidates(ctx context.Context, tx *sql.Tx, key string, now time.Time, limit int) ([]*deliveryDoc, error) {
+	active := o.admission.idsForKey(key)
+	args := make([]any, 0, 3+len(active))
+	args = append(args, key, now)
+	for _, id := range active {
+		args = append(args, id)
+	}
+	args = append(args, limit)
 
-	pending, err := o.finalizeEvent(ctx, r, terminalFailures, intendedRemainingForDLQ, remaining, len(retryableFailures) > 0)
+	var rows *sql.Rows
+	var err error
+	if len(active) == 0 {
+		stmt := tx.StmtContext(ctx, o.claimKeyStmt)
+		defer closeStmt(stmt, "claim key")
+		rows, err = stmt.QueryContext(ctx, args...)
+	} else {
+		rows, err = tx.QueryContext(ctx, o.claimKeyQuery(len(active)), args...)
+	}
 	if err != nil {
-		o.sendError(ctx, err, r.Event)
+		return nil, fmt.Errorf("could not select deliveries for key %s: %w", key, err)
+	}
+	defer rows.Close()
+	var docs []*deliveryDoc
+	for rows.Next() {
+		doc, err := o.scanDeliveryRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		docs = append(docs, doc)
+	}
+	return docs, rows.Err()
+}
+
+// expandSentinels replaces due rematch sentinels (handler_type NULL) with one
+// delivery per currently matching handler. A sentinel that matches nothing is
+// flagged unresolved (cleared again at next start) and reported.
+func (o *Outbox) expandSentinels(ctx context.Context, tx *sql.Tx, now time.Time, handlers map[string]*matcherHandler) (int, error) {
+	_ = handlers
+	stmt := tx.StmtContext(ctx, o.sentinelsStmt)
+	defer closeStmt(stmt, "rematch sentinels")
+	unresolvedStmt := tx.StmtContext(ctx, o.markUnresolvedStmt)
+	defer closeStmt(unresolvedStmt, "mark unresolved")
+	deleteStmt := tx.StmtContext(ctx, o.deleteDeliveryStmt)
+	defer closeStmt(deleteStmt, "delete delivery")
+	insertStmt := tx.StmtContext(ctx, o.insertDeliveryStmt)
+	defer closeStmt(insertStmt, "insert delivery")
+
+	o.handlersMu.RLock()
+	ordered := append([]*matcherHandler(nil), o.handlers...)
+	o.handlersMu.RUnlock()
+
+	expanded := 0
+	for {
+		// Each batch removes or flags every sentinel it reads, so the loop
+		// terminates once no due, unflagged sentinel remains.
+		batch, err := o.selectSentinels(ctx, stmt, now)
+		if err != nil {
+			return expanded, err
+		}
+		if len(batch) == 0 {
+			return expanded, nil
+		}
+		n, err := o.expandSentinelBatch(ctx, batch, ordered, now, unresolvedStmt, deleteStmt, insertStmt)
+		expanded += n
+		if err != nil {
+			return expanded, err
+		}
+	}
+}
+
+func (o *Outbox) selectSentinels(ctx context.Context, stmt *sql.Stmt, now time.Time) ([]*deliveryDoc, error) {
+	rows, err := stmt.QueryContext(ctx, now, claimQuantum)
+	if err != nil {
+		return nil, fmt.Errorf("could not select rematch sentinels: %w", err)
+	}
+	defer rows.Close()
+	var sentinels []*deliveryDoc
+	for rows.Next() {
+		doc, err := o.scanDeliveryRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		sentinels = append(sentinels, doc)
+	}
+	return sentinels, rows.Err()
+}
+
+func (o *Outbox) expandSentinelBatch(ctx context.Context, sentinels []*deliveryDoc, ordered []*matcherHandler, now time.Time, unresolvedStmt, deleteStmt, insertStmt *sql.Stmt) (int, error) {
+	expanded := 0
+	for _, doc := range sentinels {
+		if err := o.decodeDelivery(doc); err != nil {
+			if _, uerr := unresolvedStmt.ExecContext(ctx, now, doc.ID); uerr != nil {
+				return 0, fmt.Errorf("could not flag undecodable sentinel %s: %w", doc.ID, uerr)
+			}
+			o.observeSkip(SkipDecodeFailed, 1)
+			o.sendError(ctx, fmt.Errorf("%w: sentinel %s: %v", ErrUnresolvedHandler, doc.ID, err), nil)
+			continue
+		}
+		var matched []*matcherHandler
+		for _, mh := range ordered {
+			if mh != nil && mh.Match(doc.Event) {
+				matched = append(matched, mh)
+			}
+		}
+		if len(matched) == 0 {
+			if _, uerr := unresolvedStmt.ExecContext(ctx, now, doc.ID); uerr != nil {
+				return 0, fmt.Errorf("could not flag unmatched sentinel %s: %w", doc.ID, uerr)
+			}
+			o.observeSkip(SkipRematchNoMatch, 1)
+			o.sendError(ctx, fmt.Errorf("%w: rematch of delivery %s found no handlers (leaving unclaimed)", ErrUnresolvedHandler, doc.ID), doc.Event)
+			continue
+		}
+		if _, err := deleteStmt.ExecContext(ctx, doc.ID); err != nil {
+			return 0, fmt.Errorf("could not remove rematch sentinel %s: %w", doc.ID, err)
+		}
+		for _, mh := range matched {
+			key, _, _ := dispatchKeyFor(mh, doc.PartitionKey)
+			if _, err := insertStmt.ExecContext(ctx,
+				uuid.New().String(), doc.PublicationID, mh.HandlerType().String(), key, dispatchConfigFor(mh),
+				doc.EventType, doc.AggregateID, schema.UTC(doc.CreatedAt), schema.UTC(doc.AvailableAt), 0, doc.LegacyOutboxID); err != nil {
+				return 0, fmt.Errorf("could not insert rematched delivery for %s: %w", doc.ID, err)
+			}
+		}
+		expanded++
+	}
+	return expanded, nil
+}
+
+// abandonDelivery is called for queued deliveries at shutdown: the row keeps
+// taken_at and is redelivered after the next startup reset.
+func (o *Outbox) abandonDelivery(d *delivery) {
+	if d.abandoned.Swap(true) {
 		return
 	}
-	if len(terminalFailures) > 0 {
-		o.sendError(ctx, errEventHandlerMovedToDeadLetters, r.Event)
+	o.admission.release(d.doc.ID)
+	o.observeAdmission()
+	d.finish()
+}
+
+// executeDelivery runs one claimed delivery end to end: global permit, handler,
+// finalize with the saved outcome, admission release, fetcher wake-up.
+func (o *Outbox) executeDelivery(d *delivery) {
+	if d.abandoned.Load() {
+		return
 	}
-	o.exportDeadLetters(ctx, r.Event, pending)
-	if len(retryableFailures) > 0 {
+	// Global HandleEvent permit (FIFO fair across dispatch keys).
+	if err := o.handleSem.acquire(o.runContext()); err != nil {
+		o.abandonDelivery(d)
+		return
+	}
+	if o.shuttingDown.Load() {
+		o.handleSem.release()
+		o.abandonDelivery(d)
+		return
+	}
+
+	handlerLabel := d.handlerLabel
+	shardLabel := d.shardLabel
+	if o.dispatch != nil {
+		o.dispatch.addInFlight(handlerLabel, shardLabel, 1)
+	}
+	eventCtx := eh.UnmarshalContext(context.Background(), d.doc.EventCtx)
+	res := o.dispatchHandler(eventCtx, d)
+	if o.dispatch != nil {
+		o.dispatch.addInFlight(handlerLabel, shardLabel, -1)
+	}
+	o.handleSem.release()
+
+	o.finalizeDelivery(context.Background(), d, res)
+	o.admission.release(d.doc.ID)
+	o.observeAdmission()
+	d.finish()
+	// Wake fetcher after completion (decoupled from claim).
+	o.notify()
+}
+
+// finalizeDelivery commits the saved handler outcome for one delivery:
+// completed → delete (+ publication GC); retryable → retry_count+1 and
+// available_at backoff; fatal/exhausted → dead letter + delete. Finalize SQL
+// failures are retried with the same outcome (bounded backoff); the handler is
+// never re-run. After exhaustion the claim is released so the delivery becomes
+// eligible again after PeriodicSweepAge; if release fails too, the taken_at
+// timeout recovers the row later (FinalizeStuck).
+func (o *Outbox) finalizeDelivery(ctx context.Context, d *delivery, res handlerDispatchResult) {
+	started := time.Now()
+	outcome := FinalizeCompleted
+	reason := ""
+	if res.err != nil {
+		reason = res.err.Error()
+		if res.fatal || d.doc.RetryCount >= o.maxRetries {
+			outcome = FinalizeDeadLetter
+		} else {
+			outcome = FinalizeRetry
+		}
+	}
+
+	var (
+		pending []dl.Record
+		err     error
+		retried bool
+	)
+	attempts := 1 + len(finalizeRetryDelays)
+	for attempt := 1; attempt <= attempts; attempt++ {
+		pending, err = o.finalizeTx(ctx, d.doc, outcome, reason, attempt)
+		if err == nil {
+			break
+		}
+		if attempt < attempts {
+			retried = true
+			delay := finalizeRetryDelays[attempt-1]
+			o.finalizeSleep(delay)
+		}
+	}
+	if err != nil {
+		o.sendError(ctx, fmt.Errorf("could not finalize delivery %s (%s) after %d attempts: %w", d.doc.ID, outcome, attempts, err), d.doc.Event)
+		releaseErr := o.releaseClaim(ctx, d.doc)
+		if releaseErr != nil {
+			o.sendError(ctx, fmt.Errorf("%w: delivery %s: %v", ErrFinalizeStuck, d.doc.ID, releaseErr), d.doc.Event)
+			o.observeFinalize(FinalizeStuck, time.Since(started), retried, releaseErr)
+			return
+		}
+		o.observeFinalize(FinalizeReleased, time.Since(started), retried, err)
+		o.notifySchedule()
+		return
+	}
+
+	o.observeFinalize(outcome, time.Since(started), retried, nil)
+	switch outcome {
+	case FinalizeDeadLetter:
+		o.sendError(ctx, errEventHandlerMovedToDeadLetters, d.doc.Event)
+		o.exportDeadLetters(ctx, d.doc.Event, pending)
+	case FinalizeRetry:
 		// Wake the delayed-dispatch timer after a committed retry schedule.
 		o.notifySchedule()
 	}
 }
 
-func (o *Outbox) classifyFailures(r *outboxDoc, failures map[string]handlerFailure) (map[string]handlerFailure, map[string]handlerFailure) {
-	terminalFailures := make(map[string]handlerFailure)
-	retryableFailures := make(map[string]handlerFailure)
-	for handlerType, failure := range failures {
-		if failure.fatal || r.RetryCount >= o.maxRetries {
-			terminalFailures[handlerType] = failure
-			continue
-		}
-		retryableFailures[handlerType] = failure
-	}
-	return terminalFailures, retryableFailures
-}
-
-// finalizeEvent commits DLQ rows, handler list updates (or delete), and retry
-// fields in a single transaction. File export is intentionally deferred to the
-// caller so it only runs after a successful commit.
-func (o *Outbox) finalizeEvent(
-	ctx context.Context,
-	r *outboxDoc,
-	terminalFailures map[string]handlerFailure,
-	intendedRemainingHandlers []string,
-	remaining []string,
-	scheduleRetry bool,
-) ([]dl.Record, error) {
-	tx, err := o.db.Begin()
+func (o *Outbox) finalizeTx(ctx context.Context, doc *deliveryDoc, outcome FinalizeOutcome, reason string, attempt int) ([]dl.Record, error) {
+	tx, err := o.beginWriteTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("could not begin finalize transaction: %w", err)
 	}
 	defer rollbackTx(tx)
 
-	pending := make([]dl.Record, 0, len(terminalFailures))
-	for handlerType, failure := range terminalFailures {
-		record, err := o.insertOutboxDeadLetterTx(ctx, tx, r, handlerType, intendedRemainingHandlers, failure.err)
+	var pending []dl.Record
+	switch outcome {
+	case FinalizeCompleted:
+		if err := o.deleteDeliveryTx(ctx, tx, doc); err != nil {
+			return nil, err
+		}
+	case FinalizeRetry:
+		nextRetryCount := doc.RetryCount + 1
+		availableAt := schema.UTC(time.Now().Add(o.retryBackoff.DelayFunc(int64(nextRetryCount))))
+		stmt := tx.StmtContext(ctx, o.scheduleRetryStmt)
+		defer closeStmt(stmt, "schedule retry")
+		if _, err := stmt.ExecContext(ctx, nextRetryCount, availableAt, doc.ID); err != nil {
+			return nil, fmt.Errorf("could not schedule delivery retry: %w", err)
+		}
+	case FinalizeDeadLetter:
+		record, err := o.insertOutboxDeadLetterTx(ctx, tx, doc, reason)
 		if err != nil {
 			return nil, err
 		}
 		pending = append(pending, record)
+		if err := o.deleteDeliveryTx(ctx, tx, doc); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unknown finalize outcome %q", outcome)
 	}
 
-	if len(remaining) == 0 {
-		deleteStmt := tx.StmtContext(ctx, o.deleteEventStmt)
-		defer func() {
-			if err := deleteStmt.Close(); err != nil {
-				log.Printf("eventhorizon: could not close SQLite outbox delete statement: %s", err)
-			}
-		}()
-		if _, err := deleteStmt.ExecContext(ctx, r.ID.String()); err != nil {
-			return nil, fmt.Errorf("could not delete fully processed event: %w", err)
-		}
-	} else {
-		newHandlersBlob, err := jsoniter.Marshal(remaining)
-		if err != nil {
-			return nil, fmt.Errorf("could not marshal remaining handlers: %w", err)
-		}
-		updateStmt := tx.StmtContext(ctx, o.updateHandlersStmt)
-		defer func() {
-			if err := updateStmt.Close(); err != nil {
-				log.Printf("eventhorizon: could not close SQLite outbox update handlers statement: %s", err)
-			}
-		}()
-		if _, err := updateStmt.ExecContext(ctx, string(newHandlersBlob), r.ID.String()); err != nil {
-			return nil, fmt.Errorf("could not update remaining handlers: %w", err)
-		}
-		if scheduleRetry {
-			nextRetryCount := r.RetryCount + 1
-			availableAt := time.Now().Add(o.retryBackoff.DelayFunc(int64(nextRetryCount)))
-			retryStmt := tx.StmtContext(ctx, o.scheduleRetryStmt)
-			defer func() {
-				if err := retryStmt.Close(); err != nil {
-					log.Printf("eventhorizon: could not close SQLite outbox schedule retry statement: %s", err)
-				}
-			}()
-			if _, err := retryStmt.ExecContext(ctx, availableAt, r.ID.String()); err != nil {
-				return nil, fmt.Errorf("could not schedule event retry: %w", err)
-			}
+	if o.beforeFinalizeCommit != nil {
+		if err := o.beforeFinalizeCommit(doc.ID, attempt); err != nil {
+			return nil, err
 		}
 	}
-
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("could not commit finalize transaction: %w", err)
 	}
 	return pending, nil
+}
+
+func (o *Outbox) deleteDeliveryTx(ctx context.Context, tx *sql.Tx, doc *deliveryDoc) error {
+	deleteStmt := tx.StmtContext(ctx, o.deleteDeliveryStmt)
+	defer closeStmt(deleteStmt, "delete delivery")
+	if _, err := deleteStmt.ExecContext(ctx, doc.ID); err != nil {
+		return fmt.Errorf("could not delete finalized delivery: %w", err)
+	}
+	gcStmt := tx.StmtContext(ctx, o.gcPublicationStmt)
+	defer closeStmt(gcStmt, "gc publication")
+	if _, err := gcStmt.ExecContext(ctx, doc.PublicationID, doc.PublicationID); err != nil {
+		return fmt.Errorf("could not garbage collect publication: %w", err)
+	}
+	return nil
+}
+
+// releaseClaim is the safe fallback after finalize exhaustion: the delivery
+// becomes claimable again after PeriodicSweepAge without touching retry_count.
+func (o *Outbox) releaseClaim(ctx context.Context, doc *deliveryDoc) error {
+	if o.beforeReleaseClaim != nil {
+		if err := o.beforeReleaseClaim(doc.ID); err != nil {
+			return err
+		}
+	}
+	availableAt := schema.UTC(time.Now().Add(PeriodicSweepAge))
+	if _, err := o.releaseClaimStmt.ExecContext(ctx, availableAt, doc.ID); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (o *Outbox) exportDeadLetters(ctx context.Context, event eh.Event, pending []dl.Record) {
@@ -1512,7 +1889,7 @@ func (o *Outbox) exportDeadLetters(ctx context.Context, event eh.Event, pending 
 			o.sendError(ctx, fmt.Errorf("could not export outbox dead letter: %w", err), event)
 			continue
 		}
-		if err := o.markDeadLetterExported(ctx, resolved.ID, time.Now()); err != nil {
+		if err := o.markDeadLetterExported(ctx, resolved.ID, schema.UTC(time.Now())); err != nil {
 			o.sendError(ctx, fmt.Errorf("could not mark outbox dead letter exported: %w", err), event)
 		}
 	}
@@ -1524,9 +1901,11 @@ func (o *Outbox) exportDeadLetters(ctx context.Context, event eh.Event, pending 
 func (o *Outbox) loadDeadLetter(ctx context.Context, source, outboxID, handlerType string) (dl.Record, bool, error) {
 	var record dl.Record
 	var exportedAt sql.NullTime
+	var publicationID, legacyOutboxID sql.NullString
 	err := o.db.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT id, source, event_type, aggregate_id, handler_type, outbox_id,
-		       remaining_handlers, blob, error, retry_count, created_at, dead_at, exported_at
+		       remaining_handlers, blob, error, retry_count, created_at, dead_at, exported_at,
+		       publication_id, legacy_outbox_id
 		FROM %s
 		WHERE source = ? AND outbox_id = ? AND handler_type = ?
 	`, o.deadLetterTable), source, outboxID, handlerType).Scan(
@@ -1543,6 +1922,8 @@ func (o *Outbox) loadDeadLetter(ctx context.Context, source, outboxID, handlerTy
 		&record.CreatedAt,
 		&record.DeadAt,
 		&exportedAt,
+		&publicationID,
+		&legacyOutboxID,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return dl.Record{}, false, nil
@@ -1554,69 +1935,34 @@ func (o *Outbox) loadDeadLetter(ctx context.Context, source, outboxID, handlerTy
 		t := exportedAt.Time
 		record.ExportedAt = &t
 	}
+	record.PublicationID = publicationID.String
+	record.LegacyOutboxID = legacyOutboxID.String
 	return record, true, nil
 }
 
-func stringSet(values []string) map[string]bool {
-	set := make(map[string]bool, len(values))
-	for _, value := range values {
-		set[value] = true
-	}
-	return set
-}
-
-func stringSetFromMap[T any](values map[string]T) map[string]bool {
-	set := make(map[string]bool, len(values))
-	for value := range values {
-		set[value] = true
-	}
-	return set
-}
-
-func remainingHandlers(requiredHandlers []string, successful, removed map[string]bool) []string {
-	remaining := make([]string, 0, len(requiredHandlers))
-	for _, required := range requiredHandlers {
-		if successful[required] || removed[required] {
-			continue
-		}
-		remaining = append(remaining, required)
-	}
-	return remaining
-}
-
-func (o *Outbox) insertOutboxDeadLetterTx(ctx context.Context, tx *sql.Tx, r *outboxDoc, handlerType string, remainingHandlers []string, reason string) (dl.Record, error) {
-	eventBlob, err := o.codec.MarshalEvent(ctx, r.Event)
-	if err != nil {
-		return dl.Record{}, fmt.Errorf("could not marshal dead letter event: %w", err)
-	}
-	remainingHandlersBlob, err := jsoniter.Marshal(remainingHandlers)
-	if err != nil {
-		return dl.Record{}, fmt.Errorf("could not marshal dead letter handlers: %w", err)
-	}
+func (o *Outbox) insertOutboxDeadLetterTx(ctx context.Context, tx *sql.Tx, doc *deliveryDoc, reason string) (dl.Record, error) {
 	if reason == "" {
 		reason = "max retries reached or fatal handler error"
 	}
-	now := time.Now()
+	now := schema.UTC(time.Now())
 	record := dl.Record{
 		ID:                uuid.New().String(),
 		Source:            "outbox",
-		EventType:         r.Event.EventType().String(),
-		AggregateID:       r.Event.AggregateID().String(),
-		HandlerType:       handlerType,
-		OutboxID:          r.ID.String(),
-		RemainingHandlers: string(remainingHandlersBlob),
-		Blob:              string(eventBlob),
+		EventType:         doc.EventType,
+		AggregateID:       doc.AggregateID,
+		HandlerType:       doc.HandlerType,
+		OutboxID:          doc.ID,
+		RemainingHandlers: "[]",
+		Blob:              doc.EventBlob,
 		Error:             reason,
-		RetryCount:        r.RetryCount,
-		CreatedAt:         r.CreatedAt,
+		RetryCount:        doc.RetryCount,
+		CreatedAt:         schema.UTC(doc.CreatedAt),
 		DeadAt:            now,
+		PublicationID:     doc.PublicationID,
+		LegacyOutboxID:    doc.LegacyOutboxID.String,
 	}
 	insertStmt := tx.StmtContext(ctx, o.insertDeadLetterStmt)
-	defer func() {
-		if err := insertStmt.Close(); err != nil {
-			log.Printf("eventhorizon: could not close SQLite outbox dead letter statement: %s", err)
-		}
-	}()
+	defer closeStmt(insertStmt, "dead letter")
 	if _, err := insertStmt.ExecContext(ctx,
 		record.ID,
 		record.Source,
@@ -1630,14 +1976,23 @@ func (o *Outbox) insertOutboxDeadLetterTx(ctx context.Context, tx *sql.Tx, r *ou
 		record.RetryCount,
 		record.CreatedAt,
 		record.DeadAt,
+		nullString(record.PublicationID),
+		nullString(record.LegacyOutboxID),
 	); err != nil {
 		return dl.Record{}, fmt.Errorf("could not insert outbox dead letter: %w", err)
 	}
 	return record, nil
 }
 
+func nullString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
+}
+
 func (o *Outbox) markDeadLetterExported(ctx context.Context, id string, exportedAt time.Time) error {
-	if _, err := o.db.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET exported_at = ? WHERE id = ?`, o.deadLetterTable), exportedAt, id); err != nil {
+	if _, err := o.db.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET exported_at = ? WHERE id = ?`, o.deadLetterTable), schema.UTC(exportedAt), id); err != nil {
 		return err
 	}
 	return nil

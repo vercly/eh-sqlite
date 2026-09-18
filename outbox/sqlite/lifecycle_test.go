@@ -17,8 +17,33 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	eh "github.com/vercly/eventhorizon"
 	"github.com/vercly/eventhorizon/mocks"
-	"github.com/vercly/eventhorizon/uuid"
 )
+
+// lcResolveSerial stamps dispatch_key/dispatch_config for a Serial handler on
+// one delivery without running the whole startup reconcile (which would also
+// clear taken_at on rows that are currently in flight). Used for rows seeded
+// while an earlier batch is still executing.
+func lcResolveSerial(t testing.TB, o *Outbox, deliveryID, handlerType string) {
+	t.Helper()
+	if _, err := o.db.Exec(fmt.Sprintf(
+		`UPDATE %s SET dispatch_key = ?, dispatch_config = 'mode=serial', unresolved_at = NULL WHERE id = ?`,
+		o.deliveriesTable), handlerType, deliveryID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// lcCountTaken returns (claimed, unclaimed) delivery counts.
+func lcCountTaken(t testing.TB, o *Outbox) (claimed, unclaimed int) {
+	t.Helper()
+	for _, row := range listDeliveries(t, o) {
+		if row.TakenAt.Valid {
+			claimed++
+			continue
+		}
+		unclaimed++
+	}
+	return claimed, unclaimed
+}
 
 func TestOutboxStartResetsTakenAt(t *testing.T) {
 	db := newTestDB(t)
@@ -35,11 +60,16 @@ func TestOutboxStartResetsTakenAt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id := uuid.New().String()
-	// Fresh taken_at would block processBatch without Start reset / sweep age.
-	seedOutboxEventWithID(t, db, o, id, newTestEvent("reset"), []string{handler.Type}, time.Now(), time.Now(), sql.NullTime{Time: time.Now(), Valid: true})
+	// A fresh taken_at would block the claim without the startup reset.
+	createdAt := time.Now().Add(-time.Minute)
+	insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("reset"),
+		HandlerType: handler.Type,
+		CreatedAt:   createdAt,
+		TakenAt:     time.Now(),
+	})
 
-	// Start must initial-sweep after reset without an external notify.
+	// Start must reset taken_at and initial-sweep without an external notify.
 	if err := o.StartChecked(); err != nil {
 		t.Fatal(err)
 	}
@@ -47,15 +77,9 @@ func TestOutboxStartResetsTakenAt(t *testing.T) {
 	if !handler.Wait(3 * time.Second) {
 		t.Fatal("handler should run after Start clears taken_at")
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if outboxRowCount(t, db) == 0 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows after Start reset = %d, want 0", got)
+	waitUntil(t, 3*time.Second, func() bool { return countDeliveries(t, o) == 0 })
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publications after delivery completed = %d, want 0", got)
 	}
 }
 
@@ -80,9 +104,11 @@ func TestOutboxAddHandlerAfterStartFails(t *testing.T) {
 	}
 }
 
-// TestOutboxStartCheckedFailClosedOnResetAbort proves D1 fail-closed startup:
-// reset failure returns error, fetcher never runs, registration stays closed,
-// and a later StartChecked after removing the fault succeeds.
+// TestOutboxStartCheckedFailClosedOnResetAbort proves the fail-closed startup:
+// the single startup transaction (startupReconcile) cannot commit, so
+// StartChecked returns an error, the fetcher never runs, registration stays
+// closed, publish stays blocked with ErrOutboxNotStarted, and a later
+// StartChecked after removing the fault succeeds.
 func TestOutboxStartCheckedFailClosedOnResetAbort(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -97,19 +123,23 @@ func TestOutboxStartCheckedFailClosedOnResetAbort(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id := uuid.New().String()
-	seedOutboxEventWithID(t, db, o, id, newTestEvent("reset-abort"), []string{handler.Type},
-		time.Now().Add(-time.Minute), time.Now().Add(-time.Minute),
-		sql.NullTime{Time: time.Now(), Valid: true})
+	createdAt := time.Now().Add(-time.Minute)
+	insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("reset-abort"),
+		HandlerType: handler.Type,
+		CreatedAt:   createdAt,
+		TakenAt:     time.Now(),
+	})
 
-	if _, err := db.Exec(`
-		CREATE TRIGGER abort_taken_at_reset
-		BEFORE UPDATE OF taken_at ON outbox
+	// The startup transaction resets taken_at on every delivery; abort it.
+	if _, err := db.Exec(fmt.Sprintf(`
+		CREATE TRIGGER lc_abort_taken_at_reset
+		BEFORE UPDATE OF taken_at ON %s
 		WHEN NEW.taken_at IS NULL AND OLD.taken_at IS NOT NULL
 		BEGIN
 			SELECT RAISE(ABORT, 'forced reset abort');
 		END
-	`); err != nil {
+	`, o.deliveriesTable)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -136,11 +166,14 @@ func TestOutboxStartCheckedFailClosedOnResetAbort(t *testing.T) {
 	if handler.Wait(50 * time.Millisecond) {
 		t.Fatal("handler must not run when fetcher did not start")
 	}
-	if got := outboxRowCount(t, db); got != 1 {
-		t.Fatalf("outbox rows = %d, want 1 (unprocessed after failed start)", got)
+	if got := countDeliveries(t, o); got != 1 {
+		t.Fatalf("deliveries = %d, want 1 (unprocessed after failed start)", got)
+	}
+	if got := countPublications(t, o); got != 1 {
+		t.Fatalf("publications = %d, want 1 (unprocessed after failed start)", got)
 	}
 
-	if _, err := db.Exec(`DROP TRIGGER abort_taken_at_reset`); err != nil {
+	if _, err := db.Exec(`DROP TRIGGER lc_abort_taken_at_reset`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -150,27 +183,22 @@ func TestOutboxStartCheckedFailClosedOnResetAbort(t *testing.T) {
 	if !o.processorRunning.Load() {
 		t.Fatal("processorRunning = false after successful retry")
 	}
-	// Publish works only after successful retry.
+	// Publish works only after the successful retry.
 	if err := o.HandleEvent(ctx, newTestEvent("after-retry")); err != nil {
 		t.Fatalf("HandleEvent after successful retry: %v", err)
 	}
 	if !handler.Wait(3 * time.Second) {
 		t.Fatal("handler should run after successful StartChecked retry")
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if outboxRowCount(t, db) == 0 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows after retry = %d, want 0", got)
+	waitUntil(t, 3*time.Second, func() bool { return countDeliveries(t, o) == 0 })
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publications after retry drain = %d, want 0", got)
 	}
 }
 
-// TestOutboxAdmissionSkipsActiveAndClaimsIdle ensures SELECT is wide enough to
-// skip already-admitted rows and still claim a later idle record (no starvation).
+// TestOutboxAdmissionSkipsActiveAndClaimsIdle: a delivery that is already
+// admitted in this process (long-running handler) must not consume the per-key
+// LIMIT, so a later idle delivery on the same key is still claimed.
 func TestOutboxAdmissionSkipsActiveAndClaimsIdle(t *testing.T) {
 	restoreSweepAge := setPeriodicSweepAge(t, 20*time.Millisecond)
 	defer restoreSweepAge()
@@ -188,17 +216,25 @@ func TestOutboxAdmissionSkipsActiveAndClaimsIdle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	activeID := uuid.New().String()
-	idleID := uuid.New().String()
-	// Active row is older (first in FIFO) and looks reclaimable via taken_at age.
+	// The active delivery is older (first in FIFO) and its taken_at is stale,
+	// so SQL alone would happily re-claim it.
 	old := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, activeID, newTestEvent("active"), []string{handler.Type},
-		old, old, sql.NullTime{Time: time.Now().Add(-time.Hour), Valid: true})
-	seedOutboxEventWithID(t, db, o, idleID, newTestEvent("idle"), []string{handler.Type},
-		old.Add(time.Second), old.Add(time.Second), sql.NullTime{})
+	_, activeID := insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("active"),
+		HandlerType: handler.Type,
+		CreatedAt:   old,
+	})
+	_, idleID := insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("idle"),
+		HandlerType: handler.Type,
+		CreatedAt:   old.Add(time.Second),
+	})
 
-	// Process-local: active is already admitted (long-running coordinator).
-	if !o.admission.tryAdmit(activeID) {
+	reconcileForTest(t, o)
+	setTakenAt(t, o, activeID, time.Now().Add(-time.Hour))
+
+	// Process-local: active is already admitted on its dispatch key.
+	if !o.admission.tryAdmitKey(activeID, handler.Type) {
 		t.Fatal("pre-admit active id")
 	}
 
@@ -212,16 +248,14 @@ func TestOutboxAdmissionSkipsActiveAndClaimsIdle(t *testing.T) {
 	if !handler.Wait(time.Second) {
 		t.Fatal("idle event was not dispatched")
 	}
-	// Active row must remain; idle removed.
-	var remaining string
-	if err := db.QueryRow(`SELECT id FROM outbox`).Scan(&remaining); err != nil {
-		t.Fatal(err)
+
+	// The active delivery must remain untouched; the idle one is gone.
+	remaining := listDeliveries(t, o)
+	if len(remaining) != 1 {
+		t.Fatalf("deliveries = %d, want 1", len(remaining))
 	}
-	if remaining != activeID {
-		t.Fatalf("remaining outbox id = %s, want active %s", remaining, activeID)
-	}
-	if got := outboxRowCount(t, db); got != 1 {
-		t.Fatalf("outbox rows = %d, want 1", got)
+	if remaining[0].ID != activeID {
+		t.Fatalf("remaining delivery = %s, want active %s (idle %s should be gone)", remaining[0].ID, activeID, idleID)
 	}
 }
 
@@ -243,10 +277,14 @@ func TestOutboxPartialAdmissionClaimsOnlyCapacity(t *testing.T) {
 	}
 
 	createdAt := time.Now().Add(-time.Minute)
-	ids := []string{uuid.New().String(), uuid.New().String(), uuid.New().String()}
-	for _, id := range ids {
-		seedOutboxEventWithID(t, db, o, id, newTestEvent(id), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	for i := range 3 {
+		insertDeliveryDirect(t, o, deliverySeed{
+			Event:       newTestEvent(fmt.Sprintf("partial-%d", i)),
+			HandlerType: handler.Type,
+			CreatedAt:   createdAt,
+		})
 	}
+	reconcileForTest(t, o)
 
 	done := make(chan struct{})
 	go func() {
@@ -262,7 +300,7 @@ func TestOutboxPartialAdmissionClaimsOnlyCapacity(t *testing.T) {
 		t.Fatal("timed out waiting for first handler entry")
 	}
 
-	// While the first record is admitted, a second claim must not take more rows.
+	// While the first delivery is admitted, a second claim must take nothing.
 	processed, err := o.processBatch(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -271,19 +309,12 @@ func TestOutboxPartialAdmissionClaimsOnlyCapacity(t *testing.T) {
 		t.Fatalf("second processBatch processed = %d, want 0 (admission full)", processed)
 	}
 
-	var claimed int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM outbox WHERE taken_at IS NOT NULL`).Scan(&claimed); err != nil {
-		t.Fatal(err)
-	}
+	claimed, unclaimed := lcCountTaken(t, o)
 	if claimed != 1 {
-		t.Fatalf("claimed rows = %d, want 1", claimed)
+		t.Fatalf("claimed deliveries = %d, want 1", claimed)
 	}
-	var free int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM outbox WHERE taken_at IS NULL`).Scan(&free); err != nil {
-		t.Fatal(err)
-	}
-	if free != 2 {
-		t.Fatalf("unclaimed rows = %d, want 2", free)
+	if unclaimed != 2 {
+		t.Fatalf("unclaimed deliveries = %d, want 2", unclaimed)
 	}
 
 	close(release)
@@ -294,6 +325,10 @@ func TestOutboxPartialAdmissionClaimsOnlyCapacity(t *testing.T) {
 	}
 }
 
+// TestOutboxAdmissionPreventsDuplicateWhileHandlerExceedsSweepAge: a delivery
+// whose handler runs longer than PeriodicSweepAge is never claimed a second
+// time in the same process — the per-key candidate SELECT excludes ids that
+// are admitted here, so the stale taken_at is not re-claimed.
 func TestOutboxAdmissionPreventsDuplicateWhileHandlerExceedsSweepAge(t *testing.T) {
 	restoreSweepAge := setPeriodicSweepAge(t, 30*time.Millisecond)
 	defer restoreSweepAge()
@@ -318,9 +353,13 @@ func TestOutboxAdmissionPreventsDuplicateWhileHandlerExceedsSweepAge(t *testing.
 		t.Fatal(err)
 	}
 
-	id := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, id, newTestEvent("long"), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	_, deliveryID := insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("long"),
+		HandlerType: handler.Type,
+		CreatedAt:   createdAt,
+	})
+	reconcileForTest(t, o)
 
 	done := make(chan struct{})
 	go func() {
@@ -336,8 +375,9 @@ func TestOutboxAdmissionPreventsDuplicateWhileHandlerExceedsSweepAge(t *testing.
 		t.Fatal("handler did not enter")
 	}
 
-	// Wait past PeriodicSweepAge so SQL would consider taken_at reclaimable.
-	time.Sleep(3 * PeriodicSweepAge)
+	// Backdate taken_at far beyond PeriodicSweepAge: SQL alone would now
+	// consider the claim reclaimable. No sleeping, no timing threshold.
+	setTakenAt(t, o, deliveryID, time.Now().Add(-time.Hour))
 
 	processed, err := o.processBatch(ctx)
 	if err != nil {
@@ -359,6 +399,9 @@ func TestOutboxAdmissionPreventsDuplicateWhileHandlerExceedsSweepAge(t *testing.
 	if got := invocations.Load(); got != 1 {
 		t.Fatalf("handler invocations after complete = %d, want 1", got)
 	}
+	if got := countDeliveries(t, o); got != 0 {
+		t.Fatalf("deliveries after complete = %d, want 0", got)
+	}
 }
 
 func TestOutboxNewMessageDuringBatchIsProcessedAfter(t *testing.T) {
@@ -377,9 +420,13 @@ func TestOutboxNewMessageDuringBatchIsProcessedAfter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	firstID := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, firstID, newTestEvent("first"), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("first"),
+		HandlerType: handler.Type,
+		CreatedAt:   createdAt,
+	})
+	reconcileForTest(t, o)
 
 	done := make(chan struct{})
 	go func() {
@@ -395,11 +442,16 @@ func TestOutboxNewMessageDuringBatchIsProcessedAfter(t *testing.T) {
 		t.Fatal("first event did not enter handler")
 	}
 
-	// Insert a new due message while the batch is in-flight.
-	secondID := uuid.New().String()
-	seedOutboxEventWithID(t, db, o, secondID, newTestEvent("second"), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	// A new due delivery arrives while the batch is in flight. Resolve its key
+	// directly so the in-flight row's taken_at is not disturbed.
+	_, secondID := insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("second"),
+		HandlerType: handler.Type,
+		CreatedAt:   createdAt,
+	})
+	lcResolveSerial(t, o, secondID, handler.Type)
 
-	// Concurrent claim during batch must not steal capacity incorrectly.
+	// Concurrent claim during the batch must not exceed admission capacity.
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
 	} else if processed != 0 {
@@ -418,8 +470,11 @@ func TestOutboxNewMessageDuringBatchIsProcessedAfter(t *testing.T) {
 	} else if processed != 1 {
 		t.Fatalf("second processBatch = %d, want 1 for new message", processed)
 	}
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows = %d, want 0 after draining new message", got)
+	if got := countDeliveries(t, o); got != 0 {
+		t.Fatalf("deliveries = %d, want 0 after draining new message", got)
+	}
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publications = %d, want 0 after draining new message", got)
 	}
 }
 
@@ -439,10 +494,14 @@ func TestOutboxCloseWaitsForInFlightBatch(t *testing.T) {
 	}
 
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, uuid.New().String(), newTestEvent("shutdown"), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("shutdown"),
+		HandlerType: handler.Type,
+		CreatedAt:   createdAt,
+	})
 
-	// Drive via Start so Close waits on the processor goroutine.
-	// Initial sweep after Start must enter the handler without notify.
+	// Drive via Start so Close waits on the processor goroutine. The initial
+	// sweep after StartChecked must enter the handler without an external notify.
 	if err := o.StartChecked(); err != nil {
 		t.Fatal(err)
 	}
@@ -476,15 +535,18 @@ func TestOutboxCloseWaitsForInFlightBatch(t *testing.T) {
 		t.Fatal("Close did not return after handler finished")
 	}
 
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows after Close = %d, want 0", got)
+	if got := countDeliveries(t, o); got != 0 {
+		t.Fatalf("deliveries after Close = %d, want 0", got)
+	}
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publications after Close = %d, want 0", got)
 	}
 }
 
 // TestOutboxCrashRestartStartupReset is a real subprocess E2E: the child admits
 // and handles an event, signals readiness, then hangs until SIGKILL. The parent
-// reopens the same DB, registers handlers, Start()s (taken_at reset), and
-// asserts the event is redelivered exactly once to the new process.
+// reopens the same DB, registers handlers, Start()s (startup reset of taken_at),
+// and asserts the delivery is redelivered exactly once to the new process.
 func TestOutboxCrashRestartStartupReset(t *testing.T) {
 	if os.Getenv("EH_SQLITE_CRASH_CHILD") == "1" {
 		runCrashChild(t)
@@ -507,7 +569,7 @@ func TestOutboxCrashRestartStartupReset(t *testing.T) {
 		t.Fatalf("start child: %v", err)
 	}
 
-	// Wait for child to claim and enter the handler.
+	// Wait for the child to claim and enter the handler.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if _, err := os.Stat(readyPath); err == nil {
@@ -525,7 +587,8 @@ func TestOutboxCrashRestartStartupReset(t *testing.T) {
 	}
 	_, _ = cmd.Process.Wait()
 
-	// Parent: new process on same DB file — Start must reset taken_at and redeliver.
+	// Parent: new process on the same DB file — Start must reset taken_at and
+	// redeliver the orphaned delivery.
 	db, err := sql.Open("sqlite3", dbPath+"?_journal=wal&_busy_timeout=5000&_synchronous=normal&_fk=1&_loc=auto")
 	if err != nil {
 		t.Fatal(err)
@@ -543,7 +606,13 @@ func TestOutboxCrashRestartStartupReset(t *testing.T) {
 	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
 		t.Fatal(err)
 	}
-	// Initial sweep after StartChecked must redeliver without external notify.
+	// A claimed-but-orphaned delivery must be present before the restart.
+	claimed, _ := lcCountTaken(t, o)
+	if claimed != 1 {
+		t.Fatalf("claimed deliveries left by the killed child = %d, want 1", claimed)
+	}
+
+	// The initial sweep after StartChecked must redeliver without an external notify.
 	if err := o.StartChecked(); err != nil {
 		t.Fatal(err)
 	}
@@ -551,15 +620,9 @@ func TestOutboxCrashRestartStartupReset(t *testing.T) {
 	if !handler.Wait(5 * time.Second) {
 		t.Fatal("event was not redelivered after crash + Start reset")
 	}
-	deadline = time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if outboxRowCount(t, db) == 0 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows after restart processing = %d, want 0", got)
+	waitUntil(t, 5*time.Second, func() bool { return countDeliveries(t, o) == 0 })
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publications after restart processing = %d, want 0", got)
 	}
 }
 
@@ -626,7 +689,7 @@ func (h *hangAfterReadyHandler) HandleEvent(context.Context, eh.Event) error {
 		_ = os.WriteFile(h.readyPath, []byte("ready"), 0o600)
 		close(h.entered)
 	})
-	// Block forever — parent will SIGKILL.
+	// Block forever — the parent will SIGKILL.
 	select {}
 }
 

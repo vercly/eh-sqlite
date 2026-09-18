@@ -1,12 +1,9 @@
 package sqlite
 
 import (
-	"context"
 	"log"
 	"sync"
 	"sync/atomic"
-
-	eh "github.com/vercly/eventhorizon"
 )
 
 // DefaultQueueDepth is the default per-dispatch-key buffer size (enqueued +
@@ -29,20 +26,46 @@ type DispatchStats interface {
 	ObserveInFlight(handler, shard string, n int)
 }
 
-// delivery is one (record, handler) unit of work on a long-lived dispatch queue.
+// delivery is one claimed outbox_deliveries row on its long-lived dispatch
+// queue. It owns its full lifecycle: execute, finalize, release admission.
 type delivery struct {
-	event    *outboxDoc
+	doc      *deliveryDoc
 	handler  *matcherHandler
-	eventCtx map[string]any
-	coord    *recordCoordinator
 	queueKey string
 	// Explicit bounded labels for stats (not derived by parsing queueKey).
 	handlerLabel string
 	shardLabel   string
+
+	// done is closed after finalize or abandon (test/wait helper path).
+	done      chan struct{}
+	doneOnce  sync.Once
+	abandoned atomic.Bool
+}
+
+func newDelivery(doc *deliveryDoc, handler *matcherHandler, key, handlerLabel, shardLabel string) *delivery {
+	if shardLabel == "" {
+		shardLabel = serialShardLabel
+	}
+	return &delivery{
+		doc:          doc,
+		handler:      handler,
+		queueKey:     key,
+		handlerLabel: handlerLabel,
+		shardLabel:   shardLabel,
+		done:         make(chan struct{}),
+	}
+}
+
+func (d *delivery) finish() {
+	d.doneOnce.Do(func() { close(d.done) })
+}
+
+func (d *delivery) wait() {
+	<-d.done
 }
 
 // keyQueue is a bounded, long-lived FIFO for one dispatch key (handler or
-// handler+shard). Reservations allow atomic multi-queue admit before claim.
+// handler+shard). Reservations allow admit-before-claim.
 type keyQueue struct {
 	key          string
 	handlerLabel string
@@ -91,8 +114,8 @@ func (q *keyQueue) emitDepth(handler, shard string, depth int) {
 	})
 }
 
-// safeDispatchObserve runs an external DispatchStats callback and recovers
-// panics with a bounded log. Does not send on Errors() (avoids re-entrancy).
+// safeDispatchObserve runs an external stats callback and recovers panics with
+// a bounded log. Does not send on Errors() (avoids re-entrancy).
 func safeDispatchObserve(fn func()) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -100,6 +123,20 @@ func safeDispatchObserve(fn func()) {
 		}
 	}()
 	fn()
+}
+
+// freeCapacity reports how many more deliveries the queue can accept.
+func (q *keyQueue) freeCapacity() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return 0
+	}
+	free := q.capacity - q.depth
+	if free < 0 {
+		return 0
+	}
+	return free
 }
 
 func (q *keyQueue) tryReserve(n int) bool {
@@ -184,12 +221,7 @@ func (q *keyQueue) pop() (*delivery, bool) {
 func (q *keyQueue) closeAndDrain() []*delivery {
 	q.mu.Lock()
 	q.closed = true
-	// Drop reservations that never became enqueued items.
-	q.depth -= q.reserved
 	q.reserved = 0
-	if q.depth < 0 {
-		q.depth = 0
-	}
 	left := q.items
 	q.items = nil
 	q.depth = 0
@@ -270,6 +302,21 @@ func (r *dispatchRegistry) getOrCreate(key string) *keyQueue {
 	return q
 }
 
+func (r *dispatchRegistry) getExisting(key string) *keyQueue {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.queues[key]
+}
+
+// freeCapacity reports free slots of key's queue; a queue that does not exist
+// yet has full capacity.
+func (r *dispatchRegistry) freeCapacity(key string) int {
+	if q := r.getExisting(key); q != nil {
+		return q.freeCapacity()
+	}
+	return r.queueDepth
+}
+
 func (r *dispatchRegistry) inFlightKey(handler, shard string) string {
 	return handler + "\x00" + shard
 }
@@ -294,67 +341,16 @@ func (r *dispatchRegistry) addInFlight(handler, shard string, delta int) {
 	})
 }
 
-// tryReserveKeys reserves slots for each key (counted). On failure rolls back all.
-// deliveries supply explicit handler/shard labels so queues are not created by
-// parsing composite keys.
-func (r *dispatchRegistry) tryReserveKeys(keys []string, deliveries []*delivery) bool {
-	if len(keys) == 0 {
-		return true
-	}
-	counts := make(map[string]int, len(keys))
-	for _, k := range keys {
-		counts[k]++
-	}
-	for _, d := range deliveries {
-		r.rememberLabels(d.queueKey, d.handlerLabel, d.shardLabel)
-	}
-	// Deterministic order for reserve to reduce lock-order races between fetchers.
-	ordered := make([]string, 0, len(counts))
-	for k := range counts {
-		ordered = append(ordered, k)
-	}
-	// tiny stable sort without importing sort package churn — insertion sort
-	for i := 1; i < len(ordered); i++ {
-		for j := i; j > 0 && ordered[j] < ordered[j-1]; j-- {
-			ordered[j], ordered[j-1] = ordered[j-1], ordered[j]
-		}
-	}
-
-	reservedKeys := make([]string, 0, len(ordered))
-	for _, key := range ordered {
-		q := r.getOrCreate(key)
-		if !q.tryReserve(counts[key]) {
-			r.releaseKeyCounts(reservedKeys, counts)
-			return false
-		}
-		reservedKeys = append(reservedKeys, key)
-	}
-	return true
+// tryReserve reserves one slot on key's queue for d (labels remembered first
+// so the queue is created with explicit handler/shard labels).
+func (r *dispatchRegistry) tryReserve(d *delivery) bool {
+	r.rememberLabels(d.queueKey, d.handlerLabel, d.shardLabel)
+	return r.getOrCreate(d.queueKey).tryReserve(1)
 }
 
-func (r *dispatchRegistry) getExisting(key string) *keyQueue {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.queues[key]
-}
-
-func (r *dispatchRegistry) releaseKeys(keys []string) {
-	counts := make(map[string]int, len(keys))
-	for _, k := range keys {
-		counts[k]++
-	}
-	ordered := make([]string, 0, len(counts))
-	for k := range counts {
-		ordered = append(ordered, k)
-	}
-	r.releaseKeyCounts(ordered, counts)
-}
-
-func (r *dispatchRegistry) releaseKeyCounts(keys []string, counts map[string]int) {
-	for _, key := range keys {
-		if q := r.getExisting(key); q != nil {
-			q.releaseReserve(counts[key])
-		}
+func (r *dispatchRegistry) releaseReserve(key string) {
+	if q := r.getExisting(key); q != nil {
+		q.releaseReserve(1)
 	}
 }
 
@@ -372,13 +368,10 @@ func (r *dispatchRegistry) runWorker(q *keyQueue) {
 		}
 		select {
 		case <-r.stop:
-			// Drain abandoned items without executing; coordinators stay incomplete
-			// so records are redelivered after startup reset (at-least-once).
-			abandoned := q.closeAndDrain()
-			for _, d := range abandoned {
-				if d.coord != nil {
-					d.coord.abandon()
-				}
+			// Drain abandoned items without executing; rows keep taken_at and
+			// are redelivered after startup reset (at-least-once).
+			for _, d := range q.closeAndDrain() {
+				r.outbox.abandonDelivery(d)
 			}
 			return
 		case <-q.wake:
@@ -396,168 +389,4 @@ func (r *dispatchRegistry) wakeAll() {
 	for _, q := range r.queues {
 		q.signal()
 	}
-}
-
-// recordCoordinator collects all delivery outcomes for one claimed outbox row
-// and runs atomic finalization exactly once.
-type recordCoordinator struct {
-	outbox   *Outbox
-	record   *outboxDoc
-	eventCtx map[string]any
-	result   *processedResult
-
-	remaining atomic.Int32
-	doneOnce  sync.Once
-	doneCh    chan struct{}
-	abandoned atomic.Bool
-	mu        sync.Mutex
-}
-
-func newRecordCoordinator(o *Outbox, record *outboxDoc, eventCtx map[string]any, deliveryCount int) *recordCoordinator {
-	c := &recordCoordinator{
-		outbox:   o,
-		record:   record,
-		eventCtx: eventCtx,
-		result: &processedResult{
-			r:              record,
-			failedHandlers: map[string]handlerFailure{},
-		},
-		doneCh: make(chan struct{}),
-	}
-	c.remaining.Store(int32(deliveryCount))
-	return c
-}
-
-func (c *recordCoordinator) report(res handlerDispatchResult) {
-	if c.abandoned.Load() {
-		return
-	}
-	c.mu.Lock()
-	if res.err != nil {
-		recordHandlerFailure(c.result, res)
-	} else {
-		c.result.successfulHandlers = append(c.result.successfulHandlers, res.handlerType)
-	}
-	c.mu.Unlock()
-
-	if c.remaining.Add(-1) == 0 {
-		c.finish()
-	}
-}
-
-func (c *recordCoordinator) abandon() {
-	if c.abandoned.Swap(true) {
-		return
-	}
-	// Incomplete records keep taken_at; next Start resets and redelivers.
-	c.outbox.admission.release(c.record.ID.String())
-	c.doneOnce.Do(func() { close(c.doneCh) })
-}
-
-func (c *recordCoordinator) finish() {
-	c.doneOnce.Do(func() {
-		if !c.abandoned.Load() {
-			c.outbox.updateEventDB(context.Background(), *c.result)
-			// Free admission so the fetcher can claim more records.
-			c.outbox.admission.release(c.record.ID.String())
-			// Wake fetcher after completion (decoupled from claim).
-			c.outbox.notify()
-		}
-		close(c.doneCh)
-	})
-}
-
-func (c *recordCoordinator) wait() {
-	<-c.doneCh
-}
-
-func (o *Outbox) executeDelivery(d *delivery) {
-	if d.coord != nil && d.coord.abandoned.Load() {
-		return
-	}
-	// Global HandleEvent permit (FIFO fair across dispatch keys).
-	if err := o.handleSem.acquire(o.runContext()); err != nil {
-		if d.coord != nil {
-			d.coord.abandon()
-		}
-		return
-	}
-	defer o.handleSem.release()
-
-	if o.shuttingDown.Load() {
-		if d.coord != nil {
-			d.coord.abandon()
-		}
-		return
-	}
-
-	handlerLabel := d.handlerLabel
-	shardLabel := d.shardLabel
-	if shardLabel == "" {
-		shardLabel = serialShardLabel
-	}
-	if o.dispatch != nil {
-		o.dispatch.addInFlight(handlerLabel, shardLabel, 1)
-		defer o.dispatch.addInFlight(handlerLabel, shardLabel, -1)
-	}
-
-	eventCtx := eh.UnmarshalContext(context.Background(), d.eventCtx)
-	res := o.dispatchHandler(eventCtx, dispatchItem{event: d.event, handler: d.handler})
-	if d.coord != nil {
-		d.coord.report(res)
-	}
-}
-
-// planDeliveries resolves handlers for a record into dispatch keys and deliveries.
-// missing lists stored handler types that are not registered or no longer match.
-func (o *Outbox) planDeliveries(record *outboxDoc, eventCtx map[string]any) (keys []string, deliveries []*delivery, missing []string) {
-	handlersByType := o.snapshotHandlersByType()
-	for _, handlerType := range record.Handlers {
-		handler := handlersByType[handlerType]
-		if handler == nil || !handler.Match(record.Event) {
-			missing = append(missing, handlerType)
-			continue
-		}
-		key, handlerLabel, shardLabel := dispatchQueueIdentity(handler, record.Event)
-		keys = append(keys, key)
-		deliveries = append(deliveries, &delivery{
-			event:        record,
-			handler:      handler,
-			eventCtx:     eventCtx,
-			queueKey:     key,
-			handlerLabel: handlerLabel,
-			shardLabel:   shardLabel,
-		})
-	}
-	return keys, deliveries, missing
-}
-
-// planRematchDeliveries matches the event against every currently registered
-// handler (empty stored handlers list). Used after no_match DLQ replay.
-//
-// Callers must assign the matched handler type names to record.Handlers and
-// persist that list in the same claim transaction before dispatch. Finalize
-// computes remaining work from record.Handlers; leaving it empty causes silent
-// delete even when a handler failed retryably.
-func (o *Outbox) planRematchDeliveries(record *outboxDoc, eventCtx map[string]any) (keys []string, deliveries []*delivery) {
-	o.handlersMu.RLock()
-	handlers := append([]*matcherHandler(nil), o.handlers...)
-	o.handlersMu.RUnlock()
-
-	for _, mh := range handlers {
-		if mh == nil || !mh.Match(record.Event) {
-			continue
-		}
-		key, handlerLabel, shardLabel := dispatchQueueIdentity(mh, record.Event)
-		keys = append(keys, key)
-		deliveries = append(deliveries, &delivery{
-			event:        record,
-			handler:      mh,
-			eventCtx:     eventCtx,
-			queueKey:     key,
-			handlerLabel: handlerLabel,
-			shardLabel:   shardLabel,
-		})
-	}
-	return keys, deliveries
 }

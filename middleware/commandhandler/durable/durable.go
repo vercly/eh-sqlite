@@ -27,6 +27,7 @@ import (
 	"github.com/vercly/eh-sqlite/backoff"
 	dl "github.com/vercly/eh-sqlite/deadletter"
 	"github.com/vercly/eh-sqlite/internal/deadletter"
+	"github.com/vercly/eh-sqlite/schema"
 	eh "github.com/vercly/eventhorizon"
 	"github.com/vercly/eventhorizon/codec/json"
 	"github.com/vercly/eventhorizon/uuid"
@@ -210,6 +211,20 @@ func ensureSchema(db *sql.DB) error {
 	if err := deadletter.EnsureSchema(db, "dead_letters"); err != nil {
 		return fmt.Errorf("durable: %w", err)
 	}
+	// One-time rewrite of async_tasks timestamps into the canonical UTC text
+	// form; next_retry_at / locked_at are compared as text in Sweep. Marker
+	// guarded, fail closed.
+	ctx := context.Background()
+	if _, err := schema.Apply(ctx, db, "durable", "utc_timestamps", func(tx *sql.Tx) error {
+		for _, col := range []string{"created_at", "updated_at", "locked_at", "next_retry_at"} {
+			if _, err := schema.NormalizeColumnUTC(ctx, tx, "async_tasks", col); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("durable: could not normalize async_tasks timestamps: %w", err)
+	}
 	return nil
 }
 
@@ -219,7 +234,7 @@ func (m *Middleware) handler(ctx context.Context, cmd eh.Command, h eh.CommandHa
 	}
 
 	taskUUID := uuid.New()
-	now := time.Now()
+	now := schema.UTC(time.Now())
 	cmdBlob, err := m.codec.MarshalCommand(ctx, cmd)
 	if err != nil {
 		return fmt.Errorf("durable: could not marshal command: %w", err)
@@ -275,7 +290,7 @@ func (m *Middleware) handleTask(ctx context.Context, taskID int64, cmd eh.Comman
 }
 
 func (m *Middleware) markProcessing(ctx context.Context, taskID int64) error {
-	now := time.Now()
+	now := schema.UTC(time.Now())
 	if _, err := m.db.ExecContext(ctx, `
 		UPDATE async_tasks
 		SET status = 'processing', updated_at = ?, locked_by = ?, locked_at = ?, next_retry_at = NULL
@@ -305,7 +320,7 @@ func (m *Middleware) updateFinalStatus(ctx context.Context, taskID int64, status
 		UPDATE async_tasks
 		SET status = ?, last_error = ?, updated_at = ?, locked_by = NULL, locked_at = NULL, next_retry_at = NULL
 		WHERE id = ?
-	`, status, errMsg, time.Now(), taskID); err != nil {
+	`, status, errMsg, schema.UTC(time.Now()), taskID); err != nil {
 		return fmt.Errorf("durable: could not update task %d status: %w", taskID, err)
 	}
 	return nil
@@ -321,13 +336,13 @@ func (m *Middleware) scheduleRetry(ctx context.Context, taskID int64, cmd eh.Com
 	}
 
 	nextRetryCount := task.retryCount + 1
-	nextRetryAt := time.Now().Add(m.cfg.retryBackoff.DelayFunc(int64(nextRetryCount)))
+	nextRetryAt := schema.UTC(time.Now().Add(m.cfg.retryBackoff.DelayFunc(int64(nextRetryCount))))
 	errMsg := errorString(execErr)
 	if _, err := m.db.ExecContext(ctx, `
 		UPDATE async_tasks
 		SET status = 'failed_retriable', retry_count = ?, last_error = ?, updated_at = ?, locked_by = NULL, locked_at = NULL, next_retry_at = ?
 		WHERE id = ?
-	`, nextRetryCount, errMsg, time.Now(), nextRetryAt, taskID); err != nil {
+	`, nextRetryCount, errMsg, schema.UTC(time.Now()), nextRetryAt, taskID); err != nil {
 		return fmt.Errorf("durable: could not schedule retry for task %d: %w", taskID, err)
 	}
 	return nil
@@ -399,8 +414,8 @@ func Sweep(ctx context.Context, db *sql.DB, bus eh.CommandHandler, options ...Op
 		return 0, err
 	}
 	cfg := applyOptions(options...)
-	now := time.Now()
-	stuckBefore := now.Add(-cfg.stuckTimeout)
+	now := schema.UTC(time.Now())
+	stuckBefore := schema.UTC(now.Add(-cfg.stuckTimeout))
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, command_blob
 		FROM async_tasks
@@ -499,8 +514,8 @@ func insertCommandDeadLetter(ctx context.Context, db *sql.DB, task taskRecord, c
 		Blob:              string(task.commandBlob),
 		Error:             reason,
 		RetryCount:        task.retryCount,
-		CreatedAt:         task.createdAt,
-		DeadAt:            time.Now(),
+		CreatedAt:         schema.UTC(task.createdAt),
+		DeadAt:            schema.UTC(time.Now()),
 	}
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
@@ -511,7 +526,7 @@ func insertCommandDeadLetter(ctx context.Context, db *sql.DB, task taskRecord, c
 	if exporter != nil {
 		if err := exporter.ExportDeadLetter(ctx, record); err != nil {
 			log.Printf("durable: could not export command dead letter: %v", err)
-		} else if err := markCommandDeadLetterExported(ctx, db, record.ID, time.Now()); err != nil {
+		} else if err := markCommandDeadLetterExported(ctx, db, record.ID, schema.UTC(time.Now())); err != nil {
 			log.Printf("durable: could not mark command dead letter exported: %v", err)
 		}
 	}
@@ -519,7 +534,7 @@ func insertCommandDeadLetter(ctx context.Context, db *sql.DB, task taskRecord, c
 }
 
 func markCommandDeadLetterExported(ctx context.Context, db *sql.DB, id string, exportedAt time.Time) error {
-	if _, err := db.ExecContext(ctx, `UPDATE dead_letters SET exported_at = ? WHERE id = ?`, exportedAt, id); err != nil {
+	if _, err := db.ExecContext(ctx, `UPDATE dead_letters SET exported_at = ? WHERE id = ?`, schema.UTC(exportedAt), id); err != nil {
 		return err
 	}
 	return nil

@@ -3,6 +3,7 @@ package sqlite
 import (
 	"errors"
 	"sync/atomic"
+	"time"
 )
 
 // ErrOutboxNotStarted is returned when publishing is attempted before Start.
@@ -11,6 +12,17 @@ var ErrOutboxNotStarted = errors.New("outbox not started")
 // ErrOutboxAlreadyStarted is returned when AddHandler is called after Start has
 // closed handler registration. Register all handlers, then call Start once.
 var ErrOutboxAlreadyStarted = errors.New("outbox already started")
+
+// ErrUnresolvedHandler is reported on Errors() (diagnostics only) when a
+// delivery names a handler type that is not registered or no longer matches
+// the event. The delivery stays visible with unresolved_at set and is never
+// claimed or deleted implicitly.
+var ErrUnresolvedHandler = errors.New("outbox: delivery handler cannot be resolved")
+
+// ErrFinalizeStuck is reported on Errors() when finalize SQL and the safe claim
+// release both failed. The delivery keeps taken_at and is recovered by the
+// taken_at timeout (PeriodicSweepAge) once the database accepts writes again.
+var ErrFinalizeStuck = errors.New("outbox: delivery finalize failed and claim could not be released")
 
 // ErrorSeverity defines how an outbox error should be treated
 type ErrorSeverity int
@@ -52,6 +64,48 @@ var (
 
 // ErrInvalidQueueDepth is returned by WithQueueDepth when depth < 1.
 var ErrInvalidQueueDepth = errInvalidQueueDepth
+
+// ClaimSkipReason is the bounded label set for deliveries the fetcher saw but
+// could not admit in a claim pass.
+type ClaimSkipReason string
+
+const (
+	// SkipQueueFull: the dispatch key queue had no free slot.
+	SkipQueueFull ClaimSkipReason = "queue_full"
+	// SkipAdmissionFull: the global admission limit was reached.
+	SkipAdmissionFull ClaimSkipReason = "admission_full"
+	// SkipUnresolved: the delivery's handler is not registered or does not match.
+	SkipUnresolved ClaimSkipReason = "unresolved_handler"
+	// SkipRematchNoMatch: a rematch sentinel matched no registered handler.
+	SkipRematchNoMatch ClaimSkipReason = "rematch_no_match"
+	// SkipDecodeFailed: the stored event blob could not be decoded.
+	SkipDecodeFailed ClaimSkipReason = "decode_failed"
+)
+
+// FinalizeOutcome is the bounded label set for per-delivery finalization.
+type FinalizeOutcome string
+
+const (
+	FinalizeCompleted  FinalizeOutcome = "completed"
+	FinalizeRetry      FinalizeOutcome = "retry"
+	FinalizeDeadLetter FinalizeOutcome = "dead_letter"
+	// FinalizeReleased: finalize SQL exhausted its retries; the claim was
+	// released so the delivery becomes eligible again after PeriodicSweepAge.
+	FinalizeReleased FinalizeOutcome = "released"
+	// FinalizeStuck: release also failed; recovered by the taken_at timeout.
+	FinalizeStuck FinalizeOutcome = "stuck"
+)
+
+// AdmissionStats is an optional, additive observer. A DispatchStats collector
+// passed to WithDispatchStats that also implements AdmissionStats receives
+// admission, claim-skip and finalize observations. Implementations must be
+// safe for concurrent use, must not block and must not call back into the
+// outbox. Labels are bounded (no ids, no keys).
+type AdmissionStats interface {
+	ObserveAdmission(used, limit int)
+	ObserveClaimSkip(reason ClaimSkipReason)
+	ObserveFinalize(outcome FinalizeOutcome, d time.Duration, retried bool, err error)
+}
 
 // GetSeverity unpacks the error chain to check if a specific ErrorSeverity
 // has been assigned, returning SeverityUnknown if no compliant error is found.

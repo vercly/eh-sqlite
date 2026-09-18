@@ -1,10 +1,12 @@
 package deadletter
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
-	"unicode"
+
+	"github.com/vercly/eh-sqlite/schema"
 )
 
 // EnsureSchema creates the shared dead_letters table and indexes used by outbox
@@ -55,6 +57,8 @@ func EnsureSchema(db *sql.DB, tableName string) error {
 		{"exported_at", "TIMESTAMP"},
 		{"replayed_at", "TIMESTAMP"},
 		{"replayed_by", "TEXT"},
+		{"publication_id", "TEXT"},
+		{"legacy_outbox_id", "TEXT"},
 	} {
 		if err := AddColumnIfAbsent(db, tableName, col.name, col.decl); err != nil {
 			return fmt.Errorf("could not migrate dead letters column %s: %w", col.name, err)
@@ -94,6 +98,22 @@ func EnsureSchema(db *sql.DB, tableName string) error {
 		ON %[1]s (source, outbox_id, handler_type)
 	`, tableName)); err != nil {
 		return fmt.Errorf("could not create dead letters uniqueness index: %w", err)
+	}
+
+	// One-time rewrite of historical timestamps into the canonical UTC text
+	// form so lexicographic SQL comparison stays monotone. Guarded by a
+	// migration marker, so the repeated EnsureSchema calls from outbox,
+	// durable and maintenance cost one indexed lookup. Fail closed.
+	ctx := context.Background()
+	if _, err := schema.Apply(ctx, db, "deadletter", "utc_timestamps", func(tx *sql.Tx) error {
+		for _, col := range []string{"created_at", "dead_at", "exported_at", "replayed_at"} {
+			if _, err := schema.NormalizeColumnUTC(ctx, tx, tableName, col); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("could not normalize dead letters timestamps: %w", err)
 	}
 	return nil
 }
@@ -171,14 +191,5 @@ func AddColumnIfAbsent(db *sql.DB, tableName, col, decl string) error {
 }
 
 func validateIdent(name string) error {
-	if name == "" {
-		return fmt.Errorf("empty SQL identifier")
-	}
-	for i, r := range name {
-		if r == '_' || unicode.IsLetter(r) || (i > 0 && unicode.IsDigit(r)) {
-			continue
-		}
-		return fmt.Errorf("invalid SQL identifier %q", name)
-	}
-	return nil
+	return schema.ValidateIdent(name)
 }

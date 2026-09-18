@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,14 +10,99 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vercly/eh-sqlite/schema"
 	eh "github.com/vercly/eventhorizon"
 	"github.com/vercly/eventhorizon/mocks"
 	"github.com/vercly/eventhorizon/uuid"
 )
 
-// TestOutboxBarrierIdleEntersBeforeSlowReleased asserts the core 7a contract:
-// an idle dispatch key progresses while a slow key is still blocked — no batch
-// barrier. Ordering is checked via event sequence, not wall-clock SLOs.
+// brOtherEvent builds an event of mocks.EventOtherType (a second Serial
+// dispatch key when matched by its own handler).
+func brOtherEvent(content string) eh.Event {
+	return eh.NewEvent(mocks.EventOtherType, &mocks.EventData{Content: content}, time.Now(),
+		eh.ForAggregate(mocks.AggregateType, uuid.New(), 1),
+	)
+}
+
+// brInsertSiblingDelivery adds one more delivery to an existing publication
+// (the v2 shape: one publication, one row per recipient). Returns the delivery id.
+func brInsertSiblingDelivery(t testing.TB, o *Outbox, publicationID string, event eh.Event, handlerType string, createdAt time.Time) string {
+	t.Helper()
+	deliveryID := uuid.New().String()
+	if _, err := o.db.Exec(fmt.Sprintf(`
+		INSERT INTO %s (id, publication_id, handler_type, dispatch_key, dispatch_config, event_type, aggregate_id,
+		                created_at, available_at, taken_at, retry_count, unresolved_at, legacy_outbox_id)
+		VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, NULL, 0, NULL, NULL)`, o.deliveriesTable),
+		deliveryID, publicationID, handlerType, event.EventType().String(), event.AggregateID().String(),
+		schema.UTC(createdAt), schema.UTC(createdAt)); err != nil {
+		t.Fatal(err)
+	}
+	return deliveryID
+}
+
+// brClaimedForKey counts deliveries of one dispatch key that carry a claim.
+func brClaimedForKey(t testing.TB, o *Outbox, key string) int {
+	t.Helper()
+	var n int
+	if err := o.db.QueryRow(fmt.Sprintf(
+		`SELECT COUNT(*) FROM %s WHERE dispatch_key = ? AND taken_at IS NOT NULL`, o.deliveriesTable), key).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// brUnclaimedForKey counts the remaining backlog of one dispatch key.
+func brUnclaimedForKey(t testing.TB, o *Outbox, key string) int {
+	t.Helper()
+	var n int
+	if err := o.db.QueryRow(fmt.Sprintf(
+		`SELECT COUNT(*) FROM %s WHERE dispatch_key = ? AND taken_at IS NULL`, o.deliveriesTable), key).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// brMinSeqForKey returns the lowest seq still stored for a dispatch key.
+func brMinSeqForKey(t testing.TB, o *Outbox, key string) int64 {
+	t.Helper()
+	var seq int64
+	if err := o.db.QueryRow(fmt.Sprintf(
+		`SELECT MIN(seq) FROM %s WHERE dispatch_key = ?`, o.deliveriesTable), key).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+// brDrain runs claim passes until no delivery is left (handlers must be
+// released first). Only background progress is polled, never correctness.
+func brDrain(t testing.TB, o *Outbox, ctx context.Context) {
+	t.Helper()
+	// Let every released handler finish its finalize transaction before the
+	// next claim transaction starts (single-writer SQLite).
+	waitUntil(t, 10*time.Second, func() bool {
+		used, _ := o.AdmissionSnapshot()
+		return used == 0
+	})
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if countDeliveries(t, o) == 0 {
+			if got := countPublications(t, o); got != 0 {
+				t.Fatalf("publications left after draining deliveries = %d, want 0", got)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("deliveries left after drain = %d", countDeliveries(t, o))
+		}
+		if _, err := o.fetchAndDispatch(ctx, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestOutboxBarrierIdleEntersBeforeSlowReleased asserts the core contract: an
+// idle dispatch key progresses while a slow key is still blocked — no batch
+// barrier. Ordering is checked via recorded entries, not wall-clock SLOs.
 func TestOutboxBarrierIdleEntersBeforeSlowReleased(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -26,7 +110,6 @@ func TestOutboxBarrierIdleEntersBeforeSlowReleased(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer o.Close()
 
 	var order []string
 	var orderMu sync.Mutex
@@ -43,12 +126,21 @@ func TestOutboxBarrierIdleEntersBeforeSlowReleased(t *testing.T) {
 		onEnter: func() { record("slow_enter"); close(slowEntered) },
 		release: slowRelease,
 	}
+	idleEntered := make(chan struct{}, 1)
 	idle := &namedBlockHandler{
-		Type:    "idle_key",
-		onEnter: func() { record("idle_enter") },
-		release: make(chan struct{}), // closed immediately below
+		Type: "idle_key",
+		onEnter: func() {
+			record("idle_enter")
+			idleEntered <- struct{}{}
+		},
+		release: make(chan struct{}),
 	}
 	close(idle.release)
+
+	// Close waits for in-flight handlers; release before Close on every path
+	// (cleanup runs LIFO, so register Close first).
+	t.Cleanup(func() { _ = o.Close() })
+	t.Cleanup(func() { closeOnce(slowRelease) })
 
 	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, slow); err != nil {
 		t.Fatal(err)
@@ -56,18 +148,24 @@ func TestOutboxBarrierIdleEntersBeforeSlowReleased(t *testing.T) {
 	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventOtherType}, idle); err != nil {
 		t.Fatal(err)
 	}
+
+	createdAt := time.Now().Add(-time.Minute)
+	// Distinct event types → distinct Serial dispatch keys.
+	insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("slow-body"),
+		HandlerType: slow.Type,
+		CreatedAt:   createdAt,
+	})
+	insertDeliveryDirect(t, o, deliverySeed{
+		Event:       brOtherEvent("idle-body"),
+		HandlerType: idle.Type,
+		CreatedAt:   createdAt.Add(time.Millisecond),
+	})
+
+	// StartChecked reconciles the seeded rows (dispatch keys) and sweeps.
 	if err := o.StartChecked(); err != nil {
 		t.Fatal(err)
 	}
-
-	createdAt := time.Now().Add(-time.Minute)
-	// Distinct event types → distinct Serial keys.
-	seedOutboxEventWithID(t, db, o, uuid.New().String(), newTestEvent("slow-body"), []string{slow.Type}, createdAt, createdAt, sql.NullTime{})
-	seedOutboxEventWithID(t, db, o, uuid.New().String(),
-		eh.NewEvent(mocks.EventOtherType, &mocks.EventData{Content: "idle-body"}, time.Now()),
-		[]string{idle.Type}, createdAt.Add(time.Millisecond), createdAt.Add(time.Millisecond), sql.NullTime{})
-
-	o.notify()
 
 	select {
 	case <-slowEntered:
@@ -75,62 +173,42 @@ func TestOutboxBarrierIdleEntersBeforeSlowReleased(t *testing.T) {
 		t.Fatal("slow handler did not enter")
 	}
 
-	// Idle must enter while slow is still held (barrier would prevent this).
-	deadline := time.Now().Add(3 * time.Second)
-	for {
+	// The idle key must enter while slow is still held — a batch barrier would
+	// prevent this. No release has happened yet at this point.
+	select {
+	case <-idleEntered:
+	case <-time.After(3 * time.Second):
 		orderMu.Lock()
-		hasIdle := false
-		for _, e := range order {
-			if e == "idle_enter" {
-				hasIdle = true
-			}
-		}
+		got := append([]string(nil), order...)
 		orderMu.Unlock()
-		if hasIdle {
-			break
-		}
-		if time.Now().After(deadline) {
-			orderMu.Lock()
-			t.Fatalf("idle did not enter before slow release; order=%v", order)
-			orderMu.Unlock()
-		}
-		time.Sleep(5 * time.Millisecond)
+		t.Fatalf("idle did not enter while slow was still blocked; order=%v", got)
 	}
 
 	orderMu.Lock()
-	// Find first idle_enter index relative to slow_enter — idle must appear
-	// while slow has entered but before we release slow (still blocked).
-	// At this point slow is still held, so any idle_enter proves no barrier.
+	got := append([]string(nil), order...)
+	orderMu.Unlock()
 	sawSlow, sawIdle := false, false
-	for _, e := range order {
-		if e == "slow_enter" {
+	for _, e := range got {
+		switch e {
+		case "slow_enter":
 			sawSlow = true
-		}
-		if e == "idle_enter" {
+		case "idle_enter":
 			sawIdle = true
 		}
 	}
-	orderMu.Unlock()
 	if !sawSlow || !sawIdle {
-		t.Fatalf("order incomplete: %v", order)
+		t.Fatalf("order = %v, want both slow_enter and idle_enter while slow is still blocked", got)
 	}
 
-	close(slowRelease)
-	// Drain remaining work.
-	deadline = time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if outboxRowCount(t, db) == 0 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows = %d, want 0", got)
+	closeOnce(slowRelease)
+	waitUntil(t, 5*time.Second, func() bool { return countDeliveries(t, o) == 0 })
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publications = %d, want 0", got)
 	}
 }
 
 // TestOutboxD2RetryLosesPosition: A fails with backoff; B on the same key
-// completes before A's retry becomes eligible.
+// completes before A's retry becomes eligible. Retry is per delivery.
 func TestOutboxD2RetryLosesPosition(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -162,76 +240,79 @@ func TestOutboxD2RetryLosesPosition(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A is due now; B slightly later by created_at but both available now.
-	// After A fails, A gets future available_at; B should run next.
+	// A and B share one Serial key; both are due now, A first by seq.
 	t0 := time.Now().Add(-time.Minute)
-	idA := uuid.New().String()
-	idB := uuid.New().String()
-	seedOutboxEventWithID(t, db, o, idA, newTestEvent("A"), []string{handler.Type}, t0, t0, sql.NullTime{})
-	seedOutboxEventWithID(t, db, o, idB, newTestEvent("B"), []string{handler.Type}, t0.Add(time.Millisecond), t0.Add(time.Millisecond), sql.NullTime{})
+	_, idA := insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("A"),
+		HandlerType: handler.Type,
+		CreatedAt:   t0,
+	})
+	_, idB := insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("B"),
+		HandlerType: handler.Type,
+		CreatedAt:   t0.Add(time.Millisecond),
+	})
+	reconcileForTest(t, o)
 
-	// First wave: A fails, B succeeds.
+	// One pass claims both (quantum 8) and the key worker runs them in order.
 	if _, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
-	}
-	// May need a second wave if only one claimed first — keep processing until B done.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		mu.Lock()
-		n := len(seen)
-		mu.Unlock()
-		if n >= 2 {
-			break
-		}
-		_, _ = o.processBatch(ctx)
-		time.Sleep(10 * time.Millisecond)
 	}
 
 	mu.Lock()
 	got := append([]string(nil), seen...)
 	mu.Unlock()
-	// Expect A then B before any A retry (retry is 500ms out).
-	if len(got) < 2 {
-		t.Fatalf("seen = %v, want at least [A,B]", got)
+	if len(got) != 2 {
+		t.Fatalf("seen = %v, want exactly [A B] (A's retry is 500ms out)", got)
 	}
-	if got[0] != "A" {
-		t.Fatalf("first = %s, want A", got[0])
+	if got[0] != "A" || got[1] != "B" {
+		t.Fatalf("seen = %v, want [A B] (B completes before A's retry)", got)
 	}
-	if got[1] != "B" {
-		t.Fatalf("second = %s, want B (B completes before A retry)", got[1])
+
+	// B is done (row gone); A lost its position and waits for the backoff.
+	var bLeft int
+	if err := db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE id = ?`, o.deliveriesTable), idB).Scan(&bLeft); err != nil {
+		t.Fatal(err)
 	}
-	// A still pending for retry.
+	if bLeft != 0 {
+		t.Fatalf("B delivery rows = %d, want 0 (completed)", bLeft)
+	}
+
 	var retryCount int
 	var availableAt time.Time
-	if err := db.QueryRow(`SELECT retry_count, available_at FROM outbox WHERE id = ?`, idA).Scan(&retryCount, &availableAt); err != nil {
+	var takenAt any
+	if err := db.QueryRow(fmt.Sprintf(`SELECT retry_count, available_at, taken_at FROM %s WHERE id = ?`, o.deliveriesTable), idA).
+		Scan(&retryCount, &availableAt, &takenAt); err != nil {
 		t.Fatal(err)
 	}
 	if retryCount != 1 {
 		t.Fatalf("A retry_count = %d, want 1", retryCount)
 	}
+	if takenAt != nil {
+		t.Fatalf("A taken_at = %v, want NULL (claim released for retry)", takenAt)
+	}
 	if !availableAt.After(time.Now().Add(100 * time.Millisecond)) {
 		t.Fatalf("A available_at = %s, want future backoff", availableAt)
 	}
+	// Canonical UTC storage.
+	raw := storedText(t, db, fmt.Sprintf(`SELECT CAST(available_at AS TEXT) FROM %s WHERE id = ?`, o.deliveriesTable), idA)
+	if !strings.HasSuffix(raw, "+00:00") {
+		t.Fatalf("stored available_at = %q, want canonical UTC text", raw)
+	}
 }
 
-// TestOutboxSaturatedQueueDoesNotBlockOtherKeys: fill one key's queue to capacity;
-// another key's record still claims and runs.
+// TestOutboxSaturatedQueueDoesNotBlockOtherKeys: fill one key's queue to
+// capacity; another key's delivery still claims and runs in the same pass.
 func TestOutboxSaturatedQueueDoesNotBlockOtherKeys(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
-	// Tiny queue depth via constructing registry after NewOutbox — use option.
-	// Stage 7a uses defaultQueueDepth; force small depth by setting field before Start.
-	o, err := NewOutbox(db, WithMaxGoroutines(2), WithAdmissionLimit(64))
+	o, err := NewOutbox(db, WithMaxGoroutines(2), WithAdmissionLimit(64), WithQueueDepth(2))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer o.Close()
-	o.queueDepth = 2
-	o.dispatch = newDispatchRegistry(o, 2, o.dispatchStats)
 
 	blockRelease := make(chan struct{})
-	saturated := newBlockingHandler("sat_key", make(chan string, 8), blockRelease)
-	// Keep first delivery stuck so queue fills.
+	saturated := &namedBlockHandler{Type: "sat_key", release: blockRelease}
 	idleEntered := make(chan struct{}, 1)
 	idle := &namedBlockHandler{
 		Type:    "free_key",
@@ -239,6 +320,9 @@ func TestOutboxSaturatedQueueDoesNotBlockOtherKeys(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	close(idle.release)
+
+	t.Cleanup(func() { _ = o.Close() })
+	t.Cleanup(func() { closeOnce(blockRelease) })
 
 	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, saturated); err != nil {
 		t.Fatal(err)
@@ -248,45 +332,61 @@ func TestOutboxSaturatedQueueDoesNotBlockOtherKeys(t *testing.T) {
 	}
 
 	createdAt := time.Now().Add(-time.Minute)
-	// 1 in-flight + 2 queued = depth 2 reserved while first blocks...
-	// Seed 4 sat events: first runs (depth 1), next 2 fill queue, 4th cannot reserve.
-	for i := range 4 {
-		seedOutboxEventWithID(t, db, o, uuid.New().String(), newTestEvent(fmt.Sprintf("sat-%d", i)),
-			[]string{saturated.Type}, createdAt, createdAt, sql.NullTime{})
+	for i := range 6 {
+		insertDeliveryDirect(t, o, deliverySeed{
+			Event:       newTestEvent(fmt.Sprintf("sat-%d", i)),
+			HandlerType: saturated.Type,
+			CreatedAt:   createdAt,
+		})
 	}
-	// Idle record due as well.
-	seedOutboxEventWithID(t, db, o, uuid.New().String(),
-		eh.NewEvent(mocks.EventOtherType, &mocks.EventData{Content: "free"}, time.Now()),
-		[]string{idle.Type}, createdAt, createdAt, sql.NullTime{})
+	reconcileForTest(t, o)
 
-	// Non-waiting fetch waves until idle enters.
-	go func() {
-		for range 20 {
-			_, _ = o.fetchAndDispatch(ctx, false)
-			time.Sleep(5 * time.Millisecond)
+	// Saturate the sat key: claim passes until the stable fixpoint is reached
+	// (one delivery executing in the blocked handler, queueDepth queued, no
+	// free queue slot left — the worker cannot pop any more).
+	const satDepth = 2
+	waitUntil(t, 5*time.Second, func() bool {
+		if _, err := o.fetchAndDispatch(ctx, false); err != nil {
+			t.Errorf("fetchAndDispatch: %v", err)
+			return true
 		}
-	}()
+		return brClaimedForKey(t, o, saturated.Type) == satDepth+1 && o.dispatch.freeCapacity(saturated.Type) == 0
+	})
+	satClaimedBefore := brClaimedForKey(t, o, saturated.Type)
+	if satClaimedBefore != satDepth+1 {
+		t.Fatalf("saturated key claimed %d, want %d (queue full plus the executing delivery)", satClaimedBefore, satDepth+1)
+	}
+	if brUnclaimedForKey(t, o, saturated.Type) == 0 {
+		t.Fatal("saturated key has no backlog left; test would not prove anything")
+	}
 
+	// The other key's delivery arrives while sat is saturated and blocked.
+	_, idleDeliveryID := insertDeliveryDirect(t, o, deliverySeed{
+		Event:       brOtherEvent("free"),
+		HandlerType: idle.Type,
+		CreatedAt:   createdAt,
+	})
+	lcResolveSerial(t, o, idleDeliveryID, idle.Type)
+
+	if _, err := o.fetchAndDispatch(ctx, false); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case <-idleEntered:
 	case <-time.After(3 * time.Second):
 		t.Fatal("free_key did not run while sat_key queue was saturated")
 	}
-
-	close(blockRelease)
-	// Clean up remaining.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		_, _ = o.fetchAndDispatch(ctx, true)
-		if outboxRowCount(t, db) == 0 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	// The saturated key must not have taken anything more in that pass.
+	if got := brClaimedForKey(t, o, saturated.Type); got != satClaimedBefore {
+		t.Fatalf("saturated key claimed %d, want %d (queue was full)", got, satClaimedBefore)
 	}
+
+	closeOnce(blockRelease)
+	brDrain(t, o, ctx)
 }
 
-// TestOutboxNewMessageWhileSlowKeyRuns: publish/seed a new message for another
-// key while a slow key is in-flight; new message is claimed without waiting for slow.
+// TestOutboxNewMessageWhileSlowKeyRuns: a new delivery for another key while a
+// slow key is in flight is claimed without waiting for the slow key.
 func TestOutboxNewMessageWhileSlowKeyRuns(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -294,7 +394,6 @@ func TestOutboxNewMessageWhileSlowKeyRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer o.Close()
 
 	slowRelease := make(chan struct{})
 	slowEntered := make(chan struct{})
@@ -311,6 +410,9 @@ func TestOutboxNewMessageWhileSlowKeyRuns(t *testing.T) {
 	}
 	close(fast.release)
 
+	t.Cleanup(func() { _ = o.Close() })
+	t.Cleanup(func() { closeOnce(slowRelease) })
+
 	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, slow); err != nil {
 		t.Fatal(err)
 	}
@@ -319,45 +421,56 @@ func TestOutboxNewMessageWhileSlowKeyRuns(t *testing.T) {
 	}
 
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, uuid.New().String(), newTestEvent("slow"), []string{slow.Type}, createdAt, createdAt, sql.NullTime{})
+	insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("slow"),
+		HandlerType: slow.Type,
+		CreatedAt:   createdAt,
+	})
+	reconcileForTest(t, o)
 
-	go func() { _, _ = o.fetchAndDispatch(ctx, false) }()
-
+	if _, err := o.fetchAndDispatch(ctx, false); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case <-slowEntered:
 	case <-time.After(3 * time.Second):
 		t.Fatal("slow did not enter")
 	}
 
-	// New message for a different key while slow is still running.
-	seedOutboxEventWithID(t, db, o, uuid.New().String(),
-		eh.NewEvent(mocks.EventOtherType, &mocks.EventData{Content: "fast"}, time.Now()),
-		[]string{fast.Type}, createdAt, createdAt, sql.NullTime{})
-	_, _ = o.fetchAndDispatch(ctx, false)
+	// New delivery for a different key while slow is still running.
+	_, fastDeliveryID := insertDeliveryDirect(t, o, deliverySeed{
+		Event:       brOtherEvent("fast"),
+		HandlerType: fast.Type,
+		CreatedAt:   createdAt,
+	})
+	lcResolveSerial(t, o, fastDeliveryID, fast.Type)
 
+	if _, err := o.fetchAndDispatch(ctx, false); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case <-fastEntered:
 	case <-time.After(3 * time.Second):
 		t.Fatal("new message on free key was not claimed while slow still held")
 	}
 
-	close(slowRelease)
-	_, _ = o.fetchAndDispatch(ctx, true)
+	closeOnce(slowRelease)
+	brDrain(t, o, ctx)
 }
 
-// TestOutboxPaginationReachesIdleBehindFullKeyBacklog: more than maxFetchBatch
-// due rows on a saturated key must not starve a later idle-key record in the
-// same claim transaction wave.
-func TestOutboxPaginationReachesIdleBehindFullKeyBacklog(t *testing.T) {
+// TestOutboxPaginationlessBacklogDoesNotHideIdleKey replaces the v1
+// OFFSET-pagination test. There is no paging any more: each dispatch key is
+// selected separately, so a large backlog on a saturated key can neither hide
+// an idle key nor claim more than the key's queue depth in one pass. The idle
+// key's delivery must be claimed in the FIRST pass after it is due.
+func TestOutboxPaginationlessBacklogDoesNotHideIdleKey(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
-	o, err := NewOutbox(db, WithMaxGoroutines(2), WithAdmissionLimit(8))
+	const queueDepth = 2
+	o, err := NewOutbox(db, WithMaxGoroutines(2), WithAdmissionLimit(8), WithQueueDepth(queueDepth))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Tiny queue so sat key fills quickly; pagination must walk past the backlog.
-	o.queueDepth = 2
-	o.dispatch = newDispatchRegistry(o, 2, o.dispatchStats)
 
 	slowRelease := make(chan struct{})
 	slowEntered := make(chan struct{})
@@ -374,8 +487,7 @@ func TestOutboxPaginationReachesIdleBehindFullKeyBacklog(t *testing.T) {
 	}
 	close(idle.release)
 
-	// Production Close waits for in-flight handlers; always release before Close.
-	// Cleanup runs LIFO: register Close first so release runs first.
+	// Close waits for in-flight handlers; always release before Close.
 	t.Cleanup(func() { _ = o.Close() })
 	t.Cleanup(func() { closeOnce(slowRelease) })
 
@@ -386,28 +498,38 @@ func TestOutboxPaginationReachesIdleBehindFullKeyBacklog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// ORDER BY available_at, created_at, id — sat backlog fills >1 page
-	// (maxFetchBatch), idle is strictly later by available_at (no time.Time
-	// cursor comparisons; planAndClaim uses LIMIT/OFFSET in one TX).
+	// A backlog far larger than any single fetch batch on the saturated key,
+	// and one idle-key delivery that is strictly later by available_at.
 	base := time.Date(2020, 1, 1, 12, 0, 0, 0, time.UTC)
 	backlog := maxFetchBatch + 10
 	for i := range backlog {
 		ts := base.Add(time.Duration(i) * time.Second)
-		seedOutboxEventWithID(t, db, o, uuid.New().String(), newTestEvent(fmt.Sprintf("sat-%d", i)),
-			[]string{slow.Type}, ts, ts, sql.NullTime{})
+		insertDeliveryDirect(t, o, deliverySeed{
+			Event:       newTestEvent(fmt.Sprintf("sat-%d", i)),
+			HandlerType: slow.Type,
+			CreatedAt:   ts,
+		})
 	}
 	idleAt := base.Add(24 * time.Hour)
-	seedOutboxEventWithID(t, db, o, uuid.New().String(),
-		eh.NewEvent(mocks.EventOtherType, &mocks.EventData{Content: "idle"}, idleAt),
-		[]string{idle.Type}, idleAt, idleAt, sql.NullTime{})
+	insertDeliveryDirect(t, o, deliverySeed{
+		Event:       brOtherEvent("idle"),
+		HandlerType: idle.Type,
+		CreatedAt:   idleAt,
+	})
+	reconcileForTest(t, o)
 
-	// Single claim wave must OFFSET-page past the sat backlog and include idle.
+	// FIRST pass after both are due: the idle key must be served although the
+	// saturated key sits in front of it with a huge backlog.
 	n, err := o.fetchAndDispatch(ctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n < 2 {
-		t.Fatalf("claimed = %d, want at least sat+idle (pagination failed to reach idle)", n)
+		t.Fatalf("claimed = %d, want at least sat+idle in the first pass", n)
+	}
+	satClaimed := brClaimedForKey(t, o, slow.Type)
+	if satClaimed > queueDepth {
+		t.Fatalf("saturated key claimed %d in one pass, want <= queue depth %d", satClaimed, queueDepth)
 	}
 
 	select {
@@ -415,30 +537,37 @@ func TestOutboxPaginationReachesIdleBehindFullKeyBacklog(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("saturated key did not start")
 	}
-
-	// Idle must enter before slow is released.
 	select {
 	case <-idleEntered:
 	case <-time.After(3 * time.Second):
-		t.Fatal("idle key behind full-key backlog > maxFetchBatch never claimed")
+		t.Fatal("idle key behind a full-key backlog was not claimed in the first pass")
+	}
+	// Let the idle delivery's finalize transaction commit before claiming again.
+	waitUntil(t, 3*time.Second, func() bool { return countDeliveries(t, o) == backlog })
+
+	// Further passes while the saturated handler is still blocked: the per-pass
+	// claim for that key never exceeds its queue depth.
+	for pass := range 4 {
+		before := brClaimedForKey(t, o, slow.Type)
+		if _, err := o.fetchAndDispatch(ctx, false); err != nil {
+			t.Fatal(err)
+		}
+		after := brClaimedForKey(t, o, slow.Type)
+		if after-before > queueDepth {
+			t.Fatalf("pass %d claimed %d deliveries for the saturated key, want <= %d", pass, after-before, queueDepth)
+		}
+	}
+	if brUnclaimedForKey(t, o, slow.Type) == 0 {
+		t.Fatal("whole saturated backlog was claimed although its handler is blocked")
 	}
 
 	closeOnce(slowRelease)
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		_, _ = o.fetchAndDispatch(ctx, true)
-		if outboxRowCount(t, db) == 0 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("leftover outbox rows = %d", got)
-	}
+	brDrain(t, o, ctx)
 }
 
-// TestOutboxMissingHandlerLeavesUnclaimed: stored handler no longer registered
-// must not delete the row (no silent loss).
+// TestOutboxMissingHandlerLeavesUnclaimed: a stored handler that is no longer
+// registered is flagged unresolved at startup, never claimed and never deleted;
+// the sibling delivery of the SAME publication is delivered independently.
 func TestOutboxMissingHandlerLeavesUnclaimed(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -448,55 +577,78 @@ func TestOutboxMissingHandlerLeavesUnclaimed(t *testing.T) {
 	}
 	defer o.Close()
 
-	// Register a different handler than the one stored on the row.
+	// Register a different handler than the one stored on the orphan delivery.
 	live := mocks.NewEventHandler("live_handler")
 	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, live); err != nil {
 		t.Fatal(err)
 	}
 
-	id := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, id, newTestEvent("orphan"), []string{"gone_handler"}, createdAt, createdAt, sql.NullTime{})
+	event := newTestEvent("orphan")
+	publicationID, goneID := insertDeliveryDirect(t, o, deliverySeed{
+		Event:       event,
+		HandlerType: "gone_handler",
+		CreatedAt:   createdAt,
+	})
+	// Same publication, resolvable recipient: must be delivered independently.
+	liveID := brInsertSiblingDelivery(t, o, publicationID, event, live.Type, createdAt)
 
-	// Seed a healthy row that must still progress.
-	okID := uuid.New().String()
-	seedOutboxEventWithID(t, db, o, okID, newTestEvent("ok"), []string{live.Type}, createdAt, createdAt, sql.NullTime{})
-
-	if _, err := o.processBatch(ctx); err != nil {
+	// StartChecked reconciles: gone_handler becomes unresolved, live gets a key.
+	if err := o.StartChecked(); err != nil {
 		t.Fatal(err)
 	}
 
-	if got := outboxRowCount(t, db); got != 1 {
-		t.Fatalf("outbox rows = %d, want 1 (orphan left unclaimed)", got)
+	if !live.Wait(3 * time.Second) {
+		t.Fatal("sibling delivery of the same publication was not delivered")
 	}
-	var remaining string
-	if err := db.QueryRow(`SELECT id FROM outbox`).Scan(&remaining); err != nil {
+	waitUntil(t, 3*time.Second, func() bool { return countDeliveries(t, o) == 1 })
+
+	// The orphan is never claimed, not even by an explicit claim pass.
+	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
-	}
-	if remaining != id {
-		t.Fatalf("remaining id = %s, want orphan %s", remaining, id)
-	}
-	var takenAt sql.NullTime
-	if err := db.QueryRow(`SELECT taken_at FROM outbox WHERE id = ?`, id).Scan(&takenAt); err != nil {
-		t.Fatal(err)
-	}
-	if takenAt.Valid {
-		t.Fatal("orphan row must stay unclaimed (taken_at NULL)")
+	} else if processed != 0 {
+		t.Fatalf("processBatch = %d, want 0 (unresolved delivery is never claimed)", processed)
 	}
 
-	// Diagnostic error should be visible.
-	found := false
-	for range 8 {
+	rows := listDeliveries(t, o)
+	if len(rows) != 1 {
+		t.Fatalf("deliveries = %d, want 1 (orphan left in place)", len(rows))
+	}
+	row := rows[0]
+	if row.ID != goneID {
+		t.Fatalf("remaining delivery = %s, want orphan %s (live %s should be gone)", row.ID, goneID, liveID)
+	}
+	if row.TakenAt.Valid {
+		t.Fatal("orphan delivery must stay unclaimed (taken_at NULL)")
+	}
+	if !row.UnresolvedAt.Valid {
+		t.Fatal("orphan delivery must carry unresolved_at")
+	}
+	if row.DispatchKey != "" {
+		t.Fatalf("orphan dispatch_key = %q, want NULL", row.DispatchKey)
+	}
+	// The publication stays alive while any delivery references it.
+	if got := countPublications(t, o); got != 1 {
+		t.Fatalf("publications = %d, want 1 (orphan delivery still references it)", got)
+	}
+
+	// Diagnostic error must be visible on Errors().
+	var found error
+	deadline := time.After(3 * time.Second)
+wait:
+	for {
 		select {
 		case err := <-o.Errors():
-			if err != nil && strings.Contains(err.Error(), "unresolvable handlers") {
-				found = true
+			if errors.Is(err, ErrUnresolvedHandler) && strings.Contains(err.Error(), "gone_handler") {
+				found = err
+				break wait
 			}
-		default:
+		case <-deadline:
+			break wait
 		}
 	}
-	if !found {
-		t.Fatal("expected diagnostic error for unresolvable handlers")
+	if found == nil {
+		t.Fatal("expected ErrUnresolvedHandler diagnostics for gone_handler")
 	}
 }
 
@@ -554,11 +706,21 @@ func TestOutboxFairHandleEventLimitPreferWaitingKey(t *testing.T) {
 	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventOtherType}, idle); err != nil {
 		t.Fatal(err)
 	}
+	// Registration closed + dispatch-key ring computed; rows are seeded and
+	// resolved individually below so in-flight claims are never reset.
+	prepareWithoutFetcher(t, o)
 
 	createdAt := time.Now().Add(-time.Minute)
-	// Phase 1: only hot-1 so it alone holds the single permit.
-	seedOutboxEventWithID(t, db, o, uuid.New().String(), newTestEvent("h1"), []string{hot.Type}, createdAt, createdAt, sql.NullTime{})
-	go func() { _, _ = o.fetchAndDispatch(ctx, false) }()
+	// Phase 1: only hot-1, so it alone holds the single permit.
+	_, h1 := insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("h1"),
+		HandlerType: hot.Type,
+		CreatedAt:   createdAt,
+	})
+	lcResolveSerial(t, o, h1, hot.Type)
+	if _, err := o.fetchAndDispatch(ctx, false); err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case <-hotEntered1:
@@ -566,43 +728,40 @@ func TestOutboxFairHandleEventLimitPreferWaitingKey(t *testing.T) {
 		t.Fatal("hot-1 did not enter")
 	}
 
-	// Phase 2: while hot-1 holds the permit, seed idle + hot-2 and dispatch so
-	// both queue on the fair semaphore (idle waiter must be registered first).
-	seedOutboxEventWithID(t, db, o, uuid.New().String(),
-		eh.NewEvent(mocks.EventOtherType, &mocks.EventData{Content: "i1"}, time.Now()),
-		[]string{idle.Type}, createdAt.Add(time.Millisecond), createdAt.Add(time.Millisecond), sql.NullTime{})
-	// Dispatch idle alone first so its worker is the first fairSem waiter.
-	go func() { _, _ = o.fetchAndDispatch(ctx, false) }()
-	deadlineWait := time.Now().Add(2 * time.Second)
-	for !o.handleSem.hasWaiters() && time.Now().Before(deadlineWait) {
-		time.Sleep(2 * time.Millisecond)
+	// Phase 2: while hot-1 holds the permit, dispatch idle alone so its worker
+	// is the first fairSem waiter.
+	_, i1 := insertDeliveryDirect(t, o, deliverySeed{
+		Event:       brOtherEvent("i1"),
+		HandlerType: idle.Type,
+		CreatedAt:   createdAt.Add(time.Millisecond),
+	})
+	lcResolveSerial(t, o, i1, idle.Type)
+	if _, err := o.fetchAndDispatch(ctx, false); err != nil {
+		t.Fatal(err)
 	}
-	if !o.handleSem.hasWaiters() {
-		t.Fatal("idle did not queue on fairSem while hot-1 held the permit")
-	}
+	waitUntil(t, 3*time.Second, func() bool { return o.handleSem.hasWaiters() })
 
-	seedOutboxEventWithID(t, db, o, uuid.New().String(), newTestEvent("h2"), []string{hot.Type},
-		createdAt.Add(2*time.Millisecond), createdAt.Add(2*time.Millisecond), sql.NullTime{})
-	go func() { _, _ = o.fetchAndDispatch(ctx, false) }()
-	// hot-2 sits in the hot key queue; when hot-1 finishes it will acquire after idle.
-	time.Sleep(20 * time.Millisecond)
+	// hot-2 sits in the hot key queue; when hot-1 finishes, its worker acquires
+	// the permit only after the already waiting idle worker.
+	_, h2 := insertDeliveryDirect(t, o, deliverySeed{
+		Event:       newTestEvent("h2"),
+		HandlerType: hot.Type,
+		CreatedAt:   createdAt.Add(2 * time.Millisecond),
+	})
+	lcResolveSerial(t, o, h2, hot.Type)
+	if _, err := o.fetchAndDispatch(ctx, false); err != nil {
+		t.Fatal(err)
+	}
 
 	closeOnce(hotRelease1)
 
 	select {
 	case <-idleEntered:
 	case <-time.After(3 * time.Second):
-		t.Fatal("idle did not enter after hot-1 released permit")
+		t.Fatal("idle did not enter after hot-1 released the permit")
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		_, _ = o.fetchAndDispatch(ctx, true)
-		if outboxRowCount(t, db) == 0 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	brDrain(t, o, ctx)
 
 	orderMu.Lock()
 	got := append([]string(nil), order...)
@@ -630,6 +789,210 @@ func TestOutboxFairHandleEventLimitPreferWaitingKey(t *testing.T) {
 	if !(idxHot1 < idxIdle && idxIdle < idxHot2) {
 		t.Fatalf("fairness order = %v, want hot-1 before idle before hot-2", got)
 	}
+}
+
+// TestOutboxRoundRobinAcrossKeysWhenAdmissionLimited proves the v2 claim
+// fairness: when free admission slots are fewer than the total demand, the
+// round-robin pass gives every active dispatch key a quantum before any key
+// gets a second delivery, FIFO by seq inside each key. A key that appears only
+// after admission is saturated is served as soon as a slot frees — it does not
+// wait for the earlier keys' whole backlog.
+func TestOutboxRoundRobinAcrossKeysWhenAdmissionLimited(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	// Queue depth 1 bounds each key's quantum to a single delivery per pass,
+	// so the pass has to rotate to serve the other keys.
+	o, err := NewOutbox(db, WithMaxGoroutines(8), WithAdmissionLimit(3), WithQueueDepth(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newHandler := func(name string, blocked bool) *brRecordingBlockHandler {
+		h := &brRecordingBlockHandler{
+			Type:    name,
+			entered: make(chan string, 16),
+			release: make(chan struct{}),
+		}
+		if !blocked {
+			close(h.release)
+		}
+		return h
+	}
+	// Sorted dispatch keys: rr_a < rr_b < rr_c < rr_late.
+	hotNames := []string{"rr_a", "rr_b", "rr_c"}
+	hot := map[string]*brRecordingBlockHandler{}
+	for _, name := range hotNames {
+		hot[name] = newHandler(name, true)
+	}
+	late := newHandler("rr_late", false)
+
+	t.Cleanup(func() { _ = o.Close() })
+	t.Cleanup(func() {
+		for _, h := range hot {
+			closeOnce(h.release)
+		}
+	})
+
+	for _, name := range hotNames {
+		if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, hot[name]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventOtherType}, late); err != nil {
+		t.Fatal(err)
+	}
+
+	// Four publications, each with one delivery per hot handler (12 deliveries,
+	// 4 per key). Insertion order gives per-key FIFO by seq.
+	createdAt := time.Now().Add(-time.Minute)
+	const publications = 4
+	for i := range publications {
+		event := newTestEvent(fmt.Sprintf("pub-%d", i))
+		publicationID, _ := insertDeliveryDirect(t, o, deliverySeed{
+			Event:       event,
+			HandlerType: hotNames[0],
+			CreatedAt:   createdAt.Add(time.Duration(i) * time.Millisecond),
+		})
+		for _, name := range hotNames[1:] {
+			brInsertSiblingDelivery(t, o, publicationID, event, name, createdAt.Add(time.Duration(i)*time.Millisecond))
+		}
+	}
+	reconcileForTest(t, o)
+
+	// Remember each key's FIFO head before the pass.
+	headSeq := map[string]int64{}
+	for _, name := range hotNames {
+		headSeq[name] = brMinSeqForKey(t, o, name)
+	}
+
+	// One pass with free slots (3) < demand (12).
+	claimed, err := o.fetchAndDispatch(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed != 3 {
+		t.Fatalf("claimed = %d, want 3 (one per active key, admission limit 3)", claimed)
+	}
+
+	// Quantum fairness: every active key got exactly one — no key got a second
+	// delivery before the others got their first.
+	for _, name := range hotNames {
+		if got := brClaimedForKey(t, o, name); got != 1 {
+			t.Fatalf("key %s claimed %d deliveries in the pass, want exactly 1 before any key gets a second", name, got)
+		}
+	}
+	// FIFO inside each key: the claimed delivery is the key's lowest seq.
+	for _, row := range listDeliveries(t, o) {
+		if !row.TakenAt.Valid {
+			continue
+		}
+		if row.Seq != headSeq[row.DispatchKey] {
+			t.Fatalf("key %s claimed seq %d, want FIFO head %d", row.DispatchKey, row.Seq, headSeq[row.DispatchKey])
+		}
+	}
+	for _, name := range hotNames {
+		select {
+		case <-hot[name].entered:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("handler %s did not enter", name)
+		}
+	}
+	if used, limit := o.AdmissionSnapshot(); used != 3 || limit != 3 {
+		t.Fatalf("AdmissionSnapshot = (%d, %d), want (3, 3)", used, limit)
+	}
+
+	// A new key arrives after admission is saturated.
+	_, lateDeliveryID := insertDeliveryDirect(t, o, deliverySeed{
+		Event:       brOtherEvent("late"),
+		HandlerType: late.Type,
+		CreatedAt:   time.Now().Add(-time.Second),
+	})
+	lcResolveSerial(t, o, lateDeliveryID, late.Type)
+
+	if n, err := o.fetchAndDispatch(ctx, false); err != nil {
+		t.Fatal(err)
+	} else if n != 0 {
+		t.Fatalf("claimed = %d while admission is full, want 0", n)
+	}
+
+	// Free exactly one slot by releasing the first key's handler.
+	closeOnce(hot[hotNames[0]].release)
+	waitUntil(t, 3*time.Second, func() bool {
+		used, _ := o.AdmissionSnapshot()
+		return used == 2
+	})
+
+	// Backlog of the earlier keys is still there; the late key must not wait for it.
+	for _, name := range hotNames {
+		if got := brUnclaimedForKey(t, o, name); got < 3 {
+			t.Fatalf("key %s backlog = %d, want >= 3 (late key must not wait for it)", name, got)
+		}
+	}
+
+	if n, err := o.fetchAndDispatch(ctx, false); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Fatalf("claimed = %d after one slot freed, want 1 (the late key)", n)
+	}
+	select {
+	case <-late.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("late key was not served as soon as a slot freed")
+	}
+
+	// Release everything and drain; per-key delivery order must stay FIFO.
+	for _, h := range hot {
+		closeOnce(h.release)
+	}
+	brDrain(t, o, ctx)
+
+	want := make([]string, 0, publications)
+	for i := range publications {
+		want = append(want, fmt.Sprintf("pub-%d", i))
+	}
+	for _, name := range hotNames {
+		got := hot[name].Seen()
+		if !slicesEqual(got, want) {
+			t.Fatalf("key %s handled %v, want FIFO %v", name, got, want)
+		}
+	}
+	if got := late.Seen(); len(got) != 1 || got[0] != "late" {
+		t.Fatalf("late key handled %v, want [late]", got)
+	}
+}
+
+// brRecordingBlockHandler records the contents it handled (per key FIFO
+// assertions) and blocks until its release channel is closed.
+type brRecordingBlockHandler struct {
+	Type    string
+	entered chan string
+	release chan struct{}
+
+	mu   sync.Mutex
+	seen []string
+}
+
+func (h *brRecordingBlockHandler) HandlerType() eh.EventHandlerType {
+	return eh.EventHandlerType(h.Type)
+}
+
+func (h *brRecordingBlockHandler) HandleEvent(_ context.Context, event eh.Event) error {
+	content := eventContent(event)
+	h.mu.Lock()
+	h.seen = append(h.seen, content)
+	h.mu.Unlock()
+	select {
+	case h.entered <- content:
+	default:
+	}
+	<-h.release
+	return nil
+}
+
+func (h *brRecordingBlockHandler) Seen() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.seen...)
 }
 
 // closeOnce closes ch if still open (safe from multiple success/cleanup paths).

@@ -3,7 +3,6 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +14,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	dl "github.com/vercly/eh-sqlite/deadletter"
+	"github.com/vercly/eh-sqlite/schema"
 
 	txctx "github.com/vercly/eh-sqlite/context/sqlite"
 	eh "github.com/vercly/eventhorizon"
@@ -136,6 +136,8 @@ func TestOutboxIntegrationStaticRegistration(t *testing.T) {
 	}
 }
 
+// TestWithTableNameIntegration asserts the prefix contract: the v2 tables are
+// <prefix>_publications and <prefix>_deliveries.
 func TestWithTableNameIntegration(t *testing.T) {
 	db := newTestDB(t)
 
@@ -152,6 +154,26 @@ func TestWithTableNameIntegration(t *testing.T) {
 
 	if o.outboxTable != "foo_outbox" {
 		t.Fatal("table name should use custom table name")
+	}
+	if o.publicationsTable != "foo_outbox_publications" {
+		t.Fatalf("publications table = %s, want foo_outbox_publications", o.publicationsTable)
+	}
+	if o.deliveriesTable != "foo_outbox_deliveries" {
+		t.Fatalf("deliveries table = %s, want foo_outbox_deliveries", o.deliveriesTable)
+	}
+	for _, table := range []string{"foo_outbox_publications", "foo_outbox_deliveries"} {
+		var name string
+		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name); err != nil {
+			t.Fatalf("table %s was not created: %v", table, err)
+		}
+	}
+	// The default-prefix tables must not be created by a prefixed outbox.
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'outbox_deliveries'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("default prefix tables = %d, want 0", count)
 	}
 }
 
@@ -191,7 +213,10 @@ func TestOutboxHandleEventRequiresStart(t *testing.T) {
 		t.Fatalf("HandleEvent before Start error = %v, want ErrOutboxNotStarted", err)
 	}
 	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows before Start = %d, want 0", got)
+		t.Fatalf("delivery rows before Start = %d, want 0", got)
+	}
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publication rows before Start = %d, want 0", got)
 	}
 	if got := deadLetterRowCount(t, db); got != 0 {
 		t.Fatalf("dead letter rows before Start = %d, want 0", got)
@@ -208,7 +233,10 @@ func TestOutboxHandleEventRequiresStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := outboxRowCount(t, db); got != 1 {
-		t.Fatalf("outbox rows after Start = %d, want 1", got)
+		t.Fatalf("delivery rows after Start = %d, want 1", got)
+	}
+	if got := countPublications(t, o); got != 1 {
+		t.Fatalf("publication rows after Start = %d, want 1", got)
 	}
 
 	// Registration is closed after Start.
@@ -249,7 +277,6 @@ func TestOutboxProcessesStaleTakenAtAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	seedOutboxEvent(t, db, firstOutbox, newTestEvent("stale"), "stale_handler", time.Now(), time.Now(), sql.NullTime{Time: time.Now().Add(-2 * PeriodicSweepAge), Valid: true})
 	if err := firstOutbox.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -265,6 +292,16 @@ func TestOutboxProcessesStaleTakenAtAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Delivery left claimed by the previous process, older than the sweep age.
+	_, deliveryID := insertDeliveryDirect(t, restartedOutbox, deliverySeed{
+		Event:       newTestEvent("stale"),
+		HandlerType: restartedHandler.Type,
+		CreatedAt:   time.Now(),
+	})
+	reconcileForTest(t, restartedOutbox)
+	otReadyForClaim(t, restartedOutbox)
+	setTakenAt(t, restartedOutbox, deliveryID, time.Now().Add(-2*PeriodicSweepAge))
+
 	processed, err := restartedOutbox.processBatch(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -273,10 +310,13 @@ func TestOutboxProcessesStaleTakenAtAfterRestart(t *testing.T) {
 		t.Fatalf("processed count = %d, want 1", processed)
 	}
 	if !restartedHandler.Wait(time.Second) {
-		t.Fatal("stale outbox event was not dispatched")
+		t.Fatal("stale outbox delivery was not dispatched")
 	}
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows after processing = %d, want 0", got)
+	if got := countDeliveries(t, restartedOutbox); got != 0 {
+		t.Fatalf("delivery rows after processing = %d, want 0", got)
+	}
+	if got := countPublications(t, restartedOutbox); got != 0 {
+		t.Fatalf("publication rows after processing = %d, want 0", got)
 	}
 }
 
@@ -291,7 +331,6 @@ func TestOutboxDoesNotProcessFreshTakenAtBeforeSweepAge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	seedOutboxEvent(t, db, firstOutbox, newTestEvent("fresh"), "fresh_handler", time.Now(), time.Now(), sql.NullTime{Time: time.Now(), Valid: true})
 	if err := firstOutbox.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -307,6 +346,15 @@ func TestOutboxDoesNotProcessFreshTakenAtBeforeSweepAge(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	_, deliveryID := insertDeliveryDirect(t, restartedOutbox, deliverySeed{
+		Event:       newTestEvent("fresh"),
+		HandlerType: restartedHandler.Type,
+		CreatedAt:   time.Now(),
+	})
+	reconcileForTest(t, restartedOutbox)
+	otReadyForClaim(t, restartedOutbox)
+	setTakenAt(t, restartedOutbox, deliveryID, time.Now())
+
 	processed, err := restartedOutbox.processBatch(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -315,10 +363,10 @@ func TestOutboxDoesNotProcessFreshTakenAtBeforeSweepAge(t *testing.T) {
 		t.Fatalf("processed count = %d, want 0", processed)
 	}
 	if restartedHandler.Wait(50 * time.Millisecond) {
-		t.Fatal("freshly taken event should not be dispatched before PeriodicSweepAge")
+		t.Fatal("freshly taken delivery should not be dispatched before PeriodicSweepAge")
 	}
-	if got := outboxRowCount(t, db); got != 1 {
-		t.Fatalf("outbox rows after skipped processing = %d, want 1", got)
+	if got := countDeliveries(t, restartedOutbox); got != 1 {
+		t.Fatalf("delivery rows after skipped processing = %d, want 1", got)
 	}
 }
 
@@ -361,47 +409,140 @@ func TestOutboxConcurrentPublishDoesNotLoseRows(t *testing.T) {
 	}
 
 	if got := outboxRowCount(t, db); got != events {
-		t.Fatalf("outbox rows after concurrent publish = %d, want %d", got, events)
+		t.Fatalf("delivery rows after concurrent publish = %d, want %d", got, events)
+	}
+	if got := countPublications(t, o); got != events {
+		t.Fatalf("publication rows after concurrent publish = %d, want %d", got, events)
 	}
 }
 
-func TestOutboxAvailableAtMigrationBackfillsExistingRows(t *testing.T) {
+// TestOutboxV1MigrationSplitsRowsIntoPublicationsAndDeliveries replaces the v1
+// available_at backfill test: StartChecked migrates the v1 `outbox` table into
+// publications plus one delivery per handler (or a rematch sentinel for
+// handlers='[]'), preserves the v1 (available_at, created_at, id) order in the
+// delivery sequence, keeps the v1 id as provenance, backfills a NULL
+// available_at from created_at, archives the v1 table and is idempotent.
+func TestOutboxV1MigrationSplitsRowsIntoPublicationsAndDeliveries(t *testing.T) {
 	db := newTestDB(t)
-	createdAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+	ctx := context.Background()
+	createV1Table(t, db, "outbox")
 
-	if _, err := db.Exec(`
-		CREATE TABLE outbox (
-			id TEXT PRIMARY KEY,
-			event_type TEXT NOT NULL,
-			aggregate_id TEXT NOT NULL,
-			created_at TIMESTAMP NOT NULL,
-			taken_at TIMESTAMP,
-			handlers TEXT NOT NULL,
-			event_blob TEXT NOT NULL,
-			retry_count INTEGER DEFAULT 0
-		);
-	`); err != nil {
+	// Everything is seeded in the future so the started processor cannot claim
+	// (and delete) the migrated rows while the assertions run.
+	base := time.Now().Add(time.Hour).UTC().Truncate(time.Millisecond)
+	nullAvailableID := insertV1Row(t, db, "outbox", v1Seed{
+		Event:     newTestEvent("v1-null-available"),
+		Handlers:  []string{"mig_handler"},
+		CreatedAt: base,
+	})
+	// NULL available_at must be backfilled from created_at by the migration.
+	if _, err := db.Exec(`UPDATE outbox SET available_at = NULL WHERE id = ?`, nullAvailableID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`
-		INSERT INTO outbox (id, event_type, aggregate_id, created_at, handlers, event_blob, retry_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, uuid.New().String(), mocks.EventType.String(), uuid.New().String(), createdAt, "[]", "{}", 0); err != nil {
-		t.Fatal(err)
-	}
+	sentinelID := insertV1Row(t, db, "outbox", v1Seed{
+		Event:       newTestEvent("v1-rematch"),
+		Handlers:    []string{},
+		CreatedAt:   base,
+		AvailableAt: base.Add(time.Hour),
+	})
+	twoHandlerID := insertV1Row(t, db, "outbox", v1Seed{
+		Event:       newTestEvent("v1-two-handlers"),
+		Handlers:    []string{"mig_handler", "mig_second"},
+		CreatedAt:   base,
+		AvailableAt: base.Add(2 * time.Hour),
+		RetryCount:  3,
+	})
 
 	o, err := NewOutbox(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer o.Close()
-
-	var availableAt time.Time
-	if err := db.QueryRow(`SELECT available_at FROM outbox LIMIT 1`).Scan(&availableAt); err != nil {
+	for _, handlerType := range []string{"mig_handler", "mig_second"} {
+		if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, mocks.NewEventHandler(handlerType)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := o.StartChecked(); err != nil {
 		t.Fatal(err)
 	}
-	if !availableAt.Equal(createdAt) {
-		t.Fatalf("available_at = %s, want %s", availableAt, createdAt)
+
+	if got := countPublications(t, o); got != 3 {
+		t.Fatalf("publications = %d, want 3 (one per v1 row)", got)
+	}
+	deliveries := listDeliveries(t, o)
+	if len(deliveries) != 4 {
+		t.Fatalf("deliveries = %d, want 4 (1 + sentinel + 2)", len(deliveries))
+	}
+
+	// v1 order (available_at, created_at, id) is preserved by the sequence.
+	wantHandlers := []string{"mig_handler", "", "mig_handler", "mig_second"}
+	wantLegacy := []string{nullAvailableID, sentinelID, twoHandlerID, twoHandlerID}
+	for i, d := range deliveries {
+		if d.HandlerType != wantHandlers[i] {
+			t.Fatalf("delivery[%d] handler_type = %q, want %q", i, d.HandlerType, wantHandlers[i])
+		}
+		if d.LegacyOutboxID != wantLegacy[i] {
+			t.Fatalf("delivery[%d] legacy_outbox_id = %s, want %s", i, d.LegacyOutboxID, wantLegacy[i])
+		}
+		if d.TakenAt.Valid {
+			t.Fatalf("delivery[%d] taken_at must be NULL after migration", i)
+		}
+		if i > 0 && d.Seq <= deliveries[i-1].Seq {
+			t.Fatalf("delivery[%d] seq %d is not increasing", i, d.Seq)
+		}
+	}
+	// Exactly one rematch sentinel, and it has no dispatch key.
+	if deliveries[1].DispatchKey != "" {
+		t.Fatalf("sentinel dispatch_key = %q, want empty", deliveries[1].DispatchKey)
+	}
+	// retry_count is carried over per delivery.
+	for _, i := range []int{2, 3} {
+		if deliveries[i].RetryCount != 3 {
+			t.Fatalf("delivery[%d] retry_count = %d, want 3", i, deliveries[i].RetryCount)
+		}
+	}
+	// NULL available_at was backfilled from created_at.
+	if !deliveries[0].AvailableAt.Equal(base) {
+		t.Fatalf("backfilled available_at = %s, want created_at %s", deliveries[0].AvailableAt, base)
+	}
+	// Timestamps are stored as canonical UTC text.
+	raw := storedText(t, db, `SELECT CAST(available_at AS TEXT) FROM outbox_deliveries WHERE id = ?`, deliveries[0].ID)
+	if !strings.HasSuffix(raw, "+00:00") {
+		t.Fatalf("stored available_at = %q, want canonical UTC text", raw)
+	}
+
+	// The v1 table is archived, never read again.
+	if otTableExists(t, db, "outbox") {
+		t.Fatal("v1 table outbox must be renamed after migration")
+	}
+	if !otTableExists(t, db, "outbox_v1_migrated") {
+		t.Fatal("v1 table must be archived as outbox_v1_migrated")
+	}
+	applied, err := schema.IsApplied(ctx, db, "outbox", "v2_deliveries")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatal("migration marker outbox/v2_deliveries must be recorded")
+	}
+
+	// Re-running the migration (and StartChecked) is a no-op.
+	report, err := Migrate(ctx, db, "outbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Applied {
+		t.Fatalf("second Migrate applied = true, want false")
+	}
+	if err := o.StartChecked(); err != nil {
+		t.Fatal(err)
+	}
+	if got := countPublications(t, o); got != 3 {
+		t.Fatalf("publications after re-run = %d, want 3", got)
+	}
+	if got := countDeliveries(t, o); got != 4 {
+		t.Fatalf("deliveries after re-run = %d, want 4", got)
 	}
 }
 
@@ -484,26 +625,35 @@ func TestOutboxNoMatchWritesDeadLetter(t *testing.T) {
 	}
 
 	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows = %d, want 0", got)
+		t.Fatalf("delivery rows = %d, want 0", got)
+	}
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publication rows = %d, want 0 (nothing stored for a no-match)", got)
 	}
 	if got := deadLetterRowCount(t, db); got != 1 {
 		t.Fatalf("dead letter rows = %d, want 1", got)
 	}
 
 	var handlerType, source, errMsg string
-	if err := db.QueryRow(`SELECT handler_type, source, error FROM dead_letters LIMIT 1`).Scan(&handlerType, &source, &errMsg); err != nil {
+	var outboxID, publicationID sql.NullString
+	if err := db.QueryRow(`SELECT handler_type, source, error, outbox_id, publication_id FROM dead_letters LIMIT 1`).
+		Scan(&handlerType, &source, &errMsg, &outboxID, &publicationID); err != nil {
 		t.Fatal(err)
 	}
 	if handlerType != "no_match" || source != "outbox" || errMsg != "no matching handlers" {
 		t.Fatalf("dead letter = (%s, %s, %s), want no_match/outbox/no matching handlers", handlerType, source, errMsg)
 	}
+	if outboxID.Valid || publicationID.Valid {
+		t.Fatalf("no_match dead letter must keep outbox_id/publication_id NULL, got %v/%v", outboxID, publicationID)
+	}
 }
 
-// TestOutboxEmptyHandlersRematch dispatches rows with handlers=[] against the
-// current registration (replay rematch contract). Still unmatched rows stay
-// unclaimed and are never deleted.
+// TestOutboxEmptyHandlersRematch expands rematch sentinels (handler_type NULL)
+// against the current registration. Sentinels that still match nothing stay
+// unclaimed and are never deleted (they are flagged unresolved instead).
 func TestOutboxEmptyHandlersRematch(t *testing.T) {
 	db := newTestDB(t)
+	_ = db
 	o, err := NewOutbox(db)
 	if err != nil {
 		t.Fatal(err)
@@ -514,49 +664,52 @@ func TestOutboxEmptyHandlersRematch(t *testing.T) {
 	if err := o.AddHandler(context.Background(), eh.MatchEvents{mocks.EventType}, handler); err != nil {
 		t.Fatal(err)
 	}
-	if err := o.StartChecked(); err != nil {
-		t.Fatal(err)
-	}
 
-	now := time.Now()
-	matchedID := uuid.New().String()
-	unmatchedID := uuid.New().String()
-	seedOutboxEventWithID(t, db, o, matchedID, newTestEvent("rematch-hit"), []string{}, now, now, sql.NullTime{})
+	now := time.Now().Add(-time.Minute)
+	matchedPub, matchedSentinel := insertDeliveryDirect(t, o, deliverySeed{
+		Event:     newTestEvent("rematch-hit"),
+		CreatedAt: now,
+	})
 	// EventOtherType has no matching handler in this outbox.
 	other := eh.NewEvent(mocks.EventOtherType, &mocks.EventData{Content: "nope"}, now,
 		eh.ForAggregate(mocks.AggregateType, uuid.New(), 1))
-	seedOutboxEventWithID(t, db, o, unmatchedID, other, []string{}, now, now, sql.NullTime{})
+	_, unmatchedSentinel := insertDeliveryDirect(t, o, deliverySeed{
+		Event:     other,
+		CreatedAt: now,
+	})
 
 	processAllBatches(t, o, context.Background())
-	// Allow in-flight handler completion.
 	if !handler.Wait(3 * time.Second) {
 		t.Fatal("rematch handler did not receive event")
 	}
 
-	// Matched rematch row should complete and leave outbox.
-	var matchedLeft int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM outbox WHERE id = ?`, matchedID).Scan(&matchedLeft); err != nil {
-		t.Fatal(err)
+	// Matched sentinel was replaced by a real delivery, which completed; its
+	// publication is garbage collected with the last delivery.
+	if otDeliveryExists(t, o, matchedSentinel) {
+		t.Fatal("matched rematch sentinel still present")
 	}
-	if matchedLeft != 0 {
-		t.Fatalf("matched rematch row still in outbox")
+	if otPublicationExists(t, o, matchedPub) {
+		t.Fatal("publication of the completed rematch delivery was not garbage collected")
 	}
 
-	// Unmatched rematch stays unclaimed (never deleted).
-	var unmatchedHandlers string
-	var unmatchedTaken sql.NullTime
-	if err := db.QueryRow(`SELECT handlers, taken_at FROM outbox WHERE id = ?`, unmatchedID).
-		Scan(&unmatchedHandlers, &unmatchedTaken); err != nil {
-		t.Fatal(err)
+	// Unmatched sentinel stays unclaimed and visible (never deleted).
+	remaining := listDeliveries(t, o)
+	if len(remaining) != 1 || remaining[0].ID != unmatchedSentinel {
+		t.Fatalf("remaining deliveries = %+v, want only the unmatched sentinel", remaining)
 	}
-	if unmatchedHandlers != "[]" || unmatchedTaken.Valid {
-		t.Fatalf("unmatched rematch: handlers=%s taken=%v (want [] unclaimed)", unmatchedHandlers, unmatchedTaken)
+	if remaining[0].HandlerType != "" {
+		t.Fatalf("unmatched sentinel handler_type = %q, want NULL", remaining[0].HandlerType)
+	}
+	if remaining[0].TakenAt.Valid {
+		t.Fatal("unmatched sentinel must stay unclaimed")
+	}
+	if !remaining[0].UnresolvedAt.Valid {
+		t.Fatal("unmatched sentinel must be flagged unresolved (visible, not silent)")
 	}
 }
 
-// TestOutboxRematchPartialSuccessRetryable keeps the failed handler after rematch.
-// Without persisting matched handlers at claim time, remainingHandlers([]) would
-// delete the row and silently drop retryable work.
+// TestOutboxRematchPartialSuccessRetryable keeps the failed handler's delivery
+// after a sentinel expansion; the successful sibling is deleted independently.
 func TestOutboxRematchPartialSuccessRetryable(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -576,48 +729,49 @@ func TestOutboxRematchPartialSuccessRetryable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	// Rematch sentinel: empty handlers list.
-	seedOutboxEventWithID(t, db, o, id, newTestEvent("rematch-partial-retry"), []string{}, createdAt, createdAt, sql.NullTime{})
+	insertDeliveryDirect(t, o, deliverySeed{Event: newTestEvent("rematch-partial-retry"), CreatedAt: createdAt})
+	otReadyForClaim(t, o)
 
+	// One sentinel expanded (+1) and its two deliveries claimed (+2).
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
-	} else if processed != 1 {
-		t.Fatalf("processed = %d, want 1", processed)
+	} else if processed != 3 {
+		t.Fatalf("processed = %d, want 3 (1 sentinel expansion + 2 deliveries)", processed)
 	}
 
 	if !successHandler.Wait(2 * time.Second) {
 		t.Fatal("success handler did not run")
 	}
-	// Row must survive with only the retryable handler remaining (no silent delete).
-	if got := outboxRowCount(t, db); got != 1 {
-		t.Fatalf("outbox rows = %d, want 1 (retryable work kept)", got)
+	// Only the retryable delivery survives (no silent drop of retryable work).
+	deliveries := listDeliveries(t, o)
+	if len(deliveries) != 1 {
+		t.Fatalf("deliveries = %d, want 1 (retryable work kept)", len(deliveries))
 	}
-	assertOutboxHandlers(t, db, id, []string{retryHandler.Type})
-	var retryCount int
-	var availableAt time.Time
-	var takenAt sql.NullTime
-	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox WHERE id = ?`, id).
-		Scan(&retryCount, &availableAt, &takenAt); err != nil {
-		t.Fatal(err)
+	d := deliveries[0]
+	if d.HandlerType != retryHandler.Type {
+		t.Fatalf("remaining handler_type = %s, want %s", d.HandlerType, retryHandler.Type)
 	}
-	if retryCount != 1 {
-		t.Fatalf("retry_count = %d, want 1", retryCount)
+	if d.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", d.RetryCount)
 	}
-	if !availableAt.After(time.Now().Add(100 * time.Millisecond)) {
-		t.Fatalf("available_at = %s, want future retry backoff", availableAt)
+	if !d.AvailableAt.After(time.Now().Add(100 * time.Millisecond)) {
+		t.Fatalf("available_at = %s, want future retry backoff", d.AvailableAt)
 	}
-	if takenAt.Valid {
+	if d.TakenAt.Valid {
 		t.Fatal("taken_at should be cleared for retry")
+	}
+	if got := countPublications(t, o); got != 1 {
+		t.Fatalf("publications = %d, want 1 (kept while a delivery remains)", got)
 	}
 	if got := deadLetterRowCount(t, db); got != 0 {
 		t.Fatalf("dead letter rows = %d, want 0 for retryable failure", got)
 	}
 }
 
-// TestOutboxRematchPartialSuccessFatal DLQs only the fatal handler after rematch
-// and deletes the row when no retryable work remains (success was removed).
+// TestOutboxRematchPartialSuccessFatal dead-letters only the fatal delivery
+// after a sentinel expansion and removes the publication once the last
+// delivery is gone.
 func TestOutboxRematchPartialSuccessFatal(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -637,34 +791,40 @@ func TestOutboxRematchPartialSuccessFatal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, id, newTestEvent("rematch-partial-fatal"), []string{}, createdAt, createdAt, sql.NullTime{})
+	publicationID, _ := insertDeliveryDirect(t, o, deliverySeed{Event: newTestEvent("rematch-partial-fatal"), CreatedAt: createdAt})
+	otReadyForClaim(t, o)
 
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
-	} else if processed != 1 {
-		t.Fatalf("processed = %d, want 1", processed)
+	} else if processed != 3 {
+		t.Fatalf("processed = %d, want 3", processed)
 	}
 
 	if !successHandler.Wait(2 * time.Second) {
 		t.Fatal("success handler did not run")
 	}
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows = %d, want 0 after success+terminal", got)
+	if got := countDeliveries(t, o); got != 0 {
+		t.Fatalf("deliveries = %d, want 0 after success+terminal", got)
+	}
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publications = %d, want 0 after the last delivery finalized", got)
 	}
 	assertDeadLetterHandlers(t, db, []string{fatalHandler.Type})
 	record := deadLetterRecordByHandler(t, db, fatalHandler.Type)
-	if record.OutboxID != id {
-		t.Fatalf("outbox_id = %s, want %s", record.OutboxID, id)
-	}
 	if record.RemainingHandlers != "[]" {
-		t.Fatalf("remaining_handlers = %s, want []", record.RemainingHandlers)
+		t.Fatalf("remaining_handlers = %s, want [] (no sibling coupling in v2)", record.RemainingHandlers)
+	}
+	if record.PublicationID != publicationID {
+		t.Fatalf("publication_id = %s, want %s", record.PublicationID, publicationID)
+	}
+	if record.OutboxID == "" {
+		t.Fatal("outbox_id must carry the delivery id")
 	}
 }
 
-// TestOutboxRematchFatalLeavesRetryable mirrors mixed terminal+retryable finalize
-// after rematch from handlers=[] (persist matched set at claim).
+// TestOutboxRematchFatalLeavesRetryable mirrors mixed terminal+retryable
+// finalize after a sentinel expansion: siblings are independent.
 func TestOutboxRematchFatalLeavesRetryable(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -685,37 +845,31 @@ func TestOutboxRematchFatalLeavesRetryable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, id, newTestEvent("rematch-fatal-retry"), []string{}, createdAt, createdAt, sql.NullTime{})
+	insertDeliveryDirect(t, o, deliverySeed{Event: newTestEvent("rematch-fatal-retry"), CreatedAt: createdAt})
+	otReadyForClaim(t, o)
 
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
-	} else if processed != 1 {
-		t.Fatalf("processed = %d, want 1", processed)
+	} else if processed != 3 {
+		t.Fatalf("processed = %d, want 3", processed)
 	}
 
 	assertDeadLetterHandlers(t, db, []string{fatalHandler.Type})
-	assertOutboxHandlers(t, db, id, []string{retryableHandler.Type})
-	var retryCount int
-	var availableAt time.Time
-	var takenAt sql.NullTime
-	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox WHERE id = ?`, id).
-		Scan(&retryCount, &availableAt, &takenAt); err != nil {
-		t.Fatal(err)
+	otAssertDeliveryHandlers(t, o, []string{retryableHandler.Type})
+	d := listDeliveries(t, o)[0]
+	if d.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", d.RetryCount)
 	}
-	if retryCount != 1 {
-		t.Fatalf("retry_count = %d, want 1", retryCount)
-	}
-	if takenAt.Valid {
+	if d.TakenAt.Valid {
 		t.Fatal("taken_at should be cleared for retry")
 	}
-	if !availableAt.After(time.Now().Add(100 * time.Millisecond)) {
-		t.Fatalf("available_at = %s, want future retry", availableAt)
+	if !d.AvailableAt.After(time.Now().Add(100 * time.Millisecond)) {
+		t.Fatalf("available_at = %s, want future retry", d.AvailableAt)
 	}
 	record := deadLetterRecordByHandler(t, db, fatalHandler.Type)
-	if record.RemainingHandlers != fmt.Sprintf(`["%s"]`, retryableHandler.Type) {
-		t.Fatalf("remaining_handlers = %s, want retryable only", record.RemainingHandlers)
+	if record.RemainingHandlers != "[]" {
+		t.Fatalf("remaining_handlers = %s, want [] in v2", record.RemainingHandlers)
 	}
 }
 
@@ -743,7 +897,7 @@ func TestOutboxNoMatchDeadLetterRollsBackWithTransaction(t *testing.T) {
 		t.Fatalf("dead letter rows after rollback = %d, want 0", got)
 	}
 	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows after rollback = %d, want 0", got)
+		t.Fatalf("delivery rows after rollback = %d, want 0", got)
 	}
 }
 
@@ -767,26 +921,29 @@ func TestOutboxRetryableErrorSchedulesBackoff(t *testing.T) {
 	if err := o.HandleEvent(ctx, newTestEvent("retry")); err != nil {
 		t.Fatal(err)
 	}
+	otReadyForClaim(t, o)
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
 	} else if processed != 1 {
 		t.Fatalf("processed count = %d, want 1", processed)
 	}
 
-	var retryCount int
-	var availableAt time.Time
-	var takenAt sql.NullTime
-	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox LIMIT 1`).Scan(&retryCount, &availableAt, &takenAt); err != nil {
-		t.Fatal(err)
+	deliveries := listDeliveries(t, o)
+	if len(deliveries) != 1 {
+		t.Fatalf("deliveries = %d, want 1", len(deliveries))
 	}
-	if retryCount != 1 {
-		t.Fatalf("retry_count = %d, want 1", retryCount)
+	d := deliveries[0]
+	if d.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", d.RetryCount)
 	}
-	if !availableAt.After(time.Now().Add(100 * time.Millisecond)) {
-		t.Fatalf("available_at = %s, want retry backoff in the future", availableAt)
+	if !d.AvailableAt.After(time.Now().Add(100 * time.Millisecond)) {
+		t.Fatalf("available_at = %s, want retry backoff in the future", d.AvailableAt)
 	}
-	if takenAt.Valid {
+	if d.TakenAt.Valid {
 		t.Fatalf("taken_at valid = true, want retry row released")
+	}
+	if got := countPublications(t, o); got != 1 {
+		t.Fatalf("publications = %d, want 1", got)
 	}
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
@@ -815,6 +972,7 @@ func TestOutboxTerminalFailureWritesDeadLetter(t *testing.T) {
 	if err := o.HandleEvent(ctx, newTestEvent("terminal")); err != nil {
 		t.Fatal(err)
 	}
+	otReadyForClaim(t, o)
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
 	} else if processed != 1 {
@@ -822,7 +980,10 @@ func TestOutboxTerminalFailureWritesDeadLetter(t *testing.T) {
 	}
 
 	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows = %d, want 0", got)
+		t.Fatalf("delivery rows = %d, want 0", got)
+	}
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publication rows = %d, want 0", got)
 	}
 	if got := deadLetterRowCount(t, db); got != 1 {
 		t.Fatalf("dead letter rows = %d, want 1", got)
@@ -855,23 +1016,28 @@ func TestOutboxFatalHandlerDeadLetterDoesNotDropSuccessfulHandler(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	id := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, id, newTestEvent("fatal-success"), []string{successHandler.Type, fatalHandler.Type}, createdAt, createdAt, sql.NullTime{})
+	ids := otSeedDeliveries(t, o, newTestEvent("fatal-success"), []string{successHandler.Type, fatalHandler.Type}, createdAt, createdAt, sql.NullTime{})
 
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
-	} else if processed != 1 {
-		t.Fatalf("processed = %d, want 1", processed)
+	} else if processed != 2 {
+		t.Fatalf("processed = %d, want 2 (one delivery per handler)", processed)
 	}
 
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows = %d, want 0", got)
+	if got := countDeliveries(t, o); got != 0 {
+		t.Fatalf("deliveries = %d, want 0", got)
+	}
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publications = %d, want 0", got)
+	}
+	if !successHandler.Wait(2 * time.Second) {
+		t.Fatal("successful sibling must still run")
 	}
 	assertDeadLetterHandlers(t, db, []string{fatalHandler.Type})
 	record := deadLetterRecordByHandler(t, db, fatalHandler.Type)
-	if record.OutboxID != id {
-		t.Fatalf("outbox_id = %s, want %s", record.OutboxID, id)
+	if record.OutboxID != ids[fatalHandler.Type] {
+		t.Fatalf("outbox_id = %s, want fatal delivery id %s", record.OutboxID, ids[fatalHandler.Type])
 	}
 	if record.RemainingHandlers != "[]" {
 		t.Fatalf("remaining_handlers = %s, want []", record.RemainingHandlers)
@@ -898,36 +1064,36 @@ func TestOutboxFatalHandlerDeadLetterLeavesRetryableHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, id, newTestEvent("fatal-retry"), []string{fatalHandler.Type, retryableHandler.Type}, createdAt, createdAt, sql.NullTime{})
+	ids := otSeedDeliveries(t, o, newTestEvent("fatal-retry"), []string{fatalHandler.Type, retryableHandler.Type}, createdAt, createdAt, sql.NullTime{})
 
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
-	} else if processed != 1 {
-		t.Fatalf("processed = %d, want 1", processed)
+	} else if processed != 2 {
+		t.Fatalf("processed = %d, want 2", processed)
 	}
 
 	assertDeadLetterHandlers(t, db, []string{fatalHandler.Type})
-	assertOutboxHandlers(t, db, id, []string{retryableHandler.Type})
-	var retryCount int
-	var availableAt time.Time
-	var takenAt sql.NullTime
-	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox WHERE id = ?`, id).Scan(&retryCount, &availableAt, &takenAt); err != nil {
-		t.Fatal(err)
+	otAssertDeliveryHandlers(t, o, []string{retryableHandler.Type})
+	d := listDeliveries(t, o)[0]
+	if d.ID != ids[retryableHandler.Type] {
+		t.Fatalf("remaining delivery id = %s, want %s", d.ID, ids[retryableHandler.Type])
 	}
-	if retryCount != 1 {
-		t.Fatalf("retry_count = %d, want 1", retryCount)
+	if d.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", d.RetryCount)
 	}
-	if !availableAt.After(time.Now().Add(100 * time.Millisecond)) {
-		t.Fatalf("available_at = %s, want future retry", availableAt)
+	if !d.AvailableAt.After(time.Now().Add(100 * time.Millisecond)) {
+		t.Fatalf("available_at = %s, want future retry", d.AvailableAt)
 	}
-	if takenAt.Valid {
+	if d.TakenAt.Valid {
 		t.Fatal("taken_at should be cleared for retry")
 	}
 	record := deadLetterRecordByHandler(t, db, fatalHandler.Type)
-	if record.RemainingHandlers != fmt.Sprintf(`["%s"]`, retryableHandler.Type) {
-		t.Fatalf("remaining_handlers = %s, want retryable handler only", record.RemainingHandlers)
+	if record.RemainingHandlers != "[]" {
+		t.Fatalf("remaining_handlers = %s, want [] in v2 (siblings are independent rows)", record.RemainingHandlers)
+	}
+	if record.OutboxID != ids[fatalHandler.Type] {
+		t.Fatalf("outbox_id = %s, want fatal delivery id %s", record.OutboxID, ids[fatalHandler.Type])
 	}
 }
 
@@ -951,18 +1117,20 @@ func TestOutboxExhaustedRetriesWritesDeadLetterPerFailedHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, id, newTestEvent("exhausted"), []string{first.Type, second.Type}, createdAt, createdAt, sql.NullTime{})
+	otSeedDeliveries(t, o, newTestEvent("exhausted"), []string{first.Type, second.Type}, createdAt, createdAt, sql.NullTime{})
 
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
-	} else if processed != 1 {
-		t.Fatalf("processed = %d, want 1", processed)
+	} else if processed != 2 {
+		t.Fatalf("processed = %d, want 2", processed)
 	}
 
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows = %d, want 0", got)
+	if got := countDeliveries(t, o); got != 0 {
+		t.Fatalf("deliveries = %d, want 0", got)
+	}
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publications = %d, want 0", got)
 	}
 	assertDeadLetterHandlers(t, db, []string{first.Type, second.Type})
 	if got := deadLetterRowCount(t, db); got != 2 {
@@ -989,15 +1157,17 @@ func TestOutboxPermanentFailureDoesNotBlockRemainingReceiver(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, id, newTestEvent("remaining"), []string{fatalHandler.Type}, createdAt, createdAt, sql.NullTime{})
-	seedOutboxEventWithID(t, db, o, uuid.New().String(), newTestEvent("next"), []string{remainingHandler.Type}, createdAt, createdAt, sql.NullTime{})
+	otSeedDeliveries(t, o, newTestEvent("remaining"), []string{fatalHandler.Type}, createdAt, createdAt, sql.NullTime{})
+	otSeedDeliveries(t, o, newTestEvent("next"), []string{remainingHandler.Type}, createdAt, createdAt, sql.NullTime{})
 
 	processAllBatches(t, o, ctx)
 
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows = %d, want 0", got)
+	if got := countDeliveries(t, o); got != 0 {
+		t.Fatalf("deliveries = %d, want 0", got)
+	}
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publications = %d, want 0", got)
 	}
 	if !remainingHandler.Wait(time.Second) {
 		t.Fatal("remaining receiver did not process its event")
@@ -1027,12 +1197,12 @@ func TestOutboxDeadLetterExporterBestEffort(t *testing.T) {
 	}
 
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, uuid.New().String(), newTestEvent("export"), []string{first.Type, second.Type}, createdAt, createdAt, sql.NullTime{})
+	otSeedDeliveries(t, o, newTestEvent("export"), []string{first.Type, second.Type}, createdAt, createdAt, sql.NullTime{})
 
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
-	} else if processed != 1 {
-		t.Fatalf("processed = %d, want 1", processed)
+	} else if processed != 2 {
+		t.Fatalf("processed = %d, want 2", processed)
 	}
 
 	if got := deadLetterRowCount(t, db); got != 2 {
@@ -1063,7 +1233,7 @@ func TestOutboxDeadLetterExporterMarksExportedAt(t *testing.T) {
 	}
 
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, uuid.New().String(), newTestEvent("export-success"), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	otSeedDeliveries(t, o, newTestEvent("export-success"), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
 
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
@@ -1079,31 +1249,25 @@ func TestOutboxDeadLetterExporterMarksExportedAt(t *testing.T) {
 	}
 }
 
-// TestOutboxDeadLetterExportAfterFinalize asserts that file export runs only after
-// the atomic finalize transaction has committed (DLQ + handlers/retry/delete).
-// The exporter observes the post-finalize DB state: the terminal handler is no
-// longer present on the outbox row (or the row is gone).
+// TestOutboxDeadLetterExportAfterFinalize asserts that file export runs only
+// after the atomic finalize transaction has committed (DLQ insert + delivery
+// delete + publication GC). The exporter observes the post-finalize DB state:
+// the delivery row is gone and the dead_letters row is visible.
 func TestOutboxDeadLetterExportAfterFinalize(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
 
-	var observedHandlers []string
-	var outboxMissing bool
+	var deliveryMissing bool
+	var deliveriesLeft int
 	var deadLetterPresent bool
 	exporter := dl.ExportFunc(func(_ context.Context, record dl.Record) error {
-		var handlersBlob string
-		err := db.QueryRow(`SELECT handlers FROM outbox WHERE id = ?`, record.OutboxID).Scan(&handlersBlob)
-		if errors.Is(err, sql.ErrNoRows) {
-			outboxMissing = true
-		} else if err != nil {
-			t.Errorf("exporter could not read outbox: %v", err)
-			return nil
-		} else {
-			if err := json.Unmarshal([]byte(handlersBlob), &observedHandlers); err != nil {
-				t.Errorf("exporter could not unmarshal handlers: %v", err)
-			}
-		}
 		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM outbox_deliveries WHERE id = ?`, record.OutboxID).Scan(&count); err != nil {
+			t.Errorf("exporter could not read outbox_deliveries: %v", err)
+			return nil
+		}
+		deliveryMissing = count == 0
+		deliveriesLeft = count
 		if err := db.QueryRow(`
 			SELECT COUNT(*) FROM dead_letters
 			WHERE source = ? AND outbox_id = ? AND handler_type = ?
@@ -1127,9 +1291,8 @@ func TestOutboxDeadLetterExportAfterFinalize(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	outboxID := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, outboxID, newTestEvent("export-after-finalize"), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	otSeedDeliveries(t, o, newTestEvent("export-after-finalize"), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
 
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
@@ -1140,9 +1303,8 @@ func TestOutboxDeadLetterExportAfterFinalize(t *testing.T) {
 	if !deadLetterPresent {
 		t.Fatal("exporter must observe the committed dead_letters row")
 	}
-	if !outboxMissing {
-		// Single-handler terminal: outbox row must already be deleted when export runs.
-		t.Fatalf("exporter observed outbox handlers %v; want row deleted after finalize commit", observedHandlers)
+	if !deliveryMissing {
+		t.Fatalf("exporter observed %d delivery rows; want the row deleted after finalize commit", deliveriesLeft)
 	}
 }
 
@@ -1160,30 +1322,31 @@ func TestOutboxDeadLetterUniqueSourceOutboxHandler(t *testing.T) {
 	now := time.Now()
 	if _, err := db.Exec(`
 		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
-		VALUES (?, 'outbox', 'Event', 'agg', 'handler_a', 'outbox-1', '[]', '{}', 'err', 0, ?, ?)
+		VALUES (?, 'outbox', 'Event', 'agg', 'handler_a', 'delivery-1', '[]', '{}', 'err', 0, ?, ?)
 	`, uuid.New().String(), now, now); err != nil {
 		t.Fatal(err)
 	}
 	_, err = db.Exec(`
 		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
-		VALUES (?, 'outbox', 'Event', 'agg', 'handler_a', 'outbox-1', '[]', '{}', 'err-dup', 0, ?, ?)
+		VALUES (?, 'outbox', 'Event', 'agg', 'handler_a', 'delivery-1', '[]', '{}', 'err-dup', 0, ?, ?)
 	`, uuid.New().String(), now, now)
 	if err == nil {
 		t.Fatal("expected unique constraint violation for duplicate (source, outbox_id, handler_type)")
 	}
 
-	// Distinct handler_type for the same outbox id must still be allowed.
+	// Distinct handler_type for the same delivery id must still be allowed.
 	if _, err := db.Exec(`
 		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
-		VALUES (?, 'outbox', 'Event', 'agg', 'handler_b', 'outbox-1', '[]', '{}', 'err', 0, ?, ?)
+		VALUES (?, 'outbox', 'Event', 'agg', 'handler_b', 'delivery-1', '[]', '{}', 'err', 0, ?, ?)
 	`, uuid.New().String(), now, now); err != nil {
 		t.Fatalf("distinct handler_type insert failed: %v", err)
 	}
 }
 
-// TestOutboxFinalizeIdempotentOnReplay simulates a crash after DLQ insert but before
-// handlers were updated: the DLQ row already exists. Re-processing must not create a
-// second dead letter and must still remove the terminal handler (and apply retry fields).
+// TestOutboxFinalizeIdempotentOnReplay simulates a crash after the DLQ insert
+// but before the delivery was deleted: the DLQ row already exists. Re-processing
+// must not create a second dead letter, must still remove the terminal delivery
+// and must leave the retryable sibling scheduled.
 func TestOutboxFinalizeIdempotentOnReplay(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -1204,10 +1367,9 @@ func TestOutboxFinalizeIdempotentOnReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	outboxID := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
 	event := newTestEvent("replay-finalize")
-	seedOutboxEventWithID(t, db, o, outboxID, event, []string{fatalHandler.Type, retryHandler.Type}, createdAt, createdAt, sql.NullTime{})
+	ids := otSeedDeliveries(t, o, event, []string{fatalHandler.Type, retryHandler.Type}, createdAt, createdAt, sql.NullTime{})
 
 	// Pre-seed a dead letter as if the previous attempt wrote DLQ then crashed.
 	eventBlob, err := o.codec.MarshalEvent(ctx, event)
@@ -1217,40 +1379,37 @@ func TestOutboxFinalizeIdempotentOnReplay(t *testing.T) {
 	now := time.Now()
 	if _, err := db.Exec(`
 		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
-		VALUES (?, 'outbox', ?, ?, ?, ?, ?, ?, 'previous fatal', 0, ?, ?)
-	`, uuid.New().String(), event.EventType().String(), event.AggregateID().String(), fatalHandler.Type, outboxID, fmt.Sprintf(`["%s"]`, retryHandler.Type), string(eventBlob), createdAt, now); err != nil {
+		VALUES (?, 'outbox', ?, ?, ?, ?, '[]', ?, 'previous fatal', 0, ?, ?)
+	`, uuid.New().String(), event.EventType().String(), event.AggregateID().String(), fatalHandler.Type,
+		ids[fatalHandler.Type], string(eventBlob), createdAt, now); err != nil {
 		t.Fatal(err)
 	}
 
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
-	} else if processed != 1 {
-		t.Fatalf("processed = %d, want 1", processed)
+	} else if processed != 2 {
+		t.Fatalf("processed = %d, want 2", processed)
 	}
 
 	if got := deadLetterRowCount(t, db); got != 1 {
 		t.Fatalf("dead letter rows = %d, want 1 (no duplicate on replay)", got)
 	}
-	assertOutboxHandlers(t, db, outboxID, []string{retryHandler.Type})
-	var retryCount int
-	var availableAt time.Time
-	var takenAt sql.NullTime
-	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox WHERE id = ?`, outboxID).Scan(&retryCount, &availableAt, &takenAt); err != nil {
-		t.Fatal(err)
+	otAssertDeliveryHandlers(t, o, []string{retryHandler.Type})
+	d := listDeliveries(t, o)[0]
+	if d.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", d.RetryCount)
 	}
-	if retryCount != 1 {
-		t.Fatalf("retry_count = %d, want 1", retryCount)
+	if !d.AvailableAt.After(time.Now().Add(100 * time.Millisecond)) {
+		t.Fatalf("available_at = %s, want future backoff", d.AvailableAt)
 	}
-	if !availableAt.After(time.Now().Add(100 * time.Millisecond)) {
-		t.Fatalf("available_at = %s, want future backoff", availableAt)
-	}
-	if takenAt.Valid {
+	if d.TakenAt.Valid {
 		t.Fatal("taken_at should be cleared after atomic finalize with retry")
 	}
 }
 
-// TestOutboxFinalizeAtomicMixedTerminalAndRetry checks that a single finalize
-// transaction leaves DLQ, remaining handlers, and retry fields consistent.
+// TestOutboxFinalizeAtomicMixedTerminalAndRetry checks that the per-delivery
+// finalize transactions leave DLQ, surviving deliveries and retry fields
+// consistent for a mixed fatal/retryable/success fan-out.
 func TestOutboxFinalizeAtomicMixedTerminalAndRetry(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -1275,51 +1434,55 @@ func TestOutboxFinalizeAtomicMixedTerminalAndRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	outboxID := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, outboxID, newTestEvent("atomic-mixed"), []string{
+	publicationID, ids := otSeedPublication(t, o, newTestEvent("atomic-mixed"), []string{
 		fatalHandler.Type, retryHandler.Type, successHandler.Type,
 	}, createdAt, createdAt, sql.NullTime{})
 
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
-	} else if processed != 1 {
-		t.Fatalf("processed = %d, want 1", processed)
+	} else if processed != 3 {
+		t.Fatalf("processed = %d, want 3", processed)
 	}
 
-	// Atomic outcome: exactly one DLQ for the fatal handler, retryable remains,
-	// successful removed, retry scheduled.
+	// Atomic outcome: exactly one DLQ for the fatal delivery, the retryable one
+	// rescheduled, the successful one deleted, publication kept.
 	if got := deadLetterRowCount(t, db); got != 1 {
 		t.Fatalf("dead letter rows = %d, want 1", got)
 	}
 	assertDeadLetterHandlers(t, db, []string{fatalHandler.Type})
-	assertOutboxHandlers(t, db, outboxID, []string{retryHandler.Type})
-	var retryCount int
-	var availableAt time.Time
-	var takenAt sql.NullTime
-	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox WHERE id = ?`, outboxID).Scan(&retryCount, &availableAt, &takenAt); err != nil {
-		t.Fatal(err)
+	otAssertDeliveryHandlers(t, o, []string{retryHandler.Type})
+	d := listDeliveries(t, o)[0]
+	if d.PublicationID != publicationID {
+		t.Fatalf("publication_id = %s, want %s", d.PublicationID, publicationID)
 	}
-	if retryCount != 1 {
-		t.Fatalf("retry_count = %d, want 1", retryCount)
+	if d.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", d.RetryCount)
 	}
-	if !availableAt.After(time.Now().Add(100 * time.Millisecond)) {
-		t.Fatalf("available_at = %s, want future backoff", availableAt)
+	if !d.AvailableAt.After(time.Now().Add(100 * time.Millisecond)) {
+		t.Fatalf("available_at = %s, want future backoff", d.AvailableAt)
 	}
-	if takenAt.Valid {
+	if d.TakenAt.Valid {
 		t.Fatal("taken_at should be cleared")
 	}
-	record := deadLetterRecordByHandler(t, db, fatalHandler.Type)
-	if record.OutboxID != outboxID {
-		t.Fatalf("outbox_id = %s, want %s", record.OutboxID, outboxID)
+	if got := countPublications(t, o); got != 1 {
+		t.Fatalf("publications = %d, want 1 while a delivery remains", got)
 	}
-	if record.RemainingHandlers != fmt.Sprintf(`["%s"]`, retryHandler.Type) {
-		t.Fatalf("remaining_handlers = %s, want only retry handler", record.RemainingHandlers)
+	record := deadLetterRecordByHandler(t, db, fatalHandler.Type)
+	if record.OutboxID != ids[fatalHandler.Type] {
+		t.Fatalf("outbox_id = %s, want %s", record.OutboxID, ids[fatalHandler.Type])
+	}
+	if record.PublicationID != publicationID {
+		t.Fatalf("dead letter publication_id = %s, want %s", record.PublicationID, publicationID)
+	}
+	if record.RemainingHandlers != "[]" {
+		t.Fatalf("remaining_handlers = %s, want [] in v2", record.RemainingHandlers)
 	}
 }
 
-// TestOutboxFinalizeAtomicAllTerminalDeletesOutbox ensures multi-handler permanent
-// failure writes all DLQ rows and deletes the outbox row together.
+// TestOutboxFinalizeAtomicAllTerminalDeletesOutbox ensures a multi-handler
+// permanent failure writes all DLQ rows and removes every delivery plus the
+// publication.
 func TestOutboxFinalizeAtomicAllTerminalDeletesOutbox(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -1341,18 +1504,20 @@ func TestOutboxFinalizeAtomicAllTerminalDeletesOutbox(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	outboxID := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, outboxID, newTestEvent("all-terminal"), []string{first.Type, second.Type}, createdAt, createdAt, sql.NullTime{})
+	otSeedDeliveries(t, o, newTestEvent("all-terminal"), []string{first.Type, second.Type}, createdAt, createdAt, sql.NullTime{})
 
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
-	} else if processed != 1 {
-		t.Fatalf("processed = %d, want 1", processed)
+	} else if processed != 2 {
+		t.Fatalf("processed = %d, want 2", processed)
 	}
 
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows = %d, want 0", got)
+	if got := countDeliveries(t, o); got != 0 {
+		t.Fatalf("deliveries = %d, want 0", got)
+	}
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publications = %d, want 0", got)
 	}
 	if got := deadLetterRowCount(t, db); got != 2 {
 		t.Fatalf("dead letter rows = %d, want 2", got)
@@ -1365,10 +1530,12 @@ func TestOutboxFinalizeAtomicAllTerminalDeletesOutbox(t *testing.T) {
 	}
 }
 
-// TestOutboxFinalizeRollbackOnHandlersUpdateAbort proves the finalize transaction
-// rolls back when a later step fails: DLQ INSERT runs first, then UPDATE handlers
-// is aborted by a SQLite trigger. No partial DLQ, handlers/retry fields, or export.
-func TestOutboxFinalizeRollbackOnHandlersUpdateAbort(t *testing.T) {
+// TestOutboxFinalizeCommitFailureRetriesSavedOutcome replaces the v1
+// "rollback on handlers update abort" test (there is no handlers column any
+// more). A finalize commit that fails is retried with the SAVED outcome: the
+// handler is never re-run and the failed attempt leaves nothing behind (no
+// partial or duplicate DLQ row).
+func TestOutboxFinalizeCommitFailureRetriesSavedOutcome(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
 	exporter := &recordingDeadLetterExporter{}
@@ -1377,36 +1544,25 @@ func TestOutboxFinalizeRollbackOnHandlersUpdateAbort(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer o.Close()
+	o.finalizeSleep = func(time.Duration) {}
 
-	// Abort the handlers list update after any preceding DLQ insert in the same TX.
-	if _, err := db.Exec(`
-		CREATE TRIGGER abort_finalize_handlers
-		BEFORE UPDATE OF handlers ON outbox
-		BEGIN
-			SELECT RAISE(ABORT, 'forced finalize abort');
-		END
-	`); err != nil {
-		t.Fatal(err)
+	var attempts atomic.Int64
+	o.beforeFinalizeCommit = func(_ string, attempt int) error {
+		attempts.Add(1)
+		if attempt == 1 {
+			return errors.New("forced finalize abort")
+		}
+		return nil
 	}
 
-	fatalHandler := mocks.NewEventHandler("rollback_fatal_handler")
-	fatalHandler.Err = fatalOutboxError{err: errors.New("fatal during finalize")}
-	retryHandler := mocks.NewEventHandler("rollback_retry_handler")
-	retryHandler.Err = errors.New("retryable during finalize")
+	fatalHandler := &otCountingHandler{Type: "rollback_fatal_handler", err: fatalOutboxError{err: errors.New("fatal during finalize")}}
 	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, fatalHandler); err != nil {
 		t.Fatal(err)
 	}
-	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, retryHandler); err != nil {
-		t.Fatal(err)
-	}
 
-	outboxID := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Millisecond)
-	availableAt := createdAt
-	originalHandlers := []string{fatalHandler.Type, retryHandler.Type}
-	seedOutboxEventWithID(t, db, o, outboxID, newTestEvent("finalize-rollback"), originalHandlers, createdAt, availableAt, sql.NullTime{})
+	ids := otSeedDeliveries(t, o, newTestEvent("finalize-retry"), []string{fatalHandler.Type}, createdAt, createdAt, sql.NullTime{})
 
-	// Drain any residual errors, then process.
 	drainOutboxErrors(o)
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
@@ -1414,35 +1570,94 @@ func TestOutboxFinalizeRollbackOnHandlersUpdateAbort(t *testing.T) {
 		t.Fatalf("processed = %d, want 1", processed)
 	}
 
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("finalize commit attempts = %d, want 2", got)
+	}
+	// The handler ran exactly once: finalize retries never re-run it.
+	if handlerCalls := fatalHandler.Calls(); handlerCalls != 1 {
+		t.Fatalf("handler calls = %d, want 1 (finalize retry must not re-run the handler)", handlerCalls)
+	}
+	// Finalized exactly once with the saved outcome: one DLQ row, no delivery.
+	if got := deadLetterRowCount(t, db); got != 1 {
+		t.Fatalf("dead letter rows = %d, want exactly 1 (no duplicate from the retried commit)", got)
+	}
+	record := deadLetterRecordByHandler(t, db, fatalHandler.Type)
+	if record.OutboxID != ids[fatalHandler.Type] {
+		t.Fatalf("outbox_id = %s, want %s", record.OutboxID, ids[fatalHandler.Type])
+	}
+	if got := countDeliveries(t, o); got != 0 {
+		t.Fatalf("deliveries = %d, want 0", got)
+	}
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publications = %d, want 0", got)
+	}
+	if got := len(exporter.Records()); got != 1 {
+		t.Fatalf("exporter calls = %d, want 1 (export runs once, after commit)", got)
+	}
+}
+
+// TestOutboxFinalizeCommitFailureReleasesClaim covers the exhausted-finalize
+// path: every commit attempt fails, so the claim is released (taken_at NULL,
+// available_at moved forward) without touching retry_count, and the admission
+// slot is given back.
+func TestOutboxFinalizeCommitFailureReleasesClaim(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	exporter := &recordingDeadLetterExporter{}
+	o, err := NewOutbox(db, WithRetryBackoff("FIXED:2:500ms"), WithDeadLetterExporter(exporter))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+	o.finalizeSleep = func(time.Duration) {}
+	o.beforeFinalizeCommit = func(string, int) error { return errors.New("forced finalize abort") }
+	o.beforeReleaseClaim = nil
+
+	handler := mocks.NewEventHandler("release_claim_handler")
+	if err := o.AddHandler(ctx, eh.MatchEvents{mocks.EventType}, handler); err != nil {
+		t.Fatal(err)
+	}
+
+	createdAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Millisecond)
+	availableAt := createdAt
+	ids := otSeedDeliveries(t, o, newTestEvent("finalize-release"), []string{handler.Type}, createdAt, availableAt, sql.NullTime{})
+
+	drainOutboxErrors(o)
+	if processed, err := o.processBatch(ctx); err != nil {
+		t.Fatal(err)
+	} else if processed != 1 {
+		t.Fatalf("processed = %d, want 1", processed)
+	}
+
+	deliveries := listDeliveries(t, o)
+	if len(deliveries) != 1 {
+		t.Fatalf("deliveries = %d, want 1 (nothing was committed)", len(deliveries))
+	}
+	d := deliveries[0]
+	if d.ID != ids[handler.Type] {
+		t.Fatalf("delivery id = %s, want %s", d.ID, ids[handler.Type])
+	}
+	if d.TakenAt.Valid {
+		t.Fatal("taken_at must be NULL after the claim was released")
+	}
+	if !d.AvailableAt.After(availableAt) {
+		t.Fatalf("available_at = %s, want moved forward from %s", d.AvailableAt, availableAt)
+	}
+	if d.RetryCount != 0 {
+		t.Fatalf("retry_count = %d, want 0 (release must not consume a retry)", d.RetryCount)
+	}
 	if got := deadLetterRowCount(t, db); got != 0 {
 		t.Fatalf("dead letter rows = %d, want 0 after finalize rollback", got)
 	}
 	if got := len(exporter.Records()); got != 0 {
 		t.Fatalf("exporter calls = %d, want 0 after finalize rollback", got)
 	}
-	assertOutboxHandlers(t, db, outboxID, originalHandlers)
-
-	var retryCount int
-	var gotAvailableAt time.Time
-	var takenAt sql.NullTime
-	if err := db.QueryRow(`SELECT retry_count, available_at, taken_at FROM outbox WHERE id = ?`, outboxID).Scan(&retryCount, &gotAvailableAt, &takenAt); err != nil {
-		t.Fatal(err)
-	}
-	if retryCount != 0 {
-		t.Fatalf("retry_count = %d, want 0 (retry fields rolled back)", retryCount)
-	}
-	if !gotAvailableAt.Equal(availableAt) {
-		t.Fatalf("available_at = %s, want original %s", gotAvailableAt, availableAt)
-	}
-	// Claim (taken_at) commits in a separate transaction before finalize; after a
-	// finalize rollback the claim must remain so the row is not double-dispatched
-	// until PeriodicSweepAge releases it.
-	if !takenAt.Valid {
-		t.Fatal("taken_at should remain set after claim; finalize rollback must not clear it")
+	if used, _ := o.AdmissionSnapshot(); used != 0 {
+		t.Fatalf("admission used = %d, want 0 (slot released)", used)
 	}
 
 	finalizeErrs := drainOutboxErrors(o)
-	if !containsErrorSubstring(finalizeErrs, "forced finalize abort") && !containsErrorSubstring(finalizeErrs, "could not update remaining handlers") {
+	if !containsErrorSubstring(finalizeErrs, "forced finalize abort") {
 		t.Fatalf("expected finalize abort on Errors(), got: %v", finalizeErrs)
 	}
 }
@@ -1466,10 +1681,10 @@ func TestOutboxExportUsesDurableDeadLetterOnReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	outboxID := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
 	event := newTestEvent("export-durable")
-	seedOutboxEventWithID(t, db, o, outboxID, event, []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	ids := otSeedDeliveries(t, o, event, []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	deliveryID := ids[handler.Type]
 
 	existingID := uuid.New().String()
 	existingBlob := `{"durable":"previous-blob-not-from-this-attempt"}`
@@ -1480,7 +1695,7 @@ func TestOutboxExportUsesDurableDeadLetterOnReplay(t *testing.T) {
 	if _, err := db.Exec(`
 		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
 		VALUES (?, 'outbox', ?, ?, ?, ?, ?, ?, ?, 3, ?, ?)
-	`, existingID, event.EventType().String(), event.AggregateID().String(), handler.Type, outboxID, existingRemaining, existingBlob, existingError, existingCreatedAt, existingDeadAt); err != nil {
+	`, existingID, event.EventType().String(), event.AggregateID().String(), handler.Type, deliveryID, existingRemaining, existingBlob, existingError, existingCreatedAt, existingDeadAt); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1516,7 +1731,7 @@ func TestOutboxExportUsesDurableDeadLetterOnReplay(t *testing.T) {
 
 	var exportedID string
 	var exportedAt sql.NullTime
-	if err := db.QueryRow(`SELECT id, exported_at FROM dead_letters WHERE source = 'outbox' AND outbox_id = ? AND handler_type = ?`, outboxID, handler.Type).Scan(&exportedID, &exportedAt); err != nil {
+	if err := db.QueryRow(`SELECT id, exported_at FROM dead_letters WHERE source = 'outbox' AND outbox_id = ? AND handler_type = ?`, deliveryID, handler.Type).Scan(&exportedID, &exportedAt); err != nil {
 		t.Fatal(err)
 	}
 	if exportedID != existingID {
@@ -1542,24 +1757,29 @@ func TestOutboxSuccessPathFinalizeDeletesWithoutDeadLetter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	outboxID := uuid.New().String()
 	createdAt := time.Now().Add(-time.Minute)
-	seedOutboxEventWithID(t, db, o, outboxID, newTestEvent("success-only"), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	otSeedDeliveries(t, o, newTestEvent("success-only"), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
 
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
 	} else if processed != 1 {
 		t.Fatalf("processed = %d, want 1", processed)
 	}
-	if got := outboxRowCount(t, db); got != 0 {
-		t.Fatalf("outbox rows = %d, want 0", got)
+	if got := countDeliveries(t, o); got != 0 {
+		t.Fatalf("deliveries = %d, want 0", got)
+	}
+	if got := countPublications(t, o); got != 0 {
+		t.Fatalf("publications = %d, want 0 (garbage collected with the last delivery)", got)
 	}
 	if got := deadLetterRowCount(t, db); got != 0 {
 		t.Fatalf("dead letter rows = %d, want 0", got)
 	}
 }
 
-func TestOutboxSerialDispatchPreservesCreatedAtIDOrder(t *testing.T) {
+// TestOutboxSerialDispatchPreservesSeqOrder is the v2 form of the former
+// created_at/id ordering test: a Serial handler sees its deliveries in
+// (available_at, seq) order, which for equal availability is insertion order.
+func TestOutboxSerialDispatchPreservesSeqOrder(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
 	o, err := NewOutbox(db)
@@ -1574,11 +1794,13 @@ func TestOutboxSerialDispatchPreservesCreatedAtIDOrder(t *testing.T) {
 	}
 
 	createdAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
-	for range 100 {
-		id := uuid.New().String()
-		seedOutboxEventWithID(t, db, o, id, newTestEvent(id), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	var expected []string
+	for i := range 100 {
+		content := fmt.Sprintf("event-%03d", i)
+		otSeedDeliveries(t, o, newTestEvent(content), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+		expected = append(expected, content)
 	}
-	expected := outboxIDsInDispatchOrder(t, db)
+	otAssertDeliveryContentOrder(t, o, expected)
 
 	processAllBatches(t, o, ctx)
 
@@ -1603,8 +1825,7 @@ func TestOutboxSerialDispatchDoesNotOverlapHandler(t *testing.T) {
 
 	createdAt := time.Now().Add(-time.Minute)
 	for i := range 20 {
-		id := uuid.New().String()
-		seedOutboxEventWithID(t, db, o, id, newTestEvent(fmt.Sprintf("event-%d", i)), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+		otSeedDeliveries(t, o, newTestEvent(fmt.Sprintf("event-%d", i)), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
 	}
 
 	processAllBatches(t, o, ctx)
@@ -1630,11 +1851,13 @@ func TestOutboxPartitionByAggregatePreservesSameAggregateOrder(t *testing.T) {
 
 	aggregateID := uuid.New()
 	createdAt := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
-	for range 50 {
-		id := uuid.New().String()
-		seedOutboxEventWithID(t, db, o, id, newTestEventForAggregate(id, aggregateID), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	var expected []string
+	for i := range 50 {
+		content := fmt.Sprintf("event-%03d", i)
+		otSeedDeliveries(t, o, newTestEventForAggregate(content, aggregateID), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+		expected = append(expected, content)
 	}
-	expected := outboxIDsInDispatchOrder(t, db)
+	otAssertDeliveryContentOrder(t, o, expected)
 
 	processAllBatches(t, o, ctx)
 
@@ -1662,8 +1885,7 @@ func TestOutboxPartitionByAggregateAllowsDifferentAggregatesInParallel(t *testin
 	aggregates := aggregateIDsForDistinctShards(t, 2, 16)
 	createdAt := time.Now().Add(-time.Minute)
 	for i, aggregateID := range aggregates {
-		id := uuid.New().String()
-		seedOutboxEventWithID(t, db, o, id, newTestEventForAggregate(fmt.Sprintf("event-%d", i), aggregateID), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+		otSeedDeliveries(t, o, newTestEventForAggregate(fmt.Sprintf("event-%d", i), aggregateID), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
 	}
 
 	done := make(chan error, 1)
@@ -1701,11 +1923,20 @@ func TestOutboxPartitionByAggregateUsesCorrelationIDFallback(t *testing.T) {
 	correlationIDs := correlationIDsForDistinctShards(t, 2, 16)
 	createdAt := time.Now().Add(-time.Minute)
 	for i, correlationID := range correlationIDs {
-		id := uuid.New().String()
 		event := eh.NewEvent(mocks.EventType, &mocks.EventData{Content: fmt.Sprintf("event-%d", i)}, time.Now(),
 			eh.WithMetadata(map[string]any{"correlation_id": correlationID}),
 		)
-		seedOutboxEventWithID(t, db, o, id, event, []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+		otSeedDeliveries(t, o, event, []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+	}
+
+	// The stored partition key comes from the correlation metadata, so the two
+	// deliveries land on distinct dispatch keys.
+	keys := map[string]bool{}
+	for _, d := range listDeliveries(t, o) {
+		keys[d.DispatchKey] = true
+	}
+	if len(keys) != 2 {
+		t.Fatalf("distinct dispatch keys = %d, want 2 (correlation fallback)", len(keys))
 	}
 
 	done := make(chan error, 1)
@@ -1741,8 +1972,7 @@ func TestOutboxDispatchRespectsGlobalMaxGoroutines(t *testing.T) {
 	aggregates := aggregateIDsForDistinctShards(t, 8, 16)
 	createdAt := time.Now().Add(-time.Minute)
 	for i, aggregateID := range aggregates {
-		id := uuid.New().String()
-		seedOutboxEventWithID(t, db, o, id, newTestEventForAggregate(fmt.Sprintf("event-%d", i), aggregateID), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
+		otSeedDeliveries(t, o, newTestEventForAggregate(fmt.Sprintf("event-%d", i), aggregateID), []string{handler.Type}, createdAt, createdAt, sql.NullTime{})
 	}
 
 	if processed, err := o.processBatch(ctx); err != nil {
@@ -1775,33 +2005,24 @@ func TestOutboxPartialSuccessKeepsOnlyFailedHandlerForRetry(t *testing.T) {
 	}
 
 	createdAt := time.Now().Add(-time.Minute)
-	id := uuid.New().String()
-	seedOutboxEventWithID(t, db, o, id, newTestEvent("partial"), []string{successHandler.Type, failingHandler.Type}, createdAt, createdAt, sql.NullTime{})
+	otSeedDeliveries(t, o, newTestEvent("partial"), []string{successHandler.Type, failingHandler.Type}, createdAt, createdAt, sql.NullTime{})
 
 	if processed, err := o.processBatch(ctx); err != nil {
 		t.Fatal(err)
-	} else if processed != 1 {
-		t.Fatalf("processed = %d, want 1", processed)
+	} else if processed != 2 {
+		t.Fatalf("processed = %d, want 2", processed)
 	}
 
-	var handlersBlob string
-	var retryCount int
-	var takenAt sql.NullTime
-	if err := db.QueryRow(`SELECT handlers, retry_count, taken_at FROM outbox WHERE id = ?`, id).Scan(&handlersBlob, &retryCount, &takenAt); err != nil {
-		t.Fatal(err)
+	otAssertDeliveryHandlers(t, o, []string{failingHandler.Type})
+	d := listDeliveries(t, o)[0]
+	if d.RetryCount != 1 {
+		t.Fatalf("retry_count = %d, want 1", d.RetryCount)
 	}
-	var handlers []string
-	if err := json.Unmarshal([]byte(handlersBlob), &handlers); err != nil {
-		t.Fatal(err)
-	}
-	if !slicesEqual(handlers, []string{failingHandler.Type}) {
-		t.Fatalf("remaining handlers = %v, want [%s]", handlers, failingHandler.Type)
-	}
-	if retryCount != 1 {
-		t.Fatalf("retry_count = %d, want 1", retryCount)
-	}
-	if takenAt.Valid {
+	if d.TakenAt.Valid {
 		t.Fatal("taken_at should be cleared for retry")
+	}
+	if got := deadLetterRowCount(t, db); got != 0 {
+		t.Fatalf("dead letter rows = %d, want 0", got)
 	}
 }
 
@@ -1860,46 +2081,98 @@ func newTestEventForAggregate(content string, aggregateID uuid.UUID) eh.Event {
 	)
 }
 
+// otSeedPublication writes one v2 publication plus one delivery per handler
+// name (an empty list seeds a rematch sentinel), computing dispatch_key and
+// dispatch_config from the current registration so the rows are claimable
+// without a startup reconcile. It returns the publication id and a map of
+// handler type ("" for the sentinel) to delivery id.
+func otSeedPublication(t testing.TB, o *Outbox, event eh.Event, handlers []string, createdAt, availableAt time.Time, takenAt sql.NullTime) (string, map[string]string) {
+	t.Helper()
+
+	if availableAt.IsZero() {
+		availableAt = createdAt
+	}
+	eventBlob, err := o.codec.MarshalEvent(context.Background(), event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicationID := uuid.New().String()
+	partitionKey := eventPartitionKey(event)
+	if _, err := o.db.Exec(fmt.Sprintf(`
+		INSERT INTO %s (publication_id, event_type, aggregate_id, partition_key, event_blob, created_at, origin, origin_ref)
+		VALUES (?, ?, ?, ?, ?, ?, 'publish', NULL)`, o.publicationsTable),
+		publicationID, event.EventType().String(), event.AggregateID().String(), partitionKey,
+		string(eventBlob), schema.UTC(createdAt)); err != nil {
+		t.Fatal(err)
+	}
+
+	otReadyForClaim(t, o)
+	registered := o.snapshotHandlersByType()
+	insert := func(handlerType any, key, config any) string {
+		deliveryID := uuid.New().String()
+		var taken any
+		if takenAt.Valid {
+			taken = schema.UTC(takenAt.Time)
+		}
+		if _, err := o.db.Exec(fmt.Sprintf(`
+			INSERT INTO %s (id, publication_id, handler_type, dispatch_key, dispatch_config, event_type, aggregate_id,
+			                created_at, available_at, taken_at, retry_count, unresolved_at, legacy_outbox_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)`, o.deliveriesTable),
+			deliveryID, publicationID, handlerType, key, config,
+			event.EventType().String(), event.AggregateID().String(),
+			schema.UTC(createdAt), schema.UTC(availableAt), taken); err != nil {
+			t.Fatal(err)
+		}
+		return deliveryID
+	}
+
+	ids := map[string]string{}
+	if len(handlers) == 0 {
+		ids[""] = insert(nil, nil, nil)
+		return publicationID, ids
+	}
+	for _, handlerType := range handlers {
+		var key, config any
+		if mh := registered[handlerType]; mh != nil {
+			queueKey, _, _ := dispatchKeyFor(mh, partitionKey)
+			key = queueKey
+			config = dispatchConfigFor(mh)
+		}
+		ids[handlerType] = insert(handlerType, key, config)
+	}
+	return publicationID, ids
+}
+
+// otSeedDeliveries is otSeedPublication without the publication id.
+func otSeedDeliveries(t testing.TB, o *Outbox, event eh.Event, handlers []string, createdAt, availableAt time.Time, takenAt sql.NullTime) map[string]string {
+	t.Helper()
+
+	_, ids := otSeedPublication(t, o, event, handlers, createdAt, availableAt, takenAt)
+	return ids
+}
+
+// seedOutboxEvent seeds one publication with a single handler delivery.
 func seedOutboxEvent(t testing.TB, db *sql.DB, o *Outbox, event eh.Event, handlerType string, createdAt, availableAt time.Time, takenAt sql.NullTime) {
 	t.Helper()
 
-	eventBlob, err := o.codec.MarshalEvent(context.Background(), event)
-	if err != nil {
-		t.Fatal(err)
-	}
-	handlersBlob := fmt.Sprintf(`["%s"]`, handlerType)
-
-	if _, err := db.Exec(`
-		INSERT INTO outbox (id, event_type, aggregate_id, created_at, available_at, taken_at, handlers, event_blob, retry_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, uuid.New().String(), event.EventType().String(), event.AggregateID().String(), createdAt, availableAt, takenAt, handlersBlob, string(eventBlob), 0); err != nil {
-		t.Fatal(err)
-	}
+	_ = db
+	otSeedDeliveries(t, o, event, []string{handlerType}, createdAt, availableAt, takenAt)
 }
 
+// seedOutboxEventWithID keeps the historical signature; id is ignored for the
+// v2 row identities (deliveries own their own uuid) and kept only so existing
+// callers compile. Use otSeedDeliveries when the delivery ids are needed.
 func seedOutboxEventWithID(t testing.TB, db *sql.DB, o *Outbox, id string, event eh.Event, handlers []string, createdAt, availableAt time.Time, takenAt sql.NullTime) {
 	t.Helper()
 
-	eventBlob, err := o.codec.MarshalEvent(context.Background(), event)
-	if err != nil {
-		t.Fatal(err)
-	}
-	handlersBlob, err := json.Marshal(handlers)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := db.Exec(`
-		INSERT INTO outbox (id, event_type, aggregate_id, created_at, available_at, taken_at, handlers, event_blob, retry_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, id, event.EventType().String(), event.AggregateID().String(), createdAt, availableAt, takenAt, string(handlersBlob), string(eventBlob), 0); err != nil {
-		t.Fatal(err)
-	}
+	_, _ = db, id
+	otSeedDeliveries(t, o, event, handlers, createdAt, availableAt, takenAt)
 }
 
 func processAllBatches(t testing.TB, o *Outbox, ctx context.Context) {
 	t.Helper()
 
+	otReadyForClaim(t, o)
 	for {
 		processed, err := o.processBatch(ctx)
 		if err != nil {
@@ -1911,27 +2184,92 @@ func processAllBatches(t testing.TB, o *Outbox, ctx context.Context) {
 	}
 }
 
-func outboxIDsInDispatchOrder(t testing.TB, db *sql.DB) []string {
+// otReadyForClaim publishes the registered dispatch key ring that the fetcher
+// rotates over. StartChecked does this; tests that drive processBatch directly
+// after seeding rows must do it themselves.
+func otReadyForClaim(t testing.TB, o *Outbox) {
 	t.Helper()
 
-	rows, err := db.Query(`SELECT id FROM outbox ORDER BY created_at ASC, id ASC`)
+	o.handlersMu.Lock()
+	o.claimKeys = o.registeredDispatchKeys()
+	o.handlersMu.Unlock()
+}
+
+// otAssertDeliveryHandlers asserts the handler types of the surviving
+// deliveries (seq order), replacing the v1 `handlers` column assertion.
+func otAssertDeliveryHandlers(t testing.TB, o *Outbox, want []string) {
+	t.Helper()
+
+	var got []string
+	for _, d := range listDeliveries(t, o) {
+		got = append(got, d.HandlerType)
+	}
+	if !slicesEqual(got, want) {
+		t.Fatalf("delivery handler types = %v, want %v", got, want)
+	}
+}
+
+// otAssertDeliveryContentOrder asserts the stored deliveries are in the same
+// (available_at, seq) order as the expected event contents.
+func otAssertDeliveryContentOrder(t testing.TB, o *Outbox, want []string) {
+	t.Helper()
+
+	rows, err := o.db.Query(fmt.Sprintf(`
+		SELECT p.event_blob FROM %s d JOIN %s p ON p.publication_id = d.publication_id
+		ORDER BY d.available_at ASC, d.seq ASC`, o.deliveriesTable, o.publicationsTable))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
 
-	var ids []string
+	var got []string
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var blob string
+		if err := rows.Scan(&blob); err != nil {
 			t.Fatal(err)
 		}
-		ids = append(ids, id)
+		event, _, err := o.codec.UnmarshalEvent(context.Background(), []byte(blob))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, eventContent(event))
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	return ids
+	if !slicesEqual(got, want) {
+		t.Fatalf("stored delivery order = %v, want %v", got, want)
+	}
+}
+
+func otDeliveryExists(t testing.TB, o *Outbox, deliveryID string) bool {
+	t.Helper()
+
+	var count int
+	if err := o.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE id = ?`, o.deliveriesTable), deliveryID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count > 0
+}
+
+func otPublicationExists(t testing.TB, o *Outbox, publicationID string) bool {
+	t.Helper()
+
+	var count int
+	if err := o.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE publication_id = ?`, o.publicationsTable), publicationID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count > 0
+}
+
+func otTableExists(t testing.TB, db *sql.DB, table string) bool {
+	t.Helper()
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count > 0
 }
 
 func aggregateIDsForDistinctShards(t testing.TB, count, shards int) []uuid.UUID {
@@ -2001,6 +2339,27 @@ func (h *orderingHandler) Contents() []string {
 	defer h.mu.Unlock()
 
 	return append([]string(nil), h.seen...)
+}
+
+// otCountingHandler counts HandleEvent calls and always returns err (the mocks
+// handler does not record a call when it fails).
+type otCountingHandler struct {
+	Type  string
+	err   error
+	calls atomic.Int64
+}
+
+func (h *otCountingHandler) HandlerType() eh.EventHandlerType {
+	return eh.EventHandlerType(h.Type)
+}
+
+func (h *otCountingHandler) HandleEvent(context.Context, eh.Event) error {
+	h.calls.Add(1)
+	return h.err
+}
+
+func (h *otCountingHandler) Calls() int64 {
+	return h.calls.Load()
 }
 
 type concurrencyHandler struct {
@@ -2105,11 +2464,13 @@ func slicesEqual(a, b []string) bool {
 	return true
 }
 
+// outboxRowCount counts pending delivery rows (the v2 unit of work) for the
+// default table prefix.
 func outboxRowCount(t testing.TB, db *sql.DB) int {
 	t.Helper()
 
 	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM outbox`).Scan(&count); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM outbox_deliveries`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	return count
@@ -2223,38 +2584,28 @@ func assertDeadLetterHandlers(t testing.TB, db *sql.DB, want []string) {
 	}
 }
 
-func assertOutboxHandlers(t testing.TB, db *sql.DB, outboxID string, want []string) {
-	t.Helper()
-
-	var handlersBlob string
-	if err := db.QueryRow(`SELECT handlers FROM outbox WHERE id = ?`, outboxID).Scan(&handlersBlob); err != nil {
-		t.Fatal(err)
-	}
-	var got []string
-	if err := json.Unmarshal([]byte(handlersBlob), &got); err != nil {
-		t.Fatal(err)
-	}
-	if !slicesEqual(got, want) {
-		t.Fatalf("outbox handlers = %v, want %v", got, want)
-	}
-}
-
 type deadLetterRow struct {
 	OutboxID          string
 	RemainingHandlers string
+	PublicationID     string
+	LegacyOutboxID    string
 }
 
 func deadLetterRecordByHandler(t testing.TB, db *sql.DB, handlerType string) deadLetterRow {
 	t.Helper()
 
 	var record deadLetterRow
+	var outboxID, publicationID, legacyOutboxID sql.NullString
 	if err := db.QueryRow(`
-		SELECT outbox_id, remaining_handlers
+		SELECT outbox_id, remaining_handlers, publication_id, legacy_outbox_id
 		FROM dead_letters
 		WHERE source = 'outbox' AND handler_type = ?
-	`, handlerType).Scan(&record.OutboxID, &record.RemainingHandlers); err != nil {
+	`, handlerType).Scan(&outboxID, &record.RemainingHandlers, &publicationID, &legacyOutboxID); err != nil {
 		t.Fatal(err)
 	}
+	record.OutboxID = outboxID.String
+	record.PublicationID = publicationID.String
+	record.LegacyOutboxID = legacyOutboxID.String
 	return record
 }
 
