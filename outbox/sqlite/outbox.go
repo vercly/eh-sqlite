@@ -38,6 +38,23 @@ var (
 
 const metadataAvailableAtKey = "outbox.available_at"
 
+// MetadataPartitionKey is the explicit partition source for PartitionByAggregate.
+// When present it wins over the aggregate id and any correlation metadata; an
+// empty value means "no partition" (Serial fallback), never a random shard.
+// Publishers whose correlation is not an eventhorizon id (e.g. the legacy
+// Rabbit bridge) set it from the raw correlation string.
+const MetadataPartitionKey = "outbox.partition_key"
+
+// PartitionKeyResolver derives a partition key from an event envelope
+// (metadata plus aggregate id text) for publishers whose correlation is not
+// expressed as the aggregate id or as MetadataPartitionKey — typically rows
+// published before that key existed. It runs after the explicit metadata key
+// and before the aggregate-id/correlation-metadata fallbacks, on the live
+// publish path and in the startup reconcile of existing publications.
+// Returning ok=false defers to the fallbacks; returning ("", true) means
+// "no partition" (Serial).
+type PartitionKeyResolver func(metadata map[string]any, aggregateID string) (key string, ok bool)
+
 // claimQuantum bounds how many deliveries one dispatch key may claim per
 // round-robin turn. Internal constant by agreement (no ENV).
 const claimQuantum = 8
@@ -126,6 +143,7 @@ type Outbox struct {
 	queueDepth       int
 	retryBackoff     backoff.Config
 	deadLetterExport dl.Exporter
+	partitionKey     PartitionKeyResolver
 	admission        *recordAdmission
 	dispatch         *dispatchRegistry
 	dispatchStats    DispatchStats
@@ -379,6 +397,17 @@ func WithAdmissionLimit(limit int) Option {
 	}
 }
 
+// WithPartitionKeyResolver installs a PartitionKeyResolver (see its doc).
+// StartChecked re-derives partition_key for every publication that still has
+// deliveries and recomputes their dispatch keys before dispatch, so changing
+// the resolver never leaves stale shards behind.
+func WithPartitionKeyResolver(resolver PartitionKeyResolver) Option {
+	return func(o *Outbox) error {
+		o.partitionKey = resolver
+		return nil
+	}
+}
+
 // WithDeadLetterExporter registers a best-effort exporter called after the
 // atomic finalize transaction commits. Export failures do not roll back the DB write.
 func WithDeadLetterExporter(exporter dl.Exporter) Option {
@@ -604,7 +633,7 @@ func (o *Outbox) storeEvent(ctx context.Context, event eh.Event, eventBlob []byt
 	}
 
 	publicationID := uuid.New().String()
-	partitionKey := eventPartitionKey(event)
+	partitionKey := o.partitionKeyFor(event.Metadata(), event.AggregateID().String())
 	pubStmt := tx.StmtContext(ctx, o.insertPublicationStmt)
 	defer closeStmt(pubStmt, "insert publication")
 	if _, err := pubStmt.ExecContext(ctx,
@@ -853,6 +882,10 @@ func (o *Outbox) startupReconcile(ctx context.Context) (map[string]int64, error)
 		return nil, fmt.Errorf("could not reset sentinel unresolved markers: %w", err)
 	}
 
+	if err := o.reconcilePartitionKeys(ctx, tx); err != nil {
+		return nil, err
+	}
+
 	handlers := o.snapshotHandlersByType()
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT d.id, d.handler_type, d.dispatch_key, d.dispatch_config, d.unresolved_at, p.partition_key
@@ -923,6 +956,53 @@ func (o *Outbox) startupReconcile(ctx context.Context) (map[string]int64, error)
 	o.claimKeys = o.registeredDispatchKeys()
 	o.handlersMu.Unlock()
 	return unresolvedCounts, nil
+}
+
+// reconcilePartitionKeys re-derives partition_key for every publication that
+// still has deliveries, from its stored envelope and the current resolver
+// rules, so rows published under older rules (or before MetadataPartitionKey
+// existed) are re-sharded consistently before dispatch. Dispatch keys are
+// recomputed by the caller from the updated partition keys.
+func (o *Outbox) reconcilePartitionKeys(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT p.publication_id, p.partition_key, p.aggregate_id, p.event_blob
+		FROM %s p
+		WHERE EXISTS (SELECT 1 FROM %s d WHERE d.publication_id = p.publication_id)`,
+		o.publicationsTable, o.deliveriesTable))
+	if err != nil {
+		return fmt.Errorf("could not read publications for partition reconcile: %w", err)
+	}
+	type fix struct{ id, key string }
+	var fixes []fix
+	for rows.Next() {
+		var id, stored, aggregateID, blob string
+		if err := rows.Scan(&id, &stored, &aggregateID, &blob); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("could not scan publication for partition reconcile: %w", err)
+		}
+		metadata, err := storedEnvelopeMetadata([]byte(blob))
+		if err != nil {
+			// Undecodable envelope: keep the stored key; claim flags the
+			// delivery visibly when it cannot decode the event.
+			continue
+		}
+		if want := o.partitionKeyFor(metadata, aggregateID); want != stored {
+			fixes = append(fixes, fix{id: id, key: want})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, f := range fixes {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET partition_key = ? WHERE publication_id = ?`, o.publicationsTable), f.key, f.id); err != nil {
+			return fmt.Errorf("could not update partition key of publication %s: %w", f.id, err)
+		}
+	}
+	return nil
 }
 
 // Close stops accepting new work, lets in-flight HandleEvent calls finish and
@@ -1286,11 +1366,34 @@ func dispatchQueueIdentity(handler *matcherHandler, event eh.Event) (queueKey, h
 	return dispatchKeyFor(handler, eventPartitionKey(event))
 }
 
-func eventPartitionKey(event eh.Event) string {
-	if aggregateID := event.AggregateID(); aggregateID != uuid.Nil {
-		return aggregateID.String()
+// partitionKeyFor resolves the partition key for a live or stored envelope:
+// explicit metadata key, then the configured resolver, then the aggregate id,
+// then correlation metadata, else "" (Serial).
+func (o *Outbox) partitionKeyFor(metadata map[string]any, aggregateID string) string {
+	if explicit, ok := explicitPartitionKey(metadata); ok {
+		return explicit
 	}
-	metadata := event.Metadata()
+	if o.partitionKey != nil {
+		if key, ok := o.partitionKey(metadata, aggregateID); ok {
+			return strings.TrimSpace(key)
+		}
+	}
+	return fallbackPartitionKey(metadata, aggregateID)
+}
+
+func eventPartitionKey(event eh.Event) string {
+	if explicit, ok := explicitPartitionKey(event.Metadata()); ok {
+		return explicit
+	}
+	return fallbackPartitionKey(event.Metadata(), event.AggregateID().String())
+}
+
+// fallbackPartitionKey is the historical derivation: aggregate id, else
+// correlation metadata, else none.
+func fallbackPartitionKey(metadata map[string]any, aggregateID string) string {
+	if id, err := uuid.Parse(aggregateID); err == nil && id != uuid.Nil {
+		return id.String()
+	}
 	for _, key := range []string{"correlation_id", "CorrelationId", "correlationId", "x-correlation-id"} {
 		if value, ok := metadata[key]; ok {
 			if partitionKey := metadataPartitionKey(value); partitionKey != "" {
@@ -1299,6 +1402,22 @@ func eventPartitionKey(event eh.Event) string {
 		}
 	}
 	return ""
+}
+
+// explicitPartitionKey reports the MetadataPartitionKey value when the key is
+// present (an empty string is a deliberate Serial fallback).
+func explicitPartitionKey(metadata map[string]any) (string, bool) {
+	if metadata == nil {
+		return "", false
+	}
+	value, ok := metadata[MetadataPartitionKey]
+	if !ok {
+		return "", false
+	}
+	if value == nil {
+		return "", true
+	}
+	return metadataPartitionKey(value), true
 }
 
 func metadataPartitionKey(value any) string {

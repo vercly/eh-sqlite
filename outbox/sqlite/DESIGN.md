@@ -19,7 +19,7 @@ as text, which mis-orders rows across DST changes.
 `outbox_publications` — one row per `HandleEvent` call: `publication_id`
 (uuid, distinct from the event id: the same event published twice is two
 publications), `event_type`, `aggregate_id`, `partition_key` (derived at
-publish from the aggregate id or correlation metadata), `event_blob`,
+publish, see "Partition key" below), `event_blob`,
 `created_at`, `origin` (`publish` | `migrated` | `replay`), `origin_ref`
 (v1 row id or dead-letter id for provenance). A publication lives exactly as
 long as one of its deliveries; the finalize that deletes the last delivery
@@ -44,6 +44,27 @@ prefix for non-default prefixes). `PRAGMA user_version` is not used.
 All timestamps are written as `t.UTC()` so the driver stores canonical
 `YYYY-MM-DD HH:MM:SS.fffffffff+00:00` text; comparisons bind UTC parameters.
 
+## Partition key
+
+`PartitionByAggregate` handlers hash the publication's `partition_key` into
+`shards` queues. The key is derived, on publish and again at every start, in
+this order: the explicit metadata key `outbox.partition_key`
+(`MetadataPartitionKey`; present → wins; empty or nil → no partition, Serial,
+never a random shard), then the `PartitionKeyResolver` installed with
+`WithPartitionKeyResolver` (for envelopes written before the explicit key
+existed or by foreign publishers; `("", true)` means Serial, `ok=false`
+defers), then the aggregate id, then correlation metadata, else Serial.
+`StoredEventPartitionKey` applies the same rules without a resolver (explicit
+override honored, historical derivation otherwise) and
+`StoredEventPartitionKeyWith` with one, so offline tools can match the process.
+
+Each shard runs one delivery at a time; empty keys use an additional serial
+fallback queue, so a handler can have up to `shards + 1` active queues, still
+bounded by the global execution limit. This is not an admission-fairness
+guarantee: a partitioned handler with slow work can occupy every global
+admission slot. Other handlers need slots to free before they can be admitted;
+round-robin key selection does not provide a wall-clock latency bound.
+
 ## Lifecycle
 
 1. `NewOutbox` creates the v2 tables and prepared statements. It never
@@ -57,8 +78,11 @@ All timestamps are written as `t.UTC()` so the driver stores canonical
       preserved through `seq`, then renames the v1 table to
       `<prefix>_v1_migrated` (a retained backup; never read again);
    3. one startup transaction: reset every `taken_at`, clear `unresolved_at`
-      on sentinels, recompute `dispatch_key` for every delivery whose stored
-      config differs from the registered handler's config, flag deliveries of
+      on sentinels, re-derive `partition_key` of every publication that still
+      has deliveries from its stored envelope (current explicit/resolver
+      rules; an undecodable envelope keeps its key), recompute `dispatch_key`
+      for every delivery whose partition key or stored config differs from
+      the registered handler's, flag deliveries of
       unregistered handlers with `unresolved_at` (visible, never claimed,
       never deleted; one `ErrUnresolvedHandler` per handler type on
       `Errors()`);

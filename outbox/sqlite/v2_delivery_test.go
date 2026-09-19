@@ -13,6 +13,7 @@ import (
 
 	"github.com/vercly/eh-sqlite/schema"
 	eh "github.com/vercly/eventhorizon"
+	ehcodec "github.com/vercly/eventhorizon/codec/json"
 	"github.com/vercly/eventhorizon/mocks"
 	"github.com/vercly/eventhorizon/uuid"
 )
@@ -715,5 +716,211 @@ func TestV2FatalDeliveryDeadLettersWithProvenanceAndSiblingContinues(t *testing.
 	}
 	if countPublications(t, o) != 0 {
 		t.Fatal("publication must be GC'd after the last delivery (dead letter keeps its own blob)")
+	}
+}
+
+func TestV2ExplicitPartitionKeyWinsAndEmptyMeansSerial(t *testing.T) {
+	aggregate := uuid.New()
+	base := newTestEventForAggregate("x", aggregate)
+
+	withMeta := func(meta map[string]any) eh.Event {
+		return eh.NewEvent(mocks.EventType, &mocks.EventData{Content: "x"}, time.Now(),
+			eh.ForAggregate(mocks.AggregateType, aggregate, 1), eh.WithMetadata(meta))
+	}
+	if got := eventPartitionKey(base); got != aggregate.String() {
+		t.Fatalf("no explicit key: got %q want aggregate", got)
+	}
+	if got := eventPartitionKey(withMeta(map[string]any{MetadataPartitionKey: "ext-corr-123"})); got != "ext-corr-123" {
+		t.Fatalf("explicit raw key ignored: %q", got)
+	}
+	if got := eventPartitionKey(withMeta(map[string]any{MetadataPartitionKey: ""})); got != "" {
+		t.Fatalf("explicit empty key must mean no partition, got %q", got)
+	}
+	if got := eventPartitionKey(withMeta(map[string]any{MetadataPartitionKey: nil})); got != "" {
+		t.Fatalf("explicit nil key must mean no partition, got %q", got)
+	}
+
+	// Serial fallback: an empty partition key routes a partitioned handler to
+	// its bare handler key, never to a random shard.
+	mh := &matcherHandler{EventHandler: &v2CountingHandler{typ: "p"}, dispatchMode: PartitionByAggregate, partitionShards: 4}
+	if key, _, shard := dispatchKeyFor(mh, ""); key != "p" || shard != serialShardLabel {
+		t.Fatalf("empty partition key: key=%s shard=%s", key, shard)
+	}
+	k1, _, _ := dispatchKeyFor(mh, "ext-corr-123")
+	k2, _, _ := dispatchKeyFor(mh, "ext-corr-123")
+	if k1 != k2 || k1 == "p" {
+		t.Fatalf("same raw key must map to one shard: %s %s", k1, k2)
+	}
+
+	// The stored-envelope reader (migration/replay) agrees with the live path.
+	codec := &ehcodec.EventCodec{}
+	for _, ev := range []eh.Event{base, withMeta(map[string]any{MetadataPartitionKey: "ext-corr-123"}), withMeta(map[string]any{MetadataPartitionKey: ""})} {
+		blob, err := codec.MarshalEvent(context.Background(), ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored, err := StoredEventPartitionKey(blob)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if live := eventPartitionKey(ev); stored != live {
+			t.Fatalf("stored partition %q != live %q", stored, live)
+		}
+	}
+}
+
+func TestV2PartitionResolverPrecedenceAndStartupReconcile(t *testing.T) {
+	db := newTestDB(t)
+	// Resolver: legacy-style envelopes carry their raw correlation in
+	// "corr.raw"; "" means Serial; other events defer to the defaults.
+	resolver := func(metadata map[string]any, _ string) (string, bool) {
+		raw, ok := metadata["corr.raw"]
+		if !ok {
+			return "", false
+		}
+		s, _ := raw.(string)
+		return s, true
+	}
+	o := v2NewOutbox(t, db, WithPartitionKeyResolver(resolver))
+	h := &v2CountingHandler{typ: "p"}
+	if err := o.AddHandlerWithOptions(context.Background(), eh.MatchEvents{mocks.EventType}, h,
+		WithDispatchMode(PartitionByAggregate), WithPartitionShards(4)); err != nil {
+		t.Fatal(err)
+	}
+	aggregate := uuid.New()
+	mk := func(meta map[string]any) eh.Event {
+		return eh.NewEvent(mocks.EventType, &mocks.EventData{Content: "x"}, time.Now(),
+			eh.ForAggregate(mocks.AggregateType, aggregate, 1), eh.WithMetadata(meta))
+	}
+	// Precedence: explicit key > resolver > aggregate.
+	if got := o.partitionKeyFor(mk(map[string]any{MetadataPartitionKey: "explicit", "corr.raw": "r"}).Metadata(), aggregate.String()); got != "explicit" {
+		t.Fatalf("explicit must win: %q", got)
+	}
+	if got := o.partitionKeyFor(mk(map[string]any{"corr.raw": "ext-1"}).Metadata(), aggregate.String()); got != "ext-1" {
+		t.Fatalf("resolver ignored: %q", got)
+	}
+	if got := o.partitionKeyFor(mk(map[string]any{"corr.raw": ""}).Metadata(), aggregate.String()); got != "" {
+		t.Fatalf("resolver empty must mean Serial: %q", got)
+	}
+	if got := o.partitionKeyFor(mk(nil).Metadata(), aggregate.String()); got != aggregate.String() {
+		t.Fatalf("resolver ok=false must defer to aggregate: %q", got)
+	}
+	// Offline reader without a resolver still honors the explicit override
+	// and otherwise keeps the historical derivation.
+	blob, _ := (&ehcodec.EventCodec{}).MarshalEvent(context.Background(), mk(map[string]any{"corr.raw": "ext-1"}))
+	if got, _ := StoredEventPartitionKey(blob); got != aggregate.String() {
+		t.Fatalf("offline default without resolver: %q", got)
+	}
+	if got, _ := StoredEventPartitionKeyWith(blob, resolver); got != "ext-1" {
+		t.Fatalf("offline with resolver: %q", got)
+	}
+	blob, _ = (&ehcodec.EventCodec{}).MarshalEvent(context.Background(), mk(map[string]any{MetadataPartitionKey: "explicit"}))
+	if got, _ := StoredEventPartitionKey(blob); got != "explicit" {
+		t.Fatalf("offline explicit override ignored: %q", got)
+	}
+
+	// Startup reconcile: a publication stored under the old rules (aggregate
+	// based partition_key) is re-sharded from its envelope by the resolver,
+	// and its delivery's dispatch key follows, before dispatch.
+	pubID, _ := insertDeliveryDirect(t, o, deliverySeed{Event: mk(map[string]any{"corr.raw": "ext-1"}), HandlerType: "p", CreatedAt: time.Now().Add(-time.Minute)})
+	var storedKey string
+	if err := db.QueryRow(fmt.Sprintf(`SELECT partition_key FROM %s WHERE publication_id = ?`, o.publicationsTable), pubID).Scan(&storedKey); err != nil {
+		t.Fatal(err)
+	}
+	if storedKey != aggregate.String() {
+		t.Fatalf("fixture premise: stored partition_key = %q, want aggregate", storedKey)
+	}
+	reconcileForTest(t, o)
+	if err := db.QueryRow(fmt.Sprintf(`SELECT partition_key FROM %s WHERE publication_id = ?`, o.publicationsTable), pubID).Scan(&storedKey); err != nil {
+		t.Fatal(err)
+	}
+	if storedKey != "ext-1" {
+		t.Fatalf("partition_key not reconciled: %q", storedKey)
+	}
+	want, _, _ := dispatchKeyFor(o.handlersByType["p"], "ext-1")
+	if rows := listDeliveries(t, o); len(rows) != 1 || rows[0].DispatchKey != want {
+		t.Fatalf("dispatch key not recomputed from reconciled partition: %+v want %s", rows, want)
+	}
+	// Idempotent.
+	reconcileForTest(t, o)
+	if rows := listDeliveries(t, o); rows[0].DispatchKey != want {
+		t.Fatalf("second reconcile changed key: %+v", rows)
+	}
+}
+
+// A partitioned listener with slow handlers fills global admission entirely
+// (shards are a concurrency cap, not an admission-fairness guarantee). A new
+// Serial listener makes no progress while admission is full, and is served
+// within one rotation of the ring once a slot frees. No zero-latency promise.
+func TestV2PartitionedListenerFillsAdmissionNewListenerProgressesAfterRelease(t *testing.T) {
+	db := newTestDB(t)
+	o := v2NewOutbox(t, db, WithAdmissionLimit(8), WithQueueDepth(8), WithMaxGoroutines(4))
+	gate, release := v2Gate(t)
+	heavy := &v2CountingHandler{typ: "heavy", gate: gate}
+	fresh := &v2CountingHandler{typ: "fresh", entered: make(chan struct{}, 1)}
+	if err := o.AddHandlerWithOptions(context.Background(), eh.MatchEvents{mocks.EventType}, heavy,
+		WithDispatchMode(PartitionByAggregate), WithPartitionShards(4)); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.AddHandler(context.Background(), eh.MatchEvents{mocks.EventOtherType}, fresh); err != nil {
+		t.Fatal(err)
+	}
+	prepareWithoutFetcher(t, o)
+	// 24 correlations spread over 4 shards, all slow.
+	for i := range 24 {
+		if err := o.HandleEvent(context.Background(), newTestEventForAggregate(fmt.Sprintf("h%d", i), uuid.New())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 4 {
+		if used, limit := o.AdmissionSnapshot(); used == limit {
+			break
+		}
+		if _, err := o.fetchAndDispatch(context.Background(), false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if used, limit := o.AdmissionSnapshot(); used != limit {
+		t.Fatalf("partitioned listener should fill admission: %d/%d", used, limit)
+	}
+	// New listener's message arrives while admission is full: no progress.
+	event := eh.NewEvent(mocks.EventOtherType, &mocks.EventData{Content: "fresh"}, time.Now(), eh.ForAggregate(mocks.AggregateType, uuid.New(), 1))
+	if err := o.HandleEvent(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := o.fetchAndDispatch(context.Background(), false); err != nil || n != 0 {
+		t.Fatalf("pass with full admission claimed %d (err %v), want 0", n, err)
+	}
+	select {
+	case <-fresh.entered:
+		t.Fatal("fresh listener ran while admission was full")
+	default:
+	}
+	// Free one slot at a time; within one ring rotation the fresh key is served.
+	served := false
+	for pass := 0; pass < len(o.claimKeys)+1 && !served; pass++ {
+		gate <- struct{}{}
+		waitUntil(t, 5*time.Second, func() bool { used, limit := o.AdmissionSnapshot(); return used < limit })
+		if _, err := o.fetchAndDispatch(context.Background(), false); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-fresh.entered:
+			served = true
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if !served {
+		t.Fatal("fresh listener not served within one rotation of freed slots")
+	}
+	release()
+	waitUntil(t, 10*time.Second, func() bool {
+		if _, err := o.fetchAndDispatch(context.Background(), false); err != nil {
+			t.Fatal(err)
+		}
+		return countDeliveries(t, o) == 0
+	})
+	if heavy.calls.Load() != 24 || fresh.calls.Load() != 1 {
+		t.Fatalf("calls heavy=%d fresh=%d", heavy.calls.Load(), fresh.calls.Load())
 	}
 }
