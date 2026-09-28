@@ -154,3 +154,8 @@ no key is starved while slots free up (round-robin with quantum), but there
 is no latency or progress guarantee while admitted handlers never return;
 one process per database file; no exactly-once; no ordering across keys; no
 implicit remapping of historical handler identities.
+
+## Large envelopes
+
+See [payload admission](PAYLOAD_BUDGET.md) for the byte budget, preserved oversize
+records, diagnostic payload bounds and synthetic OOM regression evidence.

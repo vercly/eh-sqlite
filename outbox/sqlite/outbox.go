@@ -113,7 +113,8 @@ func WithAvailableAt(ctx context.Context, availableAt time.Time) context.Context
 // Outbox implements an eventhorizon.Outbox for SQLite (v2: one delivery row
 // per recipient sharing one publication payload).
 type Outbox struct {
-	db *sql.DB
+	payloads *payloadBudget
+	db       *sql.DB
 	// outboxTable is the table prefix (and the v1 table name before migration).
 	outboxTable       string
 	publicationsTable string
@@ -274,6 +275,7 @@ func NewOutbox(db *sql.DB, options ...Option) (*Outbox, error) {
 		retryBackoff:    backoff.FixedConfig(10, PeriodicSweepAge),
 		// Default admission capacity: in-flight deliveries in this process.
 		admission:     newRecordAdmission(maxFetchBatch),
+		payloads:      newPayloadBudget(DefaultPayloadBudget),
 		finalizeSleep: time.Sleep,
 	}
 
@@ -462,7 +464,7 @@ func (o *Outbox) prepareStatements() error {
 		UPDATE %s SET taken_at = NULL WHERE id = ? AND taken_at IS NOT NULL AND taken_at < ?`, dels))
 	prepare(&o.sentinelsStmt, "rematch sentinels", fmt.Sprintf(`
 		SELECT d.seq, d.id, d.publication_id, '', d.event_type, d.aggregate_id, d.created_at, d.available_at, d.taken_at,
-		       d.retry_count, d.legacy_outbox_id, p.event_blob, p.partition_key
+		       d.retry_count, d.legacy_outbox_id, octet_length(p.event_blob), p.partition_key
 		FROM %[1]s d INDEXED BY idx_%[1]s_sentinel JOIN %[2]s p ON p.publication_id = d.publication_id
 		WHERE d.handler_type IS NULL AND d.unresolved_at IS NULL AND d.taken_at IS NULL AND d.available_at <= ?
 		ORDER BY d.available_at ASC, d.seq ASC LIMIT ?`, dels, pubs))
@@ -499,7 +501,7 @@ func (o *Outbox) claimKeyQuery(n int) string {
 	}
 	return fmt.Sprintf(`
 		SELECT d.seq, d.id, d.publication_id, d.handler_type, d.event_type, d.aggregate_id, d.created_at, d.available_at, d.taken_at,
-		       d.retry_count, d.legacy_outbox_id, p.event_blob, p.partition_key
+		       d.retry_count, d.legacy_outbox_id, octet_length(p.event_blob), p.partition_key
 		FROM %s d JOIN %s p ON p.publication_id = d.publication_id
 		WHERE d.dispatch_key = ? AND d.taken_at IS NULL AND d.unresolved_at IS NULL
 		  AND d.available_at <= ?%s
@@ -578,6 +580,7 @@ type deliveryDoc struct {
 	LegacyOutboxID sql.NullString
 	PartitionKey   string
 	EventBlob      string
+	PayloadBytes   int64
 	Event          eh.Event
 	EventCtx       map[string]any
 }
@@ -965,10 +968,11 @@ func (o *Outbox) startupReconcile(ctx context.Context) (map[string]int64, error)
 // recomputed by the caller from the updated partition keys.
 func (o *Outbox) reconcilePartitionKeys(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
-		SELECT p.publication_id, p.partition_key, p.aggregate_id, p.event_blob
+		SELECT p.publication_id, p.partition_key, p.aggregate_id,
+		       CASE WHEN octet_length(p.event_blob) <= ? THEN p.event_blob ELSE '' END
 		FROM %s p
 		WHERE EXISTS (SELECT 1 FROM %s d WHERE d.publication_id = p.publication_id)`,
-		o.publicationsTable, o.deliveriesTable))
+		o.publicationsTable, o.deliveriesTable), o.payloads.limit)
 	if err != nil {
 		return fmt.Errorf("could not read publications for partition reconcile: %w", err)
 	}
@@ -1247,7 +1251,7 @@ func (o *Outbox) scanDeliveryRow(rows *sql.Rows) (*deliveryDoc, error) {
 		availableAt sql.NullTime
 	)
 	if err := rows.Scan(&d.Seq, &d.ID, &d.PublicationID, &handlerType, &d.EventType, &d.AggregateID,
-		&createdAt, &availableAt, &d.TakenAt, &d.RetryCount, &d.LegacyOutboxID, &d.EventBlob, &d.PartitionKey); err != nil {
+		&createdAt, &availableAt, &d.TakenAt, &d.RetryCount, &d.LegacyOutboxID, &d.PayloadBytes, &d.PartitionKey); err != nil {
 		return nil, fmt.Errorf("could not scan delivery row: %w", err)
 	}
 	d.HandlerType = handlerType.String
@@ -1258,11 +1262,12 @@ func (o *Outbox) scanDeliveryRow(rows *sql.Rows) (*deliveryDoc, error) {
 
 // decodeDelivery unmarshals the payload into d.Event / d.EventCtx.
 func (o *Outbox) decodeDelivery(d *deliveryDoc) error {
-	event, _, err := o.codec.UnmarshalEvent(o.runContext(), []byte(d.EventBlob))
+	blob := []byte(d.EventBlob)
+	event, _, err := o.codec.UnmarshalEvent(o.runContext(), blob)
 	if err != nil {
 		return fmt.Errorf("could not unmarshal event blob: %w", err)
 	}
-	eventCtx, err := eventContextValues([]byte(d.EventBlob))
+	eventCtx, err := eventContextValues(blob)
 	if err != nil {
 		return err
 	}
@@ -1444,7 +1449,7 @@ func (o *Outbox) dispatchHandler(ctx context.Context, d *delivery) handlerDispat
 	if err := d.handler.HandleEvent(ctx, d.doc.Event); err != nil {
 		severity := GetSeverity(err)
 		wrappedErr := fmt.Errorf("could not handle event (%s): %w", d.handler.HandlerType(), err)
-		o.sendError(ctx, wrappedErr, d.doc.Event)
+		o.sendError(ctx, wrappedErr, payloadDiagnostic(d.doc))
 		return handlerDispatchResult{err: wrappedErr, fatal: severity == SeverityFatal}
 	}
 	return handlerDispatchResult{}
@@ -1506,6 +1511,20 @@ func (o *Outbox) claimPass(ctx context.Context) (planned []*delivery, expanded i
 	if err != nil {
 		return nil, 0, err
 	}
+	// A byte-blocked sentinel must be expanded before normal deliveries can
+	// overtake it. Existing workers will free capacity and wake the fetcher.
+	var pendingSentinel bool
+	if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT EXISTS (
+		SELECT 1 FROM %s WHERE handler_type IS NULL AND unresolved_at IS NULL
+		AND taken_at IS NULL AND available_at <= ?)`, o.deliveriesTable), now).Scan(&pendingSentinel); err != nil {
+		return nil, 0, err
+	}
+	if pendingSentinel {
+		if err := tx.Commit(); err != nil {
+			return nil, 0, err
+		}
+		return nil, expanded, nil
+	}
 
 	keys := rotateAfter(o.claimKeys, o.claimCursor)
 
@@ -1544,35 +1563,17 @@ func (o *Outbox) claimPass(ctx context.Context) (planned []*delivery, expanded i
 				if o.admission.contains(doc.ID) {
 					continue
 				}
-				if err := o.decodeDelivery(doc); err != nil {
-					// Visible, never silent: flag as unresolved and report.
-					if _, uerr := unresolvedStmt.ExecContext(ctx, now, doc.ID); uerr != nil {
-						return nil, 0, fmt.Errorf("could not flag undecodable delivery %s: %w", doc.ID, uerr)
-					}
-					o.observeSkip(SkipDecodeFailed, 1)
-					o.sendError(ctx, fmt.Errorf("%w: delivery %s: %v", ErrUnresolvedHandler, doc.ID, err), nil)
+				d, blocked, err := o.prepareCandidate(ctx, tx, doc, handlers, now, unresolvedStmt)
+				if err != nil {
+					return nil, 0, err
+				}
+				if blocked {
+					break
+				} // Keep FIFO on this key; other keys may still fit.
+				if d == nil {
 					continue
 				}
-				mh := handlers[doc.HandlerType]
-				if mh == nil || !mh.Match(doc.Event) {
-					if _, uerr := unresolvedStmt.ExecContext(ctx, now, doc.ID); uerr != nil {
-						return nil, 0, fmt.Errorf("could not flag unresolved delivery %s: %w", doc.ID, uerr)
-					}
-					o.observeSkip(SkipUnresolved, 1)
-					o.sendError(ctx, fmt.Errorf("%w: delivery %s handler %q (leaving unclaimed)", ErrUnresolvedHandler, doc.ID, doc.HandlerType), doc.Event)
-					continue
-				}
-				queueKey, handlerLabel, shardLabel := dispatchKeyFor(mh, doc.PartitionKey)
-				d := newDelivery(doc, mh, queueKey, handlerLabel, shardLabel)
-				if !o.dispatch.tryReserve(d) {
-					o.observeSkip(SkipQueueFull, 1)
-					break
-				}
-				if !o.admission.tryAdmitKey(doc.ID, queueKey) {
-					o.dispatch.releaseReserve(queueKey)
-					o.observeSkip(SkipAdmissionFull, 1)
-					break
-				}
+
 				reserved = append(reserved, d)
 				if _, err := takenStmt.ExecContext(ctx, now, doc.ID); err != nil {
 					return nil, 0, fmt.Errorf("could not claim delivery %s: %w", doc.ID, err)
@@ -1611,6 +1612,7 @@ func (o *Outbox) claimPass(ctx context.Context) (planned []*delivery, expanded i
 func (o *Outbox) rollbackPlanned(planned []*delivery) {
 	for _, d := range planned {
 		o.dispatch.releaseReserve(d.queueKey)
+		o.releasePayload(d.doc)
 		o.admission.release(d.doc.ID)
 	}
 	o.observeAdmission()
@@ -1737,10 +1739,13 @@ func (o *Outbox) expandSentinels(ctx context.Context, tx *sql.Tx, now time.Time,
 		if len(batch) == 0 {
 			return expanded, nil
 		}
-		n, err := o.expandSentinelBatch(ctx, batch, ordered, now, unresolvedStmt, deleteStmt, insertStmt)
+		n, blocked, err := o.expandSentinelBatch(ctx, tx, batch, ordered, now, unresolvedStmt, deleteStmt, insertStmt)
 		expanded += n
 		if err != nil {
 			return expanded, err
+		}
+		if blocked {
+			return expanded, nil
 		}
 	}
 }
@@ -1762,45 +1767,64 @@ func (o *Outbox) selectSentinels(ctx context.Context, stmt *sql.Stmt, now time.T
 	return sentinels, rows.Err()
 }
 
-func (o *Outbox) expandSentinelBatch(ctx context.Context, sentinels []*deliveryDoc, ordered []*matcherHandler, now time.Time, unresolvedStmt, deleteStmt, insertStmt *sql.Stmt) (int, error) {
+func (o *Outbox) expandSentinelBatch(ctx context.Context, tx *sql.Tx, sentinels []*deliveryDoc, ordered []*matcherHandler, now time.Time, unresolvedStmt, deleteStmt, insertStmt *sql.Stmt) (int, bool, error) {
 	expanded := 0
 	for _, doc := range sentinels {
-		if err := o.decodeDelivery(doc); err != nil {
-			if _, uerr := unresolvedStmt.ExecContext(ctx, now, doc.ID); uerr != nil {
-				return 0, fmt.Errorf("could not flag undecodable sentinel %s: %w", doc.ID, uerr)
+		progress, err := func() (bool, error) {
+			if doc.PayloadBytes > o.payloads.limit {
+				return true, o.quarantinePayload(ctx, doc, now, unresolvedStmt)
 			}
-			o.observeSkip(SkipDecodeFailed, 1)
-			o.sendError(ctx, fmt.Errorf("%w: sentinel %s: %v", ErrUnresolvedHandler, doc.ID, err), nil)
-			continue
-		}
-		var matched []*matcherHandler
-		for _, mh := range ordered {
-			if mh != nil && mh.Match(doc.Event) {
-				matched = append(matched, mh)
+			if !o.payloads.reserveSentinel(doc.ID, doc.PayloadBytes) {
+				return false, nil
 			}
-		}
-		if len(matched) == 0 {
-			if _, uerr := unresolvedStmt.ExecContext(ctx, now, doc.ID); uerr != nil {
-				return 0, fmt.Errorf("could not flag unmatched sentinel %s: %w", doc.ID, uerr)
+			defer o.releasePayload(doc)
+			if err := o.loadPayload(ctx, tx, doc); err != nil {
+				return false, err
 			}
-			o.observeSkip(SkipRematchNoMatch, 1)
-			o.sendError(ctx, fmt.Errorf("%w: rematch of delivery %s found no handlers (leaving unclaimed)", ErrUnresolvedHandler, doc.ID), doc.Event)
-			continue
-		}
-		if _, err := deleteStmt.ExecContext(ctx, doc.ID); err != nil {
-			return 0, fmt.Errorf("could not remove rematch sentinel %s: %w", doc.ID, err)
-		}
-		for _, mh := range matched {
-			key, _, _ := dispatchKeyFor(mh, doc.PartitionKey)
-			if _, err := insertStmt.ExecContext(ctx,
-				uuid.New().String(), doc.PublicationID, mh.HandlerType().String(), key, dispatchConfigFor(mh),
-				doc.EventType, doc.AggregateID, schema.UTC(doc.CreatedAt), schema.UTC(doc.AvailableAt), 0, doc.LegacyOutboxID); err != nil {
-				return 0, fmt.Errorf("could not insert rematched delivery for %s: %w", doc.ID, err)
+			if err := o.decodeDelivery(doc); err != nil {
+				if _, uerr := unresolvedStmt.ExecContext(ctx, now, doc.ID); uerr != nil {
+					return false, fmt.Errorf("could not flag undecodable sentinel %s: %w", doc.ID, uerr)
+				}
+				o.observeSkip(SkipDecodeFailed, 1)
+				o.sendError(ctx, fmt.Errorf("%w: sentinel %s: %v", ErrUnresolvedHandler, doc.ID, err), nil)
+				return true, nil
 			}
+			var matched []*matcherHandler
+			for _, mh := range ordered {
+				if mh != nil && mh.Match(doc.Event) {
+					matched = append(matched, mh)
+				}
+			}
+			if len(matched) == 0 {
+				if _, uerr := unresolvedStmt.ExecContext(ctx, now, doc.ID); uerr != nil {
+					return false, fmt.Errorf("could not flag unmatched sentinel %s: %w", doc.ID, uerr)
+				}
+				o.observeSkip(SkipRematchNoMatch, 1)
+				o.sendError(ctx, fmt.Errorf("%w: rematch of delivery %s found no handlers (leaving unclaimed)", ErrUnresolvedHandler, doc.ID), payloadDiagnostic(doc))
+				return true, nil
+			}
+			if _, err := deleteStmt.ExecContext(ctx, doc.ID); err != nil {
+				return false, fmt.Errorf("could not remove rematch sentinel %s: %w", doc.ID, err)
+			}
+			for _, mh := range matched {
+				key, _, _ := dispatchKeyFor(mh, doc.PartitionKey)
+				if _, err := insertStmt.ExecContext(ctx,
+					uuid.New().String(), doc.PublicationID, mh.HandlerType().String(), key, dispatchConfigFor(mh),
+					doc.EventType, doc.AggregateID, schema.UTC(doc.CreatedAt), schema.UTC(doc.AvailableAt), 0, doc.LegacyOutboxID); err != nil {
+					return false, fmt.Errorf("could not insert rematched delivery for %s: %w", doc.ID, err)
+				}
+			}
+			expanded++
+			return true, nil
+		}()
+		if err != nil {
+			return expanded, false, err
 		}
-		expanded++
+		if !progress {
+			return expanded, true, nil
+		}
 	}
-	return expanded, nil
+	return expanded, false, nil
 }
 
 // abandonDelivery is called for queued deliveries at shutdown: the row keeps
@@ -1809,6 +1833,7 @@ func (o *Outbox) abandonDelivery(d *delivery) {
 	if d.abandoned.Swap(true) {
 		return
 	}
+	o.releasePayload(d.doc)
 	o.admission.release(d.doc.ID)
 	o.observeAdmission()
 	d.finish()
@@ -1844,6 +1869,7 @@ func (o *Outbox) executeDelivery(d *delivery) {
 	o.handleSem.release()
 
 	o.finalizeDelivery(context.Background(), d, res)
+	o.releasePayload(d.doc)
 	o.admission.release(d.doc.ID)
 	o.observeAdmission()
 	d.finish()
@@ -1889,10 +1915,10 @@ func (o *Outbox) finalizeDelivery(ctx context.Context, d *delivery, res handlerD
 		}
 	}
 	if err != nil {
-		o.sendError(ctx, fmt.Errorf("could not finalize delivery %s (%s) after %d attempts: %w", d.doc.ID, outcome, attempts, err), d.doc.Event)
+		o.sendError(ctx, fmt.Errorf("could not finalize delivery %s (%s) after %d attempts: %w", d.doc.ID, outcome, attempts, err), payloadDiagnostic(d.doc))
 		releaseErr := o.releaseClaim(ctx, d.doc)
 		if releaseErr != nil {
-			o.sendError(ctx, fmt.Errorf("%w: delivery %s: %v", ErrFinalizeStuck, d.doc.ID, releaseErr), d.doc.Event)
+			o.sendError(ctx, fmt.Errorf("%w: delivery %s: %v", ErrFinalizeStuck, d.doc.ID, releaseErr), payloadDiagnostic(d.doc))
 			o.observeFinalize(FinalizeStuck, time.Since(started), retried, releaseErr)
 			return
 		}
@@ -1904,7 +1930,7 @@ func (o *Outbox) finalizeDelivery(ctx context.Context, d *delivery, res handlerD
 	o.observeFinalize(outcome, time.Since(started), retried, nil)
 	switch outcome {
 	case FinalizeDeadLetter:
-		o.sendError(ctx, errEventHandlerMovedToDeadLetters, d.doc.Event)
+		o.sendError(ctx, errEventHandlerMovedToDeadLetters, payloadDiagnostic(d.doc))
 		o.exportDeadLetters(ctx, d.doc.Event, pending)
 	case FinalizeRetry:
 		// Wake the delayed-dispatch timer after a committed retry schedule.

@@ -207,7 +207,11 @@ func (q *keyQueue) pop() (*delivery, bool) {
 		return nil, false
 	}
 	d := q.items[0]
+	q.items[0] = nil // Do not retain a completed payload in the backing array.
 	q.items = q.items[1:]
+	if len(q.items) == 0 {
+		q.items = nil
+	}
 	q.depth--
 	if q.depth < 0 {
 		q.depth = 0

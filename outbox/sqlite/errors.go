@@ -71,7 +71,9 @@ type ClaimSkipReason string
 
 const (
 	// SkipQueueFull: the dispatch key queue had no free slot.
-	SkipQueueFull ClaimSkipReason = "queue_full"
+	SkipQueueFull       ClaimSkipReason = "queue_full"
+	SkipPayloadBudget   ClaimSkipReason = "payload_budget"
+	SkipPayloadTooLarge ClaimSkipReason = "payload_too_large"
 	// SkipAdmissionFull: the global admission limit was reached.
 	SkipAdmissionFull ClaimSkipReason = "admission_full"
 	// SkipUnresolved: the delivery's handler is not registered or does not match.
