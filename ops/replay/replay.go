@@ -36,6 +36,10 @@ type Options struct {
 	Source string
 	// AllowBroad permits Apply without IDs (not used by default CLI).
 	AllowBroad bool
+	// PartitionKeyResolver must match the Outbox's WithPartitionKeyResolver
+	// so replayed publications land on the shard the live path would pick.
+	// Nil uses the default rules.
+	PartitionKeyResolver outboxsqlite.PartitionKeyResolver
 }
 
 // ItemStatus is the outcome for one dead-letter row.
@@ -354,7 +358,7 @@ func replayOne(ctx context.Context, db *sql.DB, opts Options, row dlqRow) (PlanI
 	if v2, err := isV2(db); err != nil {
 		return item, err
 	} else if v2 && row.Source == SourceOutbox {
-		if _, err := replayPartitionKey(row.Blob); err != nil {
+		if _, err := replayPartitionKey(row.Blob, opts.PartitionKeyResolver); err != nil {
 			return item, fmt.Errorf("decode replay partition key: %w", err)
 		}
 	}
@@ -389,11 +393,11 @@ func replayOne(ctx context.Context, db *sql.DB, opts Options, row dlqRow) (PlanI
 
 	switch item.Action {
 	case "outbox_rematch_row":
-		if err := restoreNoMatch(ctx, tx, row); err != nil {
+		if err := restoreNoMatch(ctx, tx, row, opts.PartitionKeyResolver); err != nil {
 			return item, err
 		}
 	case "outbox_restore_handler":
-		if err := restoreTerminalHandler(ctx, tx, row); err != nil {
+		if err := restoreTerminalHandler(ctx, tx, row, opts.PartitionKeyResolver); err != nil {
 			return item, err
 		}
 	case "command_async_task":
@@ -422,13 +426,13 @@ func replayOne(ctx context.Context, db *sql.DB, opts Options, row dlqRow) (PlanI
 	return item, nil
 }
 
-func restoreNoMatch(ctx context.Context, tx *sql.Tx, row dlqRow) error {
+func restoreNoMatch(ctx context.Context, tx *sql.Tx, row dlqRow, resolver outboxsqlite.PartitionKeyResolver) error {
 	v2, err := isV2Tx(ctx, tx)
 	if err != nil {
 		return err
 	}
 	if v2 {
-		return restoreV2(ctx, tx, row, "")
+		return restoreV2(ctx, tx, row, "", resolver)
 	}
 	// Empty handlers list is the rematch sentinel (see outbox planAndClaim).
 	outboxID := row.ID
@@ -449,13 +453,13 @@ func restoreNoMatch(ctx context.Context, tx *sql.Tx, row dlqRow) error {
 	return err
 }
 
-func restoreTerminalHandler(ctx context.Context, tx *sql.Tx, row dlqRow) error {
+func restoreTerminalHandler(ctx context.Context, tx *sql.Tx, row dlqRow, resolver outboxsqlite.PartitionKeyResolver) error {
 	v2, err := isV2Tx(ctx, tx)
 	if err != nil {
 		return err
 	}
 	if v2 {
-		return restoreV2(ctx, tx, row, row.HandlerType)
+		return restoreV2(ctx, tx, row, row.HandlerType, resolver)
 	}
 	if !row.OutboxID.Valid || row.OutboxID.String == "" {
 		return errors.New("terminal outbox dead letter missing outbox_id")
@@ -512,11 +516,11 @@ func restoreTerminalHandler(ctx context.Context, tx *sql.Tx, row dlqRow) error {
 // restoreV2 recreates one publication plus either a terminal recipient or a
 // NULL rematch sentinel. DLQ payloads are self-contained, so no legacy row is
 // consulted. New IDs avoid conflating repeated publications of one EH event.
-func restoreV2(ctx context.Context, tx *sql.Tx, row dlqRow, handler string) error {
+func restoreV2(ctx context.Context, tx *sql.Tx, row dlqRow, handler string, resolver outboxsqlite.PartitionKeyResolver) error {
 	publicationID := uuid.New().String()
 	deliveryID := uuid.New().String()
 	now := schema.UTC(time.Now())
-	partitionKey, err := replayPartitionKey(row.Blob)
+	partitionKey, err := replayPartitionKey(row.Blob, resolver)
 	if err != nil {
 		return fmt.Errorf("decode replay partition key: %w", err)
 	}
@@ -537,8 +541,8 @@ func restoreV2(ctx context.Context, tx *sql.Tx, row dlqRow, handler string) erro
 	return err
 }
 
-func replayPartitionKey(blob string) (string, error) {
-	return outboxsqlite.StoredEventPartitionKey([]byte(blob))
+func replayPartitionKey(blob string, resolver outboxsqlite.PartitionKeyResolver) (string, error) {
+	return outboxsqlite.StoredEventPartitionKeyWith([]byte(blob), resolver)
 }
 
 func nullableHandler(handler string) any {

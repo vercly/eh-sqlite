@@ -87,3 +87,28 @@ func replayEventBlob(t *testing.T, aggregate uuid.UUID) string {
 	}
 	return string(b)
 }
+
+func TestReplayV2UsesPartitionKeyResolver(t *testing.T) {
+	db := openDB(t)
+	enableV2Replay(t, db)
+	blob := replayEventBlob(t, uuid.New())
+	seedDLQ(t, db, "dlq-resolver", SourceOutbox, "evt", "agg", "handler", "", blob)
+	resolver := func(metadata map[string]any, _ string) (string, bool) {
+		corr, _ := metadata["correlation_id"].(string)
+		return "resolved-" + corr, true
+	}
+	res, err := ReplayDeadLetters(context.Background(), db, Options{Apply: true, Actor: "ops", IDs: []string{"dlq-resolver"}, PartitionKeyResolver: resolver})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Replayed != 1 {
+		t.Fatalf("%+v", res)
+	}
+	var partition string
+	if err := db.QueryRow(`SELECT partition_key FROM outbox_publications`).Scan(&partition); err != nil {
+		t.Fatal(err)
+	}
+	if partition != "resolved-corr" {
+		t.Fatalf("partition_key=%q, want the resolver's key", partition)
+	}
+}
