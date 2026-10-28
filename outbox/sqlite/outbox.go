@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -1008,7 +1009,8 @@ func (o *Outbox) startupReconcile(ctx context.Context) (map[string]int64, error)
 func (o *Outbox) reconcilePartitionKeys(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT p.publication_id, p.partition_key, p.aggregate_id,
-		       CASE WHEN octet_length(p.event_blob) <= ? THEN p.event_blob ELSE '' END
+		       CASE WHEN octet_length(p.event_blob) <= ? AND json_valid(p.event_blob) AND json_type(p.event_blob) = 'object'
+		            THEN COALESCE(json_extract(p.event_blob, '$.metadata'), 'null') ELSE '' END
 		FROM %s p
 		WHERE EXISTS (SELECT 1 FROM %s d WHERE d.publication_id = p.publication_id)`,
 		o.publicationsTable, o.deliveriesTable), o.payloads.limit)
@@ -1018,13 +1020,16 @@ func (o *Outbox) reconcilePartitionKeys(ctx context.Context, tx *sql.Tx) error {
 	type fix struct{ id, key string }
 	var fixes []fix
 	for rows.Next() {
-		var id, stored, aggregateID, blob string
-		if err := rows.Scan(&id, &stored, &aggregateID, &blob); err != nil {
+		// Only the metadata object leaves SQLite: the event data is never
+		// copied into Go or decoded here. '' marks an oversized or
+		// undecodable envelope.
+		var id, stored, aggregateID, rawMetadata string
+		if err := rows.Scan(&id, &stored, &aggregateID, &rawMetadata); err != nil {
 			_ = rows.Close()
 			return fmt.Errorf("could not scan publication for partition reconcile: %w", err)
 		}
-		metadata, err := storedEnvelopeMetadata([]byte(blob))
-		if err != nil {
+		var metadata map[string]any
+		if err := json.Unmarshal([]byte(rawMetadata), &metadata); err != nil {
 			// Undecodable envelope: keep the stored key; claim flags the
 			// delivery visibly when it cannot decode the event.
 			continue

@@ -27,12 +27,3 @@ type storedEnvelope struct {
 	AggregateID string         `json:"aggregate_id"`
 	Metadata    map[string]any `json:"metadata"`
 }
-
-// storedEnvelopeMetadata reads only the metadata of a stored event blob.
-func storedEnvelopeMetadata(blob []byte) (map[string]any, error) {
-	var envelope storedEnvelope
-	if err := json.Unmarshal(blob, &envelope); err != nil {
-		return nil, fmt.Errorf("decode stored event envelope: %w", err)
-	}
-	return envelope.Metadata, nil
-}
