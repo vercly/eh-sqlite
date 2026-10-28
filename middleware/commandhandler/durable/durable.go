@@ -366,22 +366,13 @@ func Resume(ctx context.Context, db *sql.DB, bus eh.CommandHandler, options ...O
 	if err := ensureSchema(db); err != nil {
 		return err
 	}
-	rows, err := db.QueryContext(ctx, `
-		SELECT id, command_blob
-		FROM async_tasks
-		WHERE status = 'new' OR status = 'processing'
-		ORDER BY created_at ASC, id ASC
-	`)
+	const due = `status = 'new' OR status = 'processing'`
+	ids, err := dueTaskIDs(ctx, db, `SELECT id FROM async_tasks WHERE `+due+` ORDER BY created_at ASC, id ASC`)
 	if err != nil {
 		return fmt.Errorf("durable: could not query for unfinished tasks: %w", err)
 	}
-	defer rows.Close()
-
-	tasks, err := scanDispatchTasks(rows)
-	if err != nil {
-		return err
-	}
-	return dispatchTasks(ctx, tasks, bus)
+	_, err = dispatchTasks(ctx, db, ids, due, nil, bus)
+	return err
 }
 
 // StartSweeper launches a background retry sweeper. The caller controls its
@@ -416,65 +407,70 @@ func Sweep(ctx context.Context, db *sql.DB, bus eh.CommandHandler, options ...Op
 	cfg := applyOptions(options...)
 	now := schema.UTC(time.Now())
 	stuckBefore := schema.UTC(now.Add(-cfg.stuckTimeout))
-	rows, err := db.QueryContext(ctx, `
-		SELECT id, command_blob
-		FROM async_tasks
-		WHERE (status = 'failed_retriable' AND next_retry_at <= ?)
-		   OR (status = 'processing' AND locked_at IS NOT NULL AND locked_at < ?)
-		ORDER BY updated_at ASC, id ASC
-	`, now, stuckBefore)
+	const due = `(status = 'failed_retriable' AND next_retry_at <= ?)
+		   OR (status = 'processing' AND locked_at IS NOT NULL AND locked_at < ?)`
+	args := []any{now, stuckBefore}
+	ids, err := dueTaskIDs(ctx, db, `SELECT id FROM async_tasks WHERE `+due+` ORDER BY updated_at ASC, id ASC`, args...)
 	if err != nil {
 		return 0, fmt.Errorf("durable: could not query retryable tasks: %w", err)
 	}
-	defer rows.Close()
+	return dispatchTasks(ctx, db, ids, due, args, bus)
+}
 
-	tasks, err := scanDispatchTasks(rows)
+// dueTaskIDs lists task IDs only: command blobs are loaded one at a time at
+// dispatch, so a large backlog never sits in memory at once.
+func dueTaskIDs(ctx context.Context, db *sql.DB, query string, args ...any) ([]int64, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	if err := dispatchTasks(ctx, tasks, bus); err != nil {
-		return len(tasks), err
-	}
-	return len(tasks), nil
-}
-
-type dispatchTask struct {
-	id          int64
-	commandBlob []byte
-}
-
-func scanDispatchTasks(rows *sql.Rows) ([]dispatchTask, error) {
-	var tasks []dispatchTask
+	defer rows.Close()
+	var ids []int64
 	for rows.Next() {
-		var task dispatchTask
-		if err := rows.Scan(&task.id, &task.commandBlob); err != nil {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
 			return nil, fmt.Errorf("durable: could not scan task: %w", err)
 		}
-		tasks = append(tasks, task)
+		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("durable: error during row iteration: %w", err)
 	}
-	return tasks, nil
+	return ids, nil
 }
 
-func dispatchTasks(ctx context.Context, tasks []dispatchTask, bus eh.CommandHandler) error {
+// dispatchTasks re-dispatches tasks in order. Each blob is loaded together
+// with a re-check of the due condition, so a task that completed or was
+// re-dispatched since the listing is skipped. It returns how many tasks were
+// dispatched.
+func dispatchTasks(ctx context.Context, db *sql.DB, ids []int64, due string, dueArgs []any, bus eh.CommandHandler) (int, error) {
 	codec := json.CommandCodec{}
-	for _, task := range tasks {
-		cmd, cmdCtx, err := codec.UnmarshalCommand(ctx, task.commandBlob)
+	query := `SELECT command_blob FROM async_tasks WHERE id = ? AND (` + due + `)`
+	dispatched := 0
+	for _, id := range ids {
+		var blob []byte
+		err := db.QueryRowContext(ctx, query, append([]any{id}, dueArgs...)...).Scan(&blob)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
 		if err != nil {
-			log.Printf("durable: could not unmarshal command for task %d: %v", task.id, err)
+			return dispatched, fmt.Errorf("durable: could not load task %d: %w", id, err)
+		}
+		cmd, cmdCtx, err := codec.UnmarshalCommand(ctx, blob)
+		if err != nil {
+			log.Printf("durable: could not unmarshal command for task %d: %v", id, err)
 			continue
 		}
 		if cmdCtx == nil {
 			cmdCtx = ctx
 		}
-		cmdCtx = context.WithValue(cmdCtx, taskIDContextKey{}, task.id)
+		cmdCtx = context.WithValue(cmdCtx, taskIDContextKey{}, id)
+		dispatched++
 		if err := bus.HandleCommand(cmdCtx, cmd); err != nil {
-			log.Printf("durable: could not re-dispatch command for task %d: %v", task.id, err)
+			log.Printf("durable: could not re-dispatch command for task %d: %v", id, err)
 		}
 	}
-	return nil
+	return dispatched, nil
 }
 
 type taskRecord struct {

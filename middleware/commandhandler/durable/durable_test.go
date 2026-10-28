@@ -505,3 +505,36 @@ func TestDurableWritesCanonicalUTCText(t *testing.T) {
 		}
 	}
 }
+
+// A task listed by Sweep but finished before its turn (here: completed by the
+// handler of an earlier task) is not dispatched again.
+func TestDurableSweepSkipsTaskCompletedAfterListing(t *testing.T) {
+	db := newDurableTestDB(t)
+	opts := []durable.Option{durable.WithMaxRetries(2), durable.WithRetryBackoff("FIXED:2:1ms")}
+	handler := &completingCommandHandler{db: db}
+	wrapped := newWrappedHandler(t, db, handler, opts...)
+	first := seedTask(t, db, "failed_retriable", time.Now().Add(-2*time.Second), sql.NullTime{}, 1, 2)
+	second := seedTask(t, db, "failed_retriable", time.Now().Add(-time.Second), sql.NullTime{}, 1, 2)
+	if _, err := db.Exec(`UPDATE async_tasks SET updated_at = ? WHERE id = ?`, schema.UTC(time.Now().Add(-time.Hour)), first); err != nil {
+		t.Fatal(err)
+	}
+	handler.complete = second
+
+	assertSweepProcessed(t, db, wrapped, 1, opts...)
+
+	if handler.calls != 1 {
+		t.Fatalf("handler calls = %d, want 1", handler.calls)
+	}
+}
+
+type completingCommandHandler struct {
+	db       *sql.DB
+	complete int64
+	calls    int
+}
+
+func (h *completingCommandHandler) HandleCommand(context.Context, eh.Command) error {
+	h.calls++
+	_, err := h.db.Exec(`UPDATE async_tasks SET status = 'completed' WHERE id = ?`, h.complete)
+	return err
+}
