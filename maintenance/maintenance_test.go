@@ -380,3 +380,29 @@ func TestParseSQLiteTimeUsesSchemaParseStored(t *testing.T) {
 		t.Fatalf("parseSQLiteTime error = %v, want ErrTimestampAmbiguous", err)
 	}
 }
+
+func TestCleanupDeletesBacklogLargerThanOneBatch(t *testing.T) {
+	db := newMaintenanceTestDB(t)
+	createAsyncTasksTable(t, db)
+	now := time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
+	const old = 2*cleanupBatch + 7
+	for i := 0; i < old; i++ {
+		insertAsyncTask(t, db, "completed", now.Add(-48*time.Hour))
+	}
+	insertAsyncTask(t, db, "completed", now.Add(-time.Hour))
+
+	result, err := Cleanup(context.Background(), db, WithNow(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.AsyncCompletedDeleted != old {
+		t.Fatalf("completed deleted = %d, want %d", result.AsyncCompletedDeleted, old)
+	}
+	var left int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM async_tasks`).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 1 {
+		t.Fatalf("rows left = %d, want 1", left)
+	}
+}

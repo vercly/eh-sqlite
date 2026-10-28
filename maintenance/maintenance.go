@@ -119,19 +119,13 @@ func Cleanup(ctx context.Context, db *sql.DB, opts ...Option) (Result, error) {
 	if exists, err := tableExists(ctx, db, "async_tasks"); err != nil {
 		return result, err
 	} else if exists {
-		deleted, err := deleteRows(ctx, db, `
-			DELETE FROM async_tasks
-			WHERE status = 'completed' AND updated_at < ?
-		`, schema.UTC(now.Add(-cfg.asyncCompletedRetention)))
+		deleted, err := deleteRows(ctx, db, "async_tasks", `status = 'completed' AND updated_at < ?`, schema.UTC(now.Add(-cfg.asyncCompletedRetention)))
 		if err != nil {
 			return result, fmt.Errorf("cleanup completed async_tasks: %w", err)
 		}
 		result.AsyncCompletedDeleted = deleted
 
-		deleted, err = deleteRows(ctx, db, `
-			DELETE FROM async_tasks
-			WHERE status = 'failed_permanent' AND updated_at < ?
-		`, schema.UTC(now.Add(-cfg.failedRetention)))
+		deleted, err = deleteRows(ctx, db, "async_tasks", `status = 'failed_permanent' AND updated_at < ?`, schema.UTC(now.Add(-cfg.failedRetention)))
 		if err != nil {
 			return result, fmt.Errorf("cleanup failed async_tasks: %w", err)
 		}
@@ -141,10 +135,7 @@ func Cleanup(ctx context.Context, db *sql.DB, opts ...Option) (Result, error) {
 	if err := deadletter.EnsureSchema(db, "dead_letters"); err != nil {
 		return result, err
 	}
-	deleted, err := deleteRows(ctx, db, `
-		DELETE FROM dead_letters
-		WHERE exported_at IS NOT NULL AND exported_at < ?
-	`, schema.UTC(now.Add(-cfg.deadLetterRetention)))
+	deleted, err := deleteRows(ctx, db, "dead_letters", `exported_at IS NOT NULL AND exported_at < ?`, schema.UTC(now.Add(-cfg.deadLetterRetention)))
 	if err != nil {
 		return result, fmt.Errorf("cleanup dead_letters: %w", err)
 	}
@@ -162,13 +153,10 @@ func Cleanup(ctx context.Context, db *sql.DB, opts ...Option) (Result, error) {
 		return result, fmt.Errorf("cleanup outbox v2: publications and deliveries tables must both exist")
 	}
 	if publicationsExist {
-		deleted, err = deleteRows(ctx, db, `
-			DELETE FROM outbox_publications
-			WHERE NOT EXISTS (
-				SELECT 1 FROM outbox_deliveries
-				WHERE outbox_deliveries.publication_id = outbox_publications.publication_id
-			)
-		`)
+		deleted, err = deleteRows(ctx, db, "outbox_publications", `NOT EXISTS (
+			SELECT 1 FROM outbox_deliveries
+			WHERE outbox_deliveries.publication_id = outbox_publications.publication_id
+		)`)
 		if err != nil {
 			return result, fmt.Errorf("cleanup orphan outbox publications: %w", err)
 		}
@@ -456,12 +444,28 @@ func tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
 	return true, nil
 }
 
-func deleteRows(ctx context.Context, db *sql.DB, query string, args ...any) (int64, error) {
-	res, err := db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return 0, err
+// cleanupBatch bounds how many rows one DELETE removes, so a large backlog
+// is cleared in short write transactions instead of holding the write lock
+// for the whole cleanup.
+const cleanupBatch = 1000
+
+func deleteRows(ctx context.Context, db *sql.DB, table, where string, args ...any) (int64, error) {
+	query := fmt.Sprintf(`DELETE FROM %[1]s WHERE rowid IN (SELECT rowid FROM %[1]s WHERE %[2]s LIMIT %[3]d)`, table, where, cleanupBatch)
+	var total int64
+	for {
+		res, err := db.ExecContext(ctx, query, args...)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n < cleanupBatch {
+			return total, nil
+		}
 	}
-	return res.RowsAffected()
 }
 
 func outboxStats(ctx context.Context, db *sql.DB, now time.Time) (OutboxSnapshot, error) {
