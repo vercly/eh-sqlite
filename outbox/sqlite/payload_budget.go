@@ -146,7 +146,7 @@ func (o *Outbox) prepareCandidate(ctx context.Context, doc *deliveryDoc, handler
 		o.observeSkip(SkipQueueFull, 1)
 		return nil, true, nil
 	}
-	if !o.admission.tryAdmitKey(doc.ID, key) {
+	if !o.admission.tryAdmitDelivery(doc.ID, key, handlerLabel) {
 		o.dispatch.releaseReserve(key)
 		o.observeSkip(SkipAdmissionFull, 1)
 		return nil, true, nil

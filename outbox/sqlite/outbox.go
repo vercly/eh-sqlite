@@ -162,6 +162,9 @@ type Outbox struct {
 	// claim pass probes each key with one indexed SELECT instead of scanning
 	// the whole due set.
 	claimKeys []string
+	// claimKeyHandlers maps each claim key to its handler type (admission
+	// minimum guarantee is per handler, not per partition shard).
+	claimKeyHandlers map[string]string
 
 	// beforeFinalizeCommit is a test hook invoked before each finalize commit
 	// attempt (attempt is 1-based); a non-nil error aborts that attempt.
@@ -387,6 +390,10 @@ func WithDispatchStats(collector DispatchStats) Option {
 // in-flight: queued or executing, not yet finalized) at once in this process.
 // Admission is process-local and is not a multi-process lock. Values below 1
 // are treated as 1. Default is 50.
+//
+// The limit is shared, with a minimum guarantee per handler type: each claim
+// pass first offers one slot to every handler with nothing admitted, so a slow
+// handler that fills admission cannot keep the freed slots from the others.
 func WithAdmissionLimit(limit int) Option {
 	return func(o *Outbox) error {
 		if o.admission != nil {
@@ -862,6 +869,35 @@ func (o *Outbox) registeredDispatchKeys() []string {
 	return keys
 }
 
+// dispatchKeyHandlers maps every key of registeredDispatchKeys to its handler
+// type. Caller holds handlersMu.
+func (o *Outbox) dispatchKeyHandlers() map[string]string {
+	handlers := make(map[string]string)
+	for _, mh := range o.handlers {
+		handler := mh.HandlerType().String()
+		handlers[handler] = handler
+		if mh.dispatchMode == PartitionByAggregate {
+			shards := mh.partitionShards
+			if shards < 1 {
+				shards = defaultPartitionShards
+			}
+			for i := range shards {
+				handlers[fmt.Sprintf("%s:%d", handler, i)] = handler
+			}
+		}
+	}
+	return handlers
+}
+
+// keyHandler returns the handler type owning a claim key (the key itself
+// when unknown, which is exact for Serial handlers).
+func (o *Outbox) keyHandler(key string) string {
+	if handler, ok := o.claimKeyHandlers[key]; ok {
+		return handler
+	}
+	return key
+}
+
 // startupReconcile is the single fail-closed startup transaction:
 //  1. reset ALL taken_at (previous process claims are void);
 //  2. clear unresolved_at on rematch sentinels (new registration may match);
@@ -956,6 +992,7 @@ func (o *Outbox) startupReconcile(ctx context.Context) (map[string]int64, error)
 	// The dispatch-key ring follows the registration reconciled here.
 	o.handlersMu.Lock()
 	o.claimKeys = o.registeredDispatchKeys()
+	o.claimKeyHandlers = o.dispatchKeyHandlers()
 	o.handlersMu.Unlock()
 	return unresolvedCounts, nil
 }
@@ -1519,6 +1556,73 @@ func (o *Outbox) claimPass(ctx context.Context) (planned []*delivery, expanded i
 	unresolvedStmt := tx.StmtContext(ctx, o.markUnresolvedStmt)
 	defer closeStmt(unresolvedStmt, "mark unresolved")
 
+	// claimKey claims up to quantum due deliveries of key in FIFO order. A
+	// key that returns fewer rows than asked has no more due rows for the rest
+	// of the pass (the write lock keeps new rows out) and is not probed again.
+	exhausted := make(map[string]bool)
+	claimKey := func(key string, quantum int) (int, error) {
+		if exhausted[key] {
+			return 0, nil
+		}
+		candidates, err := o.selectKeyCandidates(ctx, tx, key, now, quantum)
+		if err != nil {
+			return 0, err
+		}
+		if len(candidates) < quantum {
+			exhausted[key] = true
+		}
+		claimed := 0
+		for _, doc := range candidates {
+			if free <= 0 {
+				break
+			}
+			if o.admission.contains(doc.ID) {
+				continue
+			}
+			d, blocked, err := o.prepareCandidate(ctx, doc, handlers, now, unresolvedStmt)
+			if err != nil {
+				return claimed, err
+			}
+			if blocked {
+				break
+			} // Keep FIFO on this key; other keys may still fit.
+			if d == nil {
+				continue
+			}
+
+			reserved = append(reserved, d)
+			if _, err := takenStmt.ExecContext(ctx, now, doc.ID); err != nil {
+				return claimed, fmt.Errorf("could not claim delivery %s: %w", doc.ID, err)
+			}
+			doc.TakenAt = sql.NullTime{Time: now, Valid: true}
+			planned = append(planned, d)
+			free--
+			claimed++
+		}
+		return claimed, nil
+	}
+
+	// Minimum guarantee: a handler with nothing admitted gets its first slot
+	// before handlers that already hold slots take more. A slot freed by a
+	// slow handler that filled admission therefore goes to a starved handler
+	// on the next pass, within the global limit.
+	for _, key := range keys {
+		if free <= 0 {
+			break
+		}
+		if o.admission.handlerActive(o.keyHandler(key)) > 0 || o.dispatch.freeCapacity(key) <= 0 {
+			continue
+		}
+		n, err := claimKey(key, 1)
+		if err != nil {
+			return nil, 0, err
+		}
+		if n > 0 {
+			o.claimCursor = key
+		}
+	}
+	keys = rotateAfter(o.claimKeys, o.claimCursor)
+
 	// Rounds over the ring until admission is full or a full round claims
 	// nothing. Adaptive quantum per round: when free admission is smaller than
 	// the ring, every key gets at most one delivery per round so a lightly
@@ -1538,37 +1642,11 @@ func (o *Outbox) claimPass(ctx context.Context) (planned []*delivery, expanded i
 				o.observeSkip(SkipQueueFull, 1)
 				continue
 			}
-			candidates, err := o.selectKeyCandidates(ctx, tx, key, now, quantum)
+			n, err := claimKey(key, quantum)
 			if err != nil {
 				return nil, 0, err
 			}
-			for _, doc := range candidates {
-				if free <= 0 {
-					break
-				}
-				if o.admission.contains(doc.ID) {
-					continue
-				}
-				d, blocked, err := o.prepareCandidate(ctx, doc, handlers, now, unresolvedStmt)
-				if err != nil {
-					return nil, 0, err
-				}
-				if blocked {
-					break
-				} // Keep FIFO on this key; other keys may still fit.
-				if d == nil {
-					continue
-				}
-
-				reserved = append(reserved, d)
-				if _, err := takenStmt.ExecContext(ctx, now, doc.ID); err != nil {
-					return nil, 0, fmt.Errorf("could not claim delivery %s: %w", doc.ID, err)
-				}
-				doc.TakenAt = sql.NullTime{Time: now, Valid: true}
-				planned = append(planned, d)
-				free--
-				claimedThisRound++
-			}
+			claimedThisRound += n
 			o.claimCursor = key
 		}
 		if claimedThisRound == 0 {
