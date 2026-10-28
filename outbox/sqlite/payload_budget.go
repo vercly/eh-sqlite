@@ -194,6 +194,9 @@ func (o *Outbox) loadClaimed(ctx context.Context, planned []*delivery) []*delive
 				err: fmt.Errorf("%w: delivery %s handler %q", ErrUnresolvedHandler, doc.ID, doc.HandlerType)})
 			continue
 		}
+		// The decoded event does not share the blob's memory; drop the raw
+		// copy while queued and executing. A dead letter reloads it.
+		doc.EventBlob = ""
 		kept = append(kept, d)
 	}
 	if len(drops) == 0 {

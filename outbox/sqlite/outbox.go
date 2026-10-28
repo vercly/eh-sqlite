@@ -2160,6 +2160,12 @@ func (o *Outbox) insertOutboxDeadLetterTx(ctx context.Context, tx *sql.Tx, doc *
 	if reason == "" {
 		reason = "max retries reached or fatal handler error"
 	}
+	if doc.EventBlob == "" {
+		// Released after decode (loadClaimed); the publication still holds it.
+		if err := o.loadPayload(ctx, tx, doc); err != nil {
+			return dl.Record{}, fmt.Errorf("could not reload payload for dead letter: %w", err)
+		}
+	}
 	now := schema.UTC(time.Now())
 	record := dl.Record{
 		ID:                uuid.New().String(),

@@ -63,9 +63,11 @@ outside the serialized admission accounting); this does not grow per recipient.
 Scheduling keeps FIFO per dispatch key. The first byte-blocked head reserves
 future capacity: smaller deliveries may use the remaining spare capacity, but
 cannot repeatedly fill the space it needs. Existing workers drain naturally;
-the protected head fits on the next eligible pass once enough bytes are freed. For legacy base64
-envelopes, the raw JSON string and decoded metadata can retain about twice the
-charged byte count, plus temporary decoder buffers and handler allocations.
+the protected head fits on the next eligible pass once enough bytes are freed.
+The raw JSON string is dropped once the claimed delivery is decoded (a dead
+letter reloads it from the publication), so a queued or executing delivery
+retains roughly its decoded event, plus temporary decoder buffers and handler
+allocations; during decoding both copies briefly coexist.
 Large diagnostics retain at most 16 short string metadata values (including
 normal correlation/routing fields), never nested payloads or large strings.
 

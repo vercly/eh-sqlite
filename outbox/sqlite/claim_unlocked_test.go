@@ -142,3 +142,33 @@ func TestClaimDecodeFailureFlagsUnresolvedAndReleases(t *testing.T) {
 		t.Fatalf("errors = %v, want one ErrUnresolvedHandler", errs)
 	}
 }
+
+func TestClaimReleasesRawBlobAndDeadLetterReloadsIt(t *testing.T) {
+	db := newTestDB(t)
+	o := v2NewOutbox(t, db)
+	h := &v2CountingHandler{typ: "h", err: v2FatalError{errors.New("fatal")}}
+	if err := o.AddHandler(context.Background(), eh.MatchEvents{mocks.EventType}, h); err != nil {
+		t.Fatal(err)
+	}
+	prepareWithoutFetcher(t, o)
+	v2Publish(t, o, "e")
+	want := storedText(t, db, fmt.Sprintf(`SELECT event_blob FROM %s`, o.publicationsTable))
+
+	planned, _, err := o.claimPass(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planned) != 1 {
+		t.Fatalf("planned %d deliveries, want 1", len(planned))
+	}
+	if planned[0].doc.Event == nil || planned[0].doc.EventBlob != "" {
+		t.Fatalf("claimed delivery: event=%v raw blob bytes=%d, want decoded event and no raw blob",
+			planned[0].doc.Event, len(planned[0].doc.EventBlob))
+	}
+	o.dispatch.enqueue(planned[0])
+	planned[0].wait()
+
+	if got := storedText(t, db, fmt.Sprintf(`SELECT blob FROM %s`, o.deadLetterTable)); got != want {
+		t.Fatalf("dead letter blob = %q, want publication blob %q", got, want)
+	}
+}
