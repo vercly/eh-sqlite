@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -153,8 +154,8 @@ func NewMiddleware(db *sql.DB, options ...Option) (eh.CommandHandlerMiddleware, 
 	}
 
 	insertStmt, err := db.Prepare(`
-		INSERT INTO async_tasks (task_uuid, command_type, command_blob, status, retry_count, max_retries, created_at, updated_at)
-		VALUES (?, ?, ?, 'new', 0, ?, ?, ?)
+		INSERT INTO async_tasks (task_uuid, command_type, command_blob, status, retry_count, max_retries, created_at, updated_at, locked_by, locked_at)
+		VALUES (?, ?, ?, 'processing', 0, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("durable: could not prepare insert statement: %w", err)
@@ -205,8 +206,10 @@ func ensureSchema(db *sql.DB) error {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_async_tasks_lookup ON async_tasks (status, next_retry_at);`); err != nil {
 		return fmt.Errorf("durable: could not create async_tasks_lookup index: %w", err)
 	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_async_tasks_uuid ON async_tasks (task_uuid);`); err != nil {
-		return fmt.Errorf("durable: could not create async_tasks_uuid index: %w", err)
+	// task_uuid is UNIQUE, so SQLite already indexes it; this older duplicate
+	// index only added a second write per insert.
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_async_tasks_uuid;`); err != nil {
+		return fmt.Errorf("durable: could not drop redundant async_tasks_uuid index: %w", err)
 	}
 	if err := deadletter.EnsureSchema(db, "dead_letters"); err != nil {
 		return fmt.Errorf("durable: %w", err)
@@ -239,7 +242,9 @@ func (m *Middleware) handler(ctx context.Context, cmd eh.Command, h eh.CommandHa
 	if err != nil {
 		return fmt.Errorf("durable: could not marshal command: %w", err)
 	}
-	res, err := m.insertStmt.ExecContext(ctx, taskUUID.String(), cmd.CommandType().String(), cmdBlob, m.cfg.maxRetries, now, now)
+	// The row is inserted already locked as processing: there is no window in
+	// which it is "new" but owned by this call. Resume picks up both states.
+	res, err := m.insertStmt.ExecContext(ctx, taskUUID.String(), cmd.CommandType().String(), cmdBlob, m.cfg.maxRetries, now, now, lockOwner(), now)
 	if err != nil {
 		return fmt.Errorf("durable: could not save command to queue: %w", err)
 	}
@@ -248,13 +253,17 @@ func (m *Middleware) handler(ctx context.Context, cmd eh.Command, h eh.CommandHa
 		return fmt.Errorf("durable: could not get last insert ID: %w", err)
 	}
 
-	return m.handleTask(ctx, taskID, cmd, h)
+	return m.runTask(ctx, taskID, cmd, h)
 }
 
-func (m *Middleware) handleTask(ctx context.Context, taskID int64, cmd eh.Command, h eh.CommandHandler) (err error) {
+func (m *Middleware) handleTask(ctx context.Context, taskID int64, cmd eh.Command, h eh.CommandHandler) error {
 	if err := m.markProcessing(ctx, taskID); err != nil {
 		return err
 	}
+	return m.runTask(ctx, taskID, cmd, h)
+}
+
+func (m *Middleware) runTask(ctx context.Context, taskID int64, cmd eh.Command, h eh.CommandHandler) (err error) {
 
 	var completed atomic.Bool
 	completionFunc := func(status string, execErr error) {
@@ -348,15 +357,37 @@ func (m *Middleware) scheduleRetry(ctx context.Context, taskID int64, cmd eh.Com
 	return nil
 }
 
+// markPermanent sets failed_permanent and inserts the dead letter in one
+// transaction, so a crash cannot leave a permanent failure without its dead
+// letter. The best-effort export runs after commit.
 func (m *Middleware) markPermanent(ctx context.Context, taskID int64, cmd eh.Command, execErr error) error {
-	if err := m.updateFinalStatus(ctx, taskID, statusFailedPermanent, execErr); err != nil {
-		return err
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("durable: could not begin dead-letter transaction for task %d: %w", taskID, err)
 	}
-	task, err := loadTask(ctx, m.db, taskID)
+	defer tx.Rollback()
+	// The status update comes first so the transaction holds the write lock
+	// before it reads the task.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE async_tasks
+		SET status = ?, last_error = ?, updated_at = ?, locked_by = NULL, locked_at = NULL, next_retry_at = NULL
+		WHERE id = ?
+	`, statusFailedPermanent, errorString(execErr), schema.UTC(time.Now()), taskID); err != nil {
+		return fmt.Errorf("durable: could not update task %d status: %w", taskID, err)
+	}
+	task, err := loadTask(ctx, tx, taskID)
 	if err != nil {
 		return err
 	}
-	return insertCommandDeadLetter(ctx, m.db, task, cmd, execErr, m.cfg.exporter)
+	record, err := insertCommandDeadLetter(ctx, tx, task, cmd, execErr)
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("durable: could not commit dead letter for task %d: %w", taskID, err)
+	}
+	exportCommandDeadLetter(ctx, m.db, record, m.cfg.exporter)
+	return nil
 }
 
 // Resume dispatches unfinished commands from the database to the command bus.
@@ -388,7 +419,7 @@ func StartSweeper(ctx context.Context, db *sql.DB, bus eh.CommandHandler, option
 		for {
 			select {
 			case <-ticker.C:
-				if _, err := Sweep(ctx, db, bus, options...); err != nil {
+				if _, err := sweep(ctx, db, bus, cfg); err != nil {
 					log.Printf("durable: sweeper failed: %v", err)
 				}
 			case <-ctx.Done():
@@ -404,7 +435,12 @@ func Sweep(ctx context.Context, db *sql.DB, bus eh.CommandHandler, options ...Op
 	if err := ensureSchema(db); err != nil {
 		return 0, err
 	}
-	cfg := applyOptions(options...)
+	return sweep(ctx, db, bus, applyOptions(options...))
+}
+
+// sweep is Sweep without the schema check; StartSweeper ensures the schema
+// once instead of taking a write lock for it on every tick.
+func sweep(ctx context.Context, db *sql.DB, bus eh.CommandHandler, cfg config) (int, error) {
 	now := schema.UTC(time.Now())
 	stuckBefore := schema.UTC(now.Add(-cfg.stuckTimeout))
 	const due = `(status = 'failed_retriable' AND next_retry_at <= ?)
@@ -483,7 +519,15 @@ type taskRecord struct {
 	createdAt   time.Time
 }
 
-func loadTask(ctx context.Context, db *sql.DB, taskID int64) (taskRecord, error) {
+type queryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func loadTask(ctx context.Context, db queryer, taskID int64) (taskRecord, error) {
 	var task taskRecord
 	if err := db.QueryRowContext(ctx, `
 		SELECT id, task_uuid, command_type, command_blob, retry_count, max_retries, created_at
@@ -495,7 +539,7 @@ func loadTask(ctx context.Context, db *sql.DB, taskID int64) (taskRecord, error)
 	return task, nil
 }
 
-func insertCommandDeadLetter(ctx context.Context, db *sql.DB, task taskRecord, cmd eh.Command, execErr error, exporter dl.Exporter) error {
+func insertCommandDeadLetter(ctx context.Context, db execer, task taskRecord, cmd eh.Command, execErr error) (dl.Record, error) {
 	reason := "command failed permanently"
 	if execErr != nil {
 		reason = execErr.Error()
@@ -517,16 +561,20 @@ func insertCommandDeadLetter(ctx context.Context, db *sql.DB, task taskRecord, c
 		INSERT INTO dead_letters (id, source, event_type, aggregate_id, handler_type, outbox_id, remaining_handlers, blob, error, retry_count, created_at, dead_at)
 		VALUES (?, 'command', ?, ?, 'command_handler', NULL, '[]', ?, ?, ?, ?, ?)
 	`, record.ID, record.EventType, record.AggregateID, record.Blob, record.Error, record.RetryCount, record.CreatedAt, record.DeadAt); err != nil {
-		return fmt.Errorf("durable: could not insert command dead letter: %w", err)
+		return dl.Record{}, fmt.Errorf("durable: could not insert command dead letter: %w", err)
 	}
-	if exporter != nil {
-		if err := exporter.ExportDeadLetter(ctx, record); err != nil {
-			log.Printf("durable: could not export command dead letter: %v", err)
-		} else if err := markCommandDeadLetterExported(ctx, db, record.ID, schema.UTC(time.Now())); err != nil {
-			log.Printf("durable: could not mark command dead letter exported: %v", err)
-		}
+	return record, nil
+}
+
+func exportCommandDeadLetter(ctx context.Context, db *sql.DB, record dl.Record, exporter dl.Exporter) {
+	if exporter == nil {
+		return
 	}
-	return nil
+	if err := exporter.ExportDeadLetter(ctx, record); err != nil {
+		log.Printf("durable: could not export command dead letter: %v", err)
+	} else if err := markCommandDeadLetterExported(ctx, db, record.ID, schema.UTC(time.Now())); err != nil {
+		log.Printf("durable: could not mark command dead letter exported: %v", err)
+	}
 }
 
 func markCommandDeadLetterExported(ctx context.Context, db *sql.DB, id string, exportedAt time.Time) error {
@@ -551,10 +599,10 @@ func getSeverity(err error) ErrorSeverity {
 	return SeverityRetryable
 }
 
-func lockOwner() string {
+var lockOwner = sync.OnceValue(func() string {
 	hostname, err := os.Hostname()
 	if err != nil || hostname == "" {
 		return "unknown"
 	}
 	return hostname
-}
+})

@@ -538,3 +538,42 @@ func (h *completingCommandHandler) HandleCommand(context.Context, eh.Command) er
 	_, err := h.db.Exec(`UPDATE async_tasks SET status = 'completed' WHERE id = ?`, h.complete)
 	return err
 }
+
+// A dead-letter insert that fails rolls back the failed_permanent status too:
+// the task never ends up permanent without its dead letter.
+func TestDurablePermanentFailureIsAtomicWithDeadLetter(t *testing.T) {
+	db := newDurableTestDB(t)
+	handler := &recordingCommandHandler{err: fatalTestError{}}
+	wrapped := newWrappedHandler(t, db, handler)
+	if _, err := db.Exec(`CREATE TRIGGER reject_dead_letter BEFORE INSERT ON dead_letters BEGIN SELECT RAISE(ABORT, 'rejected'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = wrapped.HandleCommand(context.Background(), testCommand{ID: uuid.New()})
+
+	var status string
+	if err := db.QueryRow(`SELECT status FROM async_tasks`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status == "failed_permanent" {
+		t.Fatal("task is failed_permanent although its dead letter was not written")
+	}
+	assertDeadLetters(t, db, 0)
+}
+
+func TestDurableDropsRedundantTaskUUIDIndex(t *testing.T) {
+	db := newDurableTestDB(t)
+	newWrappedHandler(t, db, &recordingCommandHandler{})
+	if _, err := db.Exec(`CREATE INDEX idx_async_tasks_uuid ON async_tasks (task_uuid)`); err != nil {
+		t.Fatal(err)
+	}
+	newWrappedHandler(t, db, &recordingCommandHandler{})
+
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_async_tasks_uuid'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("redundant idx_async_tasks_uuid index still exists")
+	}
+}
