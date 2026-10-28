@@ -19,7 +19,6 @@ import (
 	"github.com/vercly/eh-sqlite/internal/deadletter"
 	"github.com/vercly/eh-sqlite/schema"
 
-	jsoniter "github.com/json-iterator/go"
 	// Register the sqlite3 database/sql driver used by this package.
 	_ "github.com/mattn/go-sqlite3"
 	eh "github.com/vercly/eventhorizon"
@@ -582,7 +581,7 @@ type deliveryDoc struct {
 	EventBlob      string
 	PayloadBytes   int64
 	Event          eh.Event
-	EventCtx       map[string]any
+	EventCtx       context.Context
 }
 
 // HandleEvent implements the HandleEvent method of the eventhorizon.EventHandler interface.
@@ -1260,30 +1259,17 @@ func (o *Outbox) scanDeliveryRow(rows *sql.Rows) (*deliveryDoc, error) {
 	return &d, nil
 }
 
-// decodeDelivery unmarshals the payload into d.Event / d.EventCtx.
+// decodeDelivery unmarshals the payload into d.Event / d.EventCtx in one
+// parse. The context is rooted at Background so a handler's context never
+// inherits the processor's shutdown signal.
 func (o *Outbox) decodeDelivery(d *deliveryDoc) error {
-	blob := []byte(d.EventBlob)
-	event, _, err := o.codec.UnmarshalEvent(o.runContext(), blob)
+	event, eventCtx, err := o.codec.UnmarshalEvent(context.Background(), []byte(d.EventBlob))
 	if err != nil {
 		return fmt.Errorf("could not unmarshal event blob: %w", err)
-	}
-	eventCtx, err := eventContextValues(blob)
-	if err != nil {
-		return err
 	}
 	d.Event = event
 	d.EventCtx = eventCtx
 	return nil
-}
-
-func eventContextValues(eventBlob []byte) (map[string]any, error) {
-	var raw struct {
-		Context map[string]any `json:"context"`
-	}
-	if err := jsoniter.Unmarshal(eventBlob, &raw); err != nil {
-		return nil, fmt.Errorf("could not unmarshal event context: %w", err)
-	}
-	return raw.Context, nil
 }
 
 type handlerDispatchResult struct {
@@ -1563,7 +1549,7 @@ func (o *Outbox) claimPass(ctx context.Context) (planned []*delivery, expanded i
 				if o.admission.contains(doc.ID) {
 					continue
 				}
-				d, blocked, err := o.prepareCandidate(ctx, tx, doc, handlers, now, unresolvedStmt)
+				d, blocked, err := o.prepareCandidate(ctx, doc, handlers, now, unresolvedStmt)
 				if err != nil {
 					return nil, 0, err
 				}
@@ -1605,6 +1591,7 @@ func (o *Outbox) claimPass(ctx context.Context) (planned []*delivery, expanded i
 	if err := tx.Commit(); err != nil {
 		return nil, 0, fmt.Errorf("could not commit claim transaction: %w", err)
 	}
+	planned = o.loadClaimed(ctx, planned)
 	o.observeAdmission()
 	return planned, expanded, nil
 }
@@ -1861,8 +1848,7 @@ func (o *Outbox) executeDelivery(d *delivery) {
 	if o.dispatch != nil {
 		o.dispatch.addInFlight(handlerLabel, shardLabel, 1)
 	}
-	eventCtx := eh.UnmarshalContext(context.Background(), d.doc.EventCtx)
-	res := o.dispatchHandler(eventCtx, d)
+	res := o.dispatchHandler(d.doc.EventCtx, d)
 	if o.dispatch != nil {
 		o.dispatch.addInFlight(handlerLabel, shardLabel, -1)
 	}

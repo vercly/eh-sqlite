@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/vercly/eh-sqlite/schema"
 	eh "github.com/vercly/eventhorizon"
 	"strings"
 	"sync"
@@ -97,8 +98,14 @@ func (o *Outbox) releasePayload(doc *deliveryDoc) {
 	doc.EventCtx = nil
 	o.payloads.release(doc.ID)
 }
-func (o *Outbox) loadPayload(ctx context.Context, tx *sql.Tx, doc *deliveryDoc) error {
-	return tx.QueryRowContext(ctx, fmt.Sprintf("SELECT event_blob FROM %s WHERE publication_id = ?", o.publicationsTable), doc.PublicationID).Scan(&doc.EventBlob)
+
+// rowQuerier is satisfied by *sql.DB and *sql.Tx.
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func (o *Outbox) loadPayload(ctx context.Context, q rowQuerier, doc *deliveryDoc) error {
+	return q.QueryRowContext(ctx, fmt.Sprintf("SELECT event_blob FROM %s WHERE publication_id = ?", o.publicationsTable), doc.PublicationID).Scan(&doc.EventBlob)
 }
 func (o *Outbox) quarantinePayload(ctx context.Context, doc *deliveryDoc, now time.Time, stmt *sql.Stmt) error {
 	if _, err := stmt.ExecContext(ctx, now, doc.ID); err != nil {
@@ -108,7 +115,7 @@ func (o *Outbox) quarantinePayload(ctx context.Context, doc *deliveryDoc, now ti
 	o.sendError(ctx, fmt.Errorf("%w: delivery %s publication %s bytes=%d budget=%d (retained unresolved)", ErrPayloadTooLarge, doc.ID, doc.PublicationID, doc.PayloadBytes, o.payloads.limit), nil)
 	return nil
 }
-func (o *Outbox) prepareCandidate(ctx context.Context, tx *sql.Tx, doc *deliveryDoc, handlers map[string]*matcherHandler, now time.Time, unresolved *sql.Stmt) (_ *delivery, blocked bool, err error) {
+func (o *Outbox) prepareCandidate(ctx context.Context, doc *deliveryDoc, handlers map[string]*matcherHandler, now time.Time, unresolved *sql.Stmt) (_ *delivery, blocked bool, err error) {
 	if doc.PayloadBytes > o.payloads.limit {
 		return nil, false, o.quarantinePayload(ctx, doc, now, unresolved)
 	}
@@ -122,24 +129,15 @@ func (o *Outbox) prepareCandidate(ctx context.Context, tx *sql.Tx, doc *delivery
 			o.releasePayload(doc)
 		}
 	}()
-	if err = o.loadPayload(ctx, tx, doc); err != nil {
-		return nil, false, err
-	}
-	if err = o.decodeDelivery(doc); err != nil {
-		if _, e := unresolved.ExecContext(ctx, now, doc.ID); e != nil {
-			return nil, false, e
-		}
-		o.observeSkip(SkipDecodeFailed, 1)
-		o.sendError(ctx, fmt.Errorf("%w: delivery %s: %v", ErrUnresolvedHandler, doc.ID, err), nil)
-		return nil, false, nil
-	}
+	// The payload is loaded, decoded and matched by loadClaimed after the
+	// claim commits; only checks that need no payload run under the lock.
 	mh := handlers[doc.HandlerType]
-	if mh == nil || !mh.Match(doc.Event) {
+	if mh == nil {
 		if _, e := unresolved.ExecContext(ctx, now, doc.ID); e != nil {
 			return nil, false, e
 		}
 		o.observeSkip(SkipUnresolved, 1)
-		o.sendError(ctx, fmt.Errorf("%w: delivery %s handler %q", ErrUnresolvedHandler, doc.ID, doc.HandlerType), payloadDiagnostic(doc))
+		o.sendError(ctx, fmt.Errorf("%w: delivery %s handler %q", ErrUnresolvedHandler, doc.ID, doc.HandlerType), nil)
 		return nil, false, nil
 	}
 	key, handlerLabel, shardLabel := dispatchKeyFor(mh, doc.PartitionKey)
@@ -155,6 +153,87 @@ func (o *Outbox) prepareCandidate(ctx context.Context, tx *sql.Tx, doc *delivery
 	}
 	keep = true
 	return d, false, nil
+}
+
+// loadClaimed reads, decodes and matches the payloads of a committed claim
+// pass outside the write transaction, so blob reads, JSON decoding and
+// application matchers never extend the SQLite write lock. Deliveries that
+// cannot be decoded or no longer match are flagged unresolved as before; a
+// failed read releases the claim for the next pass. Dropped deliveries give
+// back their reservations; the rest keep claim order.
+func (o *Outbox) loadClaimed(ctx context.Context, planned []*delivery) []*delivery {
+	type dropped struct {
+		d          *delivery
+		unresolved bool
+		err        error
+		event      eh.Event
+	}
+	var drops []dropped
+	// Recipients of one publication claimed in this pass share one read; each
+	// is still charged its own budget and decodes its own event.
+	blobs := make(map[string]string)
+	kept := planned[:0]
+	for _, d := range planned {
+		doc := d.doc
+		if blob, ok := blobs[doc.PublicationID]; ok {
+			doc.EventBlob = blob
+		} else if err := o.loadPayload(ctx, o.db, doc); err != nil {
+			drops = append(drops, dropped{d: d, err: fmt.Errorf("could not load payload for delivery %s: %w", doc.ID, err)})
+			continue
+		} else {
+			blobs[doc.PublicationID] = doc.EventBlob
+		}
+		if err := o.decodeDelivery(doc); err != nil {
+			o.observeSkip(SkipDecodeFailed, 1)
+			drops = append(drops, dropped{d: d, unresolved: true, err: fmt.Errorf("%w: delivery %s: %v", ErrUnresolvedHandler, doc.ID, err)})
+			continue
+		}
+		if !d.handler.Match(doc.Event) {
+			o.observeSkip(SkipUnresolved, 1)
+			drops = append(drops, dropped{d: d, unresolved: true, event: payloadDiagnostic(doc),
+				err: fmt.Errorf("%w: delivery %s handler %q", ErrUnresolvedHandler, doc.ID, doc.HandlerType)})
+			continue
+		}
+		kept = append(kept, d)
+	}
+	if len(drops) == 0 {
+		return kept
+	}
+
+	// Flag before reporting, so an observer of the error sees the row state.
+	// If this write fails the rows keep taken_at and reclaimStale returns them
+	// after PeriodicSweepAge.
+	err := func() error {
+		tx, err := o.beginWriteTx(ctx)
+		if err != nil {
+			return err
+		}
+		defer rollbackTx(tx)
+		now := schema.UTC(time.Now())
+		unresolvedStmt := tx.StmtContext(ctx, o.markUnresolvedStmt)
+		defer closeStmt(unresolvedStmt, "mark unresolved")
+		for _, drop := range drops {
+			if drop.unresolved {
+				_, err = unresolvedStmt.ExecContext(ctx, now, drop.d.doc.ID)
+			} else {
+				_, err = tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET taken_at = NULL WHERE id = ?`, o.deliveriesTable), drop.d.doc.ID)
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	}()
+	if err != nil {
+		o.sendError(ctx, fmt.Errorf("could not release %d undeliverable claims: %w", len(drops), err), nil)
+	}
+	released := make([]*delivery, 0, len(drops))
+	for _, drop := range drops {
+		o.sendError(ctx, drop.err, drop.event)
+		released = append(released, drop.d)
+	}
+	o.rollbackPlanned(released)
+	return kept
 }
 
 // Buffered diagnostics must not retain another unbudgeted copy of a large
