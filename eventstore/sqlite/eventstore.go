@@ -189,6 +189,31 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 	id := events[0].AggregateID()
 	at := events[0].AggregateType()
 
+	// Validate and serialize every event before taking the write lock, so the
+	// JSON encoding does not run while other writers wait. Positions are
+	// assigned once the global position is read under the lock.
+	dbEvents := make([]*evt, len(events))
+	for i, event := range events {
+		if event.AggregateID() != id {
+			return &eh.EventStoreError{Err: eh.ErrMismatchedEventAggregateIDs}
+		}
+		if event.AggregateType() != at {
+			return &eh.EventStoreError{Err: eh.ErrMismatchedEventAggregateTypes}
+		}
+		if event.Version() != originalVersion+i+1 {
+			return &eh.EventStoreError{Err: eh.ErrIncorrectEventVersion}
+		}
+
+		e, err := newEvt(ctx, event)
+		if err != nil {
+			return &eh.EventStoreError{
+				Err: fmt.Errorf("could not create event record: %w", err),
+				Op:  eh.EventStoreOpSave,
+			}
+		}
+		dbEvents[i] = e
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return &eh.EventStoreError{
@@ -210,7 +235,7 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 	}
 
 	// Fetch and increment global version in the all-stream.
-	row := tx.Stmt(s.stmtSelectStream).QueryRow("$all")
+	row := tx.Stmt(s.stmtSelectStream).QueryRowContext(ctx, "$all")
 	var allStreamPosition int
 	if err := row.Scan(&allStreamPosition); err != nil {
 		return &eh.EventStoreError{
@@ -219,37 +244,13 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 		}
 	}
 
-	// Build all event records, with incrementing versions starting from the
-	// original aggregate version.
-	dbEvents := make([]*evt, len(events))
-	for i, event := range events {
-		if event.AggregateID() != id {
-			return &eh.EventStoreError{Err: eh.ErrMismatchedEventAggregateIDs}
-		}
-		if event.AggregateType() != at {
-			return &eh.EventStoreError{Err: eh.ErrMismatchedEventAggregateTypes}
-		}
-		if event.Version() != originalVersion+i+1 {
-			return &eh.EventStoreError{Err: eh.ErrIncorrectEventVersion}
-		}
-
-		e, err := newEvt(ctx, event)
-		if err != nil {
-			return &eh.EventStoreError{
-				Err: fmt.Errorf("could not create event record: %w", err),
-				Op:  eh.EventStoreOpSave,
-			}
-		}
-		e.Position = allStreamPosition + i + 1
-		dbEvents[i] = e
-	}
-
 	// Insert events.
 	stmt := tx.Stmt(s.stmtInsertEvent)
 	var lastPosition int
-	for _, e := range dbEvents {
+	for i, e := range dbEvents {
+		e.Position = allStreamPosition + i + 1
 		lastPosition = e.Position
-		_, err := stmt.Exec(e.Position, e.EventType, e.Timestamp, e.AggregateType, e.AggregateID, e.Version, e.RawData, e.Metadata)
+		_, err := stmt.ExecContext(ctx, e.Position, e.EventType, e.Timestamp, e.AggregateType, e.AggregateID, e.Version, e.RawData, e.Metadata)
 		if err != nil {
 			return &eh.EventStoreError{
 				Err: fmt.Errorf("could not insert event: %w", err),
@@ -259,7 +260,7 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 	}
 
 	// Update the $all stream.
-	if _, err := tx.Stmt(s.stmtUpdateAllStream).Exec(lastPosition, "$all"); err != nil {
+	if _, err := tx.Stmt(s.stmtUpdateAllStream).ExecContext(ctx, lastPosition, "$all"); err != nil {
 		return &eh.EventStoreError{
 			Err: fmt.Errorf("could not update global position: %w", err),
 			Op:  eh.EventStoreOpSave,
@@ -268,14 +269,14 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 
 	// Update the aggregate stream.
 	if originalVersion == 0 {
-		if _, err := tx.Stmt(s.stmtInsertStream).Exec(id, lastPosition, at, len(dbEvents), schema.UTC(time.Now())); err != nil {
+		if _, err := tx.Stmt(s.stmtInsertStream).ExecContext(ctx, id, lastPosition, at, len(dbEvents), schema.UTC(time.Now())); err != nil {
 			return &eh.EventStoreError{
 				Err: fmt.Errorf("could not insert stream: %w", err),
 				Op:  eh.EventStoreOpSave,
 			}
 		}
 	} else {
-		res, err := tx.Stmt(s.stmtUpdateStream).Exec(lastPosition, len(dbEvents), schema.UTC(time.Now()), id, originalVersion)
+		res, err := tx.Stmt(s.stmtUpdateStream).ExecContext(ctx, lastPosition, len(dbEvents), schema.UTC(time.Now()), id, originalVersion)
 		if err != nil {
 			return &eh.EventStoreError{
 				Err: fmt.Errorf("could not update stream: %w", err),
@@ -332,7 +333,7 @@ func (s *EventStore) Load(ctx context.Context, id uuid.UUID) ([]eh.Event, error)
 
 // LoadFrom loads all events from version for the aggregate id from the store.
 func (s *EventStore) LoadFrom(ctx context.Context, id uuid.UUID, version int) ([]eh.Event, error) {
-	rows, err := s.stmtSelectEvents.Query(id.String(), version)
+	rows, err := s.stmtSelectEvents.QueryContext(ctx, id.String(), version)
 	if err != nil {
 		return nil, &eh.EventStoreError{
 			Err:         fmt.Errorf("could not query events: %w", err),
@@ -375,7 +376,7 @@ func (s *EventStore) LoadFrom(ctx context.Context, id uuid.UUID, version int) ([
 }
 
 func (s *EventStore) LoadSnapshot(ctx context.Context, id uuid.UUID) (*eh.Snapshot, error) {
-	row := s.stmtSelectSnapshot.QueryRow(id.String())
+	row := s.stmtSelectSnapshot.QueryRowContext(ctx, id.String())
 
 	var data string
 	var version int
@@ -436,7 +437,7 @@ func (s *EventStore) SaveSnapshot(ctx context.Context, id uuid.UUID, snapshot eh
 		}
 	}
 
-	_, err = s.stmtInsertSnapshot.Exec(id.String(), snapshot.Version, string(marshaledData), schema.UTC(time.Now()), snapshot.AggregateType)
+	_, err = s.stmtInsertSnapshot.ExecContext(ctx, id.String(), snapshot.Version, string(marshaledData), schema.UTC(time.Now()), snapshot.AggregateType)
 	if err != nil {
 		return &eh.EventStoreError{
 			Err: fmt.Errorf("could not insert snapshot: %w", err),
