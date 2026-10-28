@@ -166,6 +166,9 @@ type Outbox struct {
 	// minimum guarantee is per handler, not per partition shard).
 	claimKeyHandlers map[string]string
 
+	// finalizer group-commits concurrent first finalize attempts.
+	finalizer finalizeGroup
+
 	// beforeFinalizeCommit is a test hook invoked before each finalize commit
 	// attempt (attempt is 1-based); a non-nil error aborts that attempt.
 	beforeFinalizeCommit func(deliveryID string, attempt int) error
@@ -1968,7 +1971,11 @@ func (o *Outbox) finalizeDelivery(ctx context.Context, d *delivery, res handlerD
 	)
 	attempts := 1 + len(finalizeRetryDelays)
 	for attempt := 1; attempt <= attempts; attempt++ {
-		pending, err = o.finalizeTx(ctx, d.doc, outcome, reason, attempt)
+		if attempt == 1 {
+			pending, err = o.finalizeGrouped(ctx, d.doc, outcome, reason)
+		} else {
+			pending, err = o.finalizeTx(ctx, d.doc, outcome, reason, attempt)
+		}
 		if err == nil {
 			break
 		}
@@ -2009,6 +2016,19 @@ func (o *Outbox) finalizeTx(ctx context.Context, doc *deliveryDoc, outcome Final
 	}
 	defer rollbackTx(tx)
 
+	pending, err := o.applyFinalizeTx(ctx, tx, doc, outcome, reason, attempt)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("could not commit finalize transaction: %w", err)
+	}
+	return pending, nil
+}
+
+// applyFinalizeTx writes one finalize outcome inside tx, including the
+// beforeFinalizeCommit test hook, without committing.
+func (o *Outbox) applyFinalizeTx(ctx context.Context, tx *sql.Tx, doc *deliveryDoc, outcome FinalizeOutcome, reason string, attempt int) ([]dl.Record, error) {
 	var pending []dl.Record
 	switch outcome {
 	case FinalizeCompleted:
@@ -2040,9 +2060,6 @@ func (o *Outbox) finalizeTx(ctx context.Context, doc *deliveryDoc, outcome Final
 		if err := o.beforeFinalizeCommit(doc.ID, attempt); err != nil {
 			return nil, err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("could not commit finalize transaction: %w", err)
 	}
 	return pending, nil
 }
