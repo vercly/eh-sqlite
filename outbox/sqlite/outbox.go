@@ -1533,19 +1533,13 @@ func (o *Outbox) claimPass(ctx context.Context) (planned []*delivery, expanded i
 	// transaction), so an older due sentinel can never be overtaken by a newer
 	// normal delivery on the same key. Expanded rows are claimed by the normal
 	// per-key selection below in the same pass (they are due).
-	expanded, err = o.expandSentinels(ctx, tx, now, handlers)
+	expanded, sentinelBlocked, err := o.expandSentinels(ctx, tx, now)
 	if err != nil {
 		return nil, 0, err
 	}
 	// A byte-blocked sentinel must be expanded before normal deliveries can
 	// overtake it. Existing workers will free capacity and wake the fetcher.
-	var pendingSentinel bool
-	if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT EXISTS (
-		SELECT 1 FROM %s WHERE handler_type IS NULL AND unresolved_at IS NULL
-		AND taken_at IS NULL AND available_at <= ?)`, o.deliveriesTable), now).Scan(&pendingSentinel); err != nil {
-		return nil, 0, err
-	}
-	if pendingSentinel {
+	if sentinelBlocked {
 		if err := tx.Commit(); err != nil {
 			return nil, 0, err
 		}
@@ -1780,9 +1774,9 @@ func (o *Outbox) selectKeyCandidates(ctx context.Context, tx *sql.Tx, key string
 
 // expandSentinels replaces due rematch sentinels (handler_type NULL) with one
 // delivery per currently matching handler. A sentinel that matches nothing is
-// flagged unresolved (cleared again at next start) and reported.
-func (o *Outbox) expandSentinels(ctx context.Context, tx *sql.Tx, now time.Time, handlers map[string]*matcherHandler) (int, error) {
-	_ = handlers
+// flagged unresolved (cleared again at next start) and reported. blocked
+// reports a due sentinel left waiting for payload budget.
+func (o *Outbox) expandSentinels(ctx context.Context, tx *sql.Tx, now time.Time) (expanded int, blocked bool, err error) {
 	stmt := tx.StmtContext(ctx, o.sentinelsStmt)
 	defer closeStmt(stmt, "rematch sentinels")
 	unresolvedStmt := tx.StmtContext(ctx, o.markUnresolvedStmt)
@@ -1796,24 +1790,20 @@ func (o *Outbox) expandSentinels(ctx context.Context, tx *sql.Tx, now time.Time,
 	ordered := append([]*matcherHandler(nil), o.handlers...)
 	o.handlersMu.RUnlock()
 
-	expanded := 0
 	for {
 		// Each batch removes or flags every sentinel it reads, so the loop
 		// terminates once no due, unflagged sentinel remains.
 		batch, err := o.selectSentinels(ctx, stmt, now)
 		if err != nil {
-			return expanded, err
+			return expanded, false, err
 		}
 		if len(batch) == 0 {
-			return expanded, nil
+			return expanded, false, nil
 		}
 		n, blocked, err := o.expandSentinelBatch(ctx, tx, batch, ordered, now, unresolvedStmt, deleteStmt, insertStmt)
 		expanded += n
-		if err != nil {
-			return expanded, err
-		}
-		if blocked {
-			return expanded, nil
+		if err != nil || blocked {
+			return expanded, blocked, err
 		}
 	}
 }
