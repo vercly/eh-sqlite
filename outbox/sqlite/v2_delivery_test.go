@@ -524,6 +524,109 @@ func TestV2SentinelIsExpandedBeforeNewerNormalDeliveryOnSameKey(t *testing.T) {
 	}
 }
 
+func TestV2SentinelKeepsFIFOPositionAtEqualAvailability(t *testing.T) {
+	db := newTestDB(t)
+	o := v2NewOutbox(t, db)
+	var order []string
+	var mu sync.Mutex
+	h := &v2OrderHandler{typ: "h", record: func(c string) { mu.Lock(); order = append(order, c); mu.Unlock() }}
+	if err := o.AddHandler(context.Background(), eh.MatchEvents{mocks.EventType}, h); err != nil {
+		t.Fatal(err)
+	}
+	due := time.Now().Add(-time.Minute)
+	insertDeliveryDirect(t, o, deliverySeed{Event: newTestEvent("sentinel"), AvailableAt: due, CreatedAt: due})
+	insertDeliveryDirect(t, o, deliverySeed{Event: newTestEvent("normal"), HandlerType: "h", AvailableAt: due, CreatedAt: due})
+	prepareWithoutFetcher(t, o)
+	v2Drain(t, o)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 2 || order[0] != "sentinel" || order[1] != "normal" {
+		t.Fatalf("equal-availability delivery order = %v", order)
+	}
+}
+
+func TestV2SentinelBatchesKeepBarrierAndOrder(t *testing.T) {
+	db := newTestDB(t)
+	o := v2NewOutbox(t, db)
+	var order []string
+	var mu sync.Mutex
+	h := &v2OrderHandler{typ: "h", record: func(c string) { mu.Lock(); order = append(order, c); mu.Unlock() }}
+	if err := o.AddHandler(context.Background(), eh.MatchEvents{mocks.EventType}, h); err != nil {
+		t.Fatal(err)
+	}
+	due := time.Now().Add(-time.Minute)
+	for i := range claimQuantum + 1 {
+		insertDeliveryDirect(t, o, deliverySeed{Event: newTestEvent(fmt.Sprintf("sentinel-%02d", i)), AvailableAt: due, CreatedAt: due})
+	}
+	insertDeliveryDirect(t, o, deliverySeed{Event: newTestEvent("normal"), HandlerType: "h", AvailableAt: due, CreatedAt: due})
+	prepareWithoutFetcher(t, o)
+	if n, err := o.processBatch(context.Background()); err != nil || n != claimQuantum {
+		t.Fatalf("first batch: %d %v", n, err)
+	}
+	if len(order) != 0 {
+		t.Fatalf("delivery crossed sentinel barrier: %v", order)
+	}
+	v2Drain(t, o)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != claimQuantum+2 {
+		t.Fatalf("delivery count: %v", order)
+	}
+	for i := range claimQuantum + 1 {
+		if order[i] != fmt.Sprintf("sentinel-%02d", i) {
+			t.Fatalf("delivery order: %v", order)
+		}
+	}
+	if order[len(order)-1] != "normal" {
+		t.Fatalf("delivery order: %v", order)
+	}
+}
+
+func TestV2ClaimOrderSchemaUpgrade(t *testing.T) {
+	db := newTestDB(t)
+	old, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`DROP INDEX idx_outbox_deliveries_claim`,
+		`ALTER TABLE outbox_deliveries DROP COLUMN order_seq`,
+		`CREATE INDEX idx_outbox_deliveries_claim ON outbox_deliveries(dispatch_key, taken_at, available_at, seq)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	o, err := NewOutbox(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = o.Close() })
+	rows, err := db.Query(`EXPLAIN QUERY PLAN `+o.claimKeyQuery(0), "h", time.Now(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan += detail + "\n"
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan, "idx_outbox_deliveries_claim") || strings.Contains(plan, "TEMP B-TREE") {
+		t.Fatalf("claim order not served by upgraded index: %s", plan)
+	}
+}
+
 type v2OrderHandler struct {
 	typ    eh.EventHandlerType
 	record func(content string)

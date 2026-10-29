@@ -515,7 +515,7 @@ func (o *Outbox) claimKeyQuery(n int) string {
 		FROM %s d JOIN %s p ON p.publication_id = d.publication_id
 		WHERE d.dispatch_key = ? AND d.taken_at IS NULL AND d.unresolved_at IS NULL
 		  AND d.available_at <= ?%s
-		ORDER BY d.available_at ASC, d.seq ASC LIMIT ?`, o.deliveriesTable, o.publicationsTable, exclude)
+		ORDER BY d.available_at ASC, COALESCE(d.order_seq, d.seq) ASC LIMIT ?`, o.deliveriesTable, o.publicationsTable, exclude)
 }
 
 // HandlerType implements the HandlerType method of the eventhorizon.EventHandler interface.
@@ -1007,34 +1007,75 @@ func (o *Outbox) startupReconcile(ctx context.Context) (map[string]int64, error)
 // existed) are re-sharded consistently before dispatch. Dispatch keys are
 // recomputed by the caller from the updated partition keys.
 func (o *Outbox) reconcilePartitionKeys(ctx context.Context, tx *sql.Tx) error {
+	const explicitKeyPath = `$.metadata."` + MetadataPartitionKey + `"`
+	// partitionKeyFor consults an explicit MetadataPartitionKey before the
+	// resolver, so a text or null explicit key decides the partition from that
+	// one value and the resolver is never called, as on the live path. SQLite
+	// returns it as a raw JSON token (->) that encoding/json decodes, so escapes
+	// and lone surrogates read exactly as when decoding the metadata object.
+	//
+	// The fast path must never decide where decoding the metadata object in Go
+	// would decide differently or fail, so it is taken only when the object
+	// holds the key once (SQLite resolves duplicate keys to the first
+	// occurrence, encoding/json to the last) and holds no number beyond 1e308
+	// in magnitude (SQLite accepts 1e999, encoding/json rejects the object and
+	// the stored key is kept). Both paths read the first metadata object of an
+	// envelope that repeats it. The nested CASEs fix the evaluation order:
+	// rows without the key pay one lookup, and json_tree reads only numeric
+	// values. Oversized or malformed envelopes keep their stored key; claim
+	// flags the delivery visibly when it cannot decode the event.
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
-		SELECT p.publication_id, p.partition_key, p.aggregate_id,
-		       CASE WHEN octet_length(p.event_blob) <= ? AND json_valid(p.event_blob) AND json_type(p.event_blob) = 'object'
-		            THEN COALESCE(json_extract(p.event_blob, '$.metadata'), 'null') ELSE '' END
-		FROM %s p
-		WHERE EXISTS (SELECT 1 FROM %s d WHERE d.publication_id = p.publication_id)`,
-		o.publicationsTable, o.deliveriesTable), o.payloads.limit)
+		SELECT publication_id, partition_key, aggregate_id,
+		       CASE WHEN fast THEN event_blob -> ?2 END,
+		       CASE WHEN NOT fast THEN COALESCE(json_extract(event_blob, '$.metadata'), 'null') END
+		FROM (
+			SELECT p.publication_id, p.partition_key, p.aggregate_id, p.event_blob,
+			       COALESCE(CASE WHEN json_type(p.event_blob, ?2) IN ('text', 'null') THEN
+			                CASE WHEN (SELECT count(*) FROM json_each(p.event_blob, '$.metadata') WHERE key = ?3) = 1 THEN
+			                     NOT EXISTS (SELECT 1 FROM json_tree(p.event_blob, '$.metadata')
+			                                 WHERE CASE WHEN type IN ('integer', 'real') THEN value > 1e308 OR value < -1e308 END)
+			                END END, 0) AS fast
+			FROM %s p
+			WHERE EXISTS (SELECT 1 FROM %s d WHERE d.publication_id = p.publication_id)
+			  AND CASE WHEN octet_length(p.event_blob) <= ?1 AND json_valid(p.event_blob)
+			           THEN json_type(p.event_blob) = 'object' ELSE 0 END
+		)`,
+		o.publicationsTable, o.deliveriesTable), o.payloads.limit, explicitKeyPath, MetadataPartitionKey)
 	if err != nil {
 		return fmt.Errorf("could not read publications for partition reconcile: %w", err)
 	}
 	type fix struct{ id, key string }
 	var fixes []fix
 	for rows.Next() {
-		// Only the metadata object leaves SQLite: the event data is never
-		// copied into Go or decoded here. '' marks an oversized or
-		// undecodable envelope.
-		var id, stored, aggregateID, rawMetadata string
-		if err := rows.Scan(&id, &stored, &aggregateID, &rawMetadata); err != nil {
+		// Exactly one of explicit and rawMetadata is set; the event data never
+		// leaves SQLite.
+		var (
+			id, stored, aggregateID string
+			explicit, rawMetadata   sql.NullString
+		)
+		if err := rows.Scan(&id, &stored, &aggregateID, &explicit, &rawMetadata); err != nil {
 			_ = rows.Close()
 			return fmt.Errorf("could not scan publication for partition reconcile: %w", err)
 		}
-		var metadata map[string]any
-		if err := json.Unmarshal([]byte(rawMetadata), &metadata); err != nil {
-			// Undecodable envelope: keep the stored key; claim flags the
-			// delivery visibly when it cannot decode the event.
-			continue
+		var want string
+		if explicit.Valid {
+			var value any
+			if err := json.Unmarshal([]byte(explicit.String), &value); err != nil {
+				continue
+			}
+			// A JSON null explicit key is a deliberate Serial fallback.
+			if value != nil {
+				want = metadataPartitionKey(value)
+			}
+		} else {
+			var metadata map[string]any
+			if err := json.Unmarshal([]byte(rawMetadata.String), &metadata); err != nil {
+				// Undecodable metadata: keep the stored key.
+				continue
+			}
+			want = o.partitionKeyFor(metadata, aggregateID)
 		}
-		if want := o.partitionKeyFor(metadata, aggregateID); want != stored {
+		if want != stored {
 			fixes = append(fixes, fix{id: id, key: want})
 		}
 	}
@@ -1533,17 +1574,13 @@ func (o *Outbox) claimPass(ctx context.Context) (planned []*delivery, expanded i
 		return nil, 0, err
 	}
 
-	// Rematch sentinels are expanded BEFORE any normal claim in this pass, and
-	// all due sentinels are expanded (in bounded batches inside this
-	// transaction), so an older due sentinel can never be overtaken by a newer
-	// normal delivery on the same key. Expanded rows are claimed by the normal
-	// per-key selection below in the same pass (they are due).
+	// Expand one bounded rematch batch per transaction. Normal claims wait until all
+	// due sentinels have been processed, including across transaction boundaries.
 	expanded, sentinelBlocked, err := o.expandSentinels(ctx, tx, now)
 	if err != nil {
 		return nil, 0, err
 	}
-	// A byte-blocked sentinel must be expanded before normal deliveries can
-	// overtake it. Existing workers will free capacity and wake the fetcher.
+	// A full batch or byte-blocked sentinel keeps the normal-claim barrier.
 	if sentinelBlocked {
 		if err := tx.Commit(); err != nil {
 			return nil, 0, err
@@ -1780,7 +1817,7 @@ func (o *Outbox) selectKeyCandidates(ctx context.Context, tx *sql.Tx, key string
 // expandSentinels replaces due rematch sentinels (handler_type NULL) with one
 // delivery per currently matching handler. A sentinel that matches nothing is
 // flagged unresolved (cleared again at next start) and reported. blocked
-// reports a due sentinel left waiting for payload budget.
+// preserves the claim barrier when a batch is full or lacks payload budget.
 func (o *Outbox) expandSentinels(ctx context.Context, tx *sql.Tx, now time.Time) (expanded int, blocked bool, err error) {
 	stmt := tx.StmtContext(ctx, o.sentinelsStmt)
 	defer closeStmt(stmt, "rematch sentinels")
@@ -1788,29 +1825,31 @@ func (o *Outbox) expandSentinels(ctx context.Context, tx *sql.Tx, now time.Time)
 	defer closeStmt(unresolvedStmt, "mark unresolved")
 	deleteStmt := tx.StmtContext(ctx, o.deleteDeliveryStmt)
 	defer closeStmt(deleteStmt, "delete delivery")
-	insertStmt := tx.StmtContext(ctx, o.insertDeliveryStmt)
+	batch, err := o.selectSentinels(ctx, stmt, now)
+	if err != nil || len(batch) == 0 {
+		return 0, false, err
+	}
+	insertStmt, err := tx.PrepareContext(ctx, fmt.Sprintf(`INSERT INTO %s
+		(id, publication_id, handler_type, dispatch_key, dispatch_config, event_type, aggregate_id,
+		 created_at, available_at, taken_at, retry_count, unresolved_at, legacy_outbox_id, order_seq)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)`, o.deliveriesTable))
+	if err != nil {
+		return 0, false, err
+	}
 	defer closeStmt(insertStmt, "insert delivery")
-
 	o.handlersMu.RLock()
 	ordered := append([]*matcherHandler(nil), o.handlers...)
 	o.handlersMu.RUnlock()
-
-	for {
-		// Each batch removes or flags every sentinel it reads, so the loop
-		// terminates once no due, unflagged sentinel remains.
-		batch, err := o.selectSentinels(ctx, stmt, now)
-		if err != nil {
-			return expanded, false, err
-		}
-		if len(batch) == 0 {
-			return expanded, false, nil
-		}
-		n, blocked, err := o.expandSentinelBatch(ctx, tx, batch, ordered, now, unresolvedStmt, deleteStmt, insertStmt)
-		expanded += n
-		if err != nil || blocked {
-			return expanded, blocked, err
-		}
+	n, blocked, err := o.expandSentinelBatch(ctx, tx, batch, ordered, now, unresolvedStmt, deleteStmt, insertStmt)
+	if err != nil || blocked {
+		return n, blocked, err
 	}
+	if len(batch) == claimQuantum {
+		// Even a batch of only unresolved sentinels made progress. Trigger
+		// another pass so a full batch cannot strand later due work.
+		return max(n, 1), true, nil
+	}
+	return n, false, nil
 }
 
 func (o *Outbox) selectSentinels(ctx context.Context, stmt *sql.Stmt, now time.Time) ([]*deliveryDoc, error) {
@@ -1873,7 +1912,7 @@ func (o *Outbox) expandSentinelBatch(ctx context.Context, tx *sql.Tx, sentinels 
 				key, _, _ := dispatchKeyFor(mh, doc.PartitionKey)
 				if _, err := insertStmt.ExecContext(ctx,
 					uuid.New().String(), doc.PublicationID, mh.HandlerType().String(), key, dispatchConfigFor(mh),
-					doc.EventType, doc.AggregateID, schema.UTC(doc.CreatedAt), schema.UTC(doc.AvailableAt), 0, doc.LegacyOutboxID); err != nil {
+					doc.EventType, doc.AggregateID, schema.UTC(doc.CreatedAt), schema.UTC(doc.AvailableAt), 0, doc.LegacyOutboxID, doc.Seq); err != nil {
 					return false, fmt.Errorf("could not insert rematched delivery for %s: %w", doc.ID, err)
 				}
 			}

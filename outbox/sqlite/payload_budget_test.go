@@ -210,8 +210,11 @@ func TestQuarantinedSentinelBatchesDoNotDelayNormalClaims(t *testing.T) {
 	}
 	insertDeliveryDirect(t, o, deliverySeed{Event: newTestEvent("small"), HandlerType: "reader", CreatedAt: now})
 	reconcileForTest(t, o)
+	if n, err := o.processBatch(context.Background()); err != nil || n == 0 || h.calls.Load() != 0 {
+		t.Fatalf("first sentinel batch did not preserve barrier: %d %v", n, err)
+	}
 	if n, err := o.processBatch(context.Background()); err != nil || n != 1 {
-		t.Fatalf("normal claim delayed: %d %v", n, err)
+		t.Fatalf("normal claim after final batch: %d %v", n, err)
 	}
 	var unresolved int
 	if err := o.db.QueryRow("SELECT count(*) FROM outbox_deliveries WHERE unresolved_at IS NOT NULL").Scan(&unresolved); err != nil {

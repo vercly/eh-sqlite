@@ -76,7 +76,6 @@ func createV2Schema(ctx context.Context, tx *sql.Tx, prefix string) error {
 			unresolved_at    TIMESTAMP,
 			legacy_outbox_id TEXT
 		)`, dels, pubs),
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%[1]s_claim ON %[1]s (dispatch_key, taken_at, available_at, seq)`, dels),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%[1]s_publication ON %[1]s (publication_id)`, dels),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%[1]s_taken_available ON %[1]s (taken_at, available_at)`, dels),
 		// Timer lookup: first row with available_at > now, no scan of due rows.
@@ -88,6 +87,23 @@ func createV2Schema(ctx context.Context, tx *sql.Tx, prefix string) error {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("could not create outbox v2 schema: %w", err)
 		}
+	}
+	// Preserve a rematch sentinel's original FIFO position across its fan-out.
+	// Upgrade existing databases before preparing the claim query.
+	hasOrder, err := schema.ColumnExistsTx(ctx, tx, dels, "order_seq")
+	if err != nil {
+		return err
+	}
+	if !hasOrder {
+		if err := schema.AddColumnIfAbsentTx(ctx, tx, dels, "order_seq", "INTEGER"); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DROP INDEX IF EXISTS idx_%s_claim`, dels)); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%[1]s_claim ON %[1]s (dispatch_key, taken_at, available_at, COALESCE(order_seq, seq))`, dels)); err != nil {
+		return fmt.Errorf("could not create outbox claim index: %w", err)
 	}
 	return nil
 }
